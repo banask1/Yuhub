@@ -279,8 +279,21 @@ def _make_request(url, extra_headers=None, insecure=False):
     return req, None
 
 
-def _open(url, extra_headers=None, insecure=False):
+def _open(url, extra_headers=None, insecure=False, proxy=None):
+    """打开一个下载请求。
+
+    proxy=None（默认）：走系统代理（urllib 自动读取环境变量 / 注册表）。
+    proxy="direct"：**绕过一切代理直连**——系统代理配置了但代理软件已死
+    时，所有请求都会卡死在坏代理上，这是"换什么源都连不上"的另一个
+    隐蔽根因，所以下载源要支持逐个尝试「系统代理 → 直连」。
+    """
     req, ctx = _make_request(url, extra_headers, insecure)
+    if proxy == "direct":
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        if ctx is not None:
+            return opener.open(req, timeout=TIMEOUT, context=ctx)
+        return opener.open(req, timeout=TIMEOUT)
     if ctx is not None:
         return urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx)
     return urllib.request.urlopen(req, timeout=TIMEOUT)
@@ -293,7 +306,7 @@ def _is_cert_error(exc):
     return "CERTIFICATE_VERIFY_FAILED" in str(exc).upper()
 
 
-def probe(url, insecure_fallback=True):
+def probe(url, insecure_fallback=True, proxy=None):
     """探测 URL：总大小、是否支持分块、文件名。
 
     用 `Range: bytes=0-0` 而不是 HEAD —— 不少站点根本不支持 HEAD，
@@ -311,12 +324,12 @@ def probe(url, insecure_fallback=True):
 
     insecure = False
     try:
-        resp = _open(url, {"Range": "bytes=0-0"})
+        resp = _open(url, {"Range": "bytes=0-0"}, proxy=proxy)
     except urllib.error.HTTPError as exc:
         # 服务器不喜欢 Range（或要求其它条件）：退回普通 GET 再试一次
         if exc.code in (400, 416, 501):
             try:
-                resp = _open(url)
+                resp = _open(url, proxy=proxy)
             except Exception as exc2:
                 res.error = f"HTTP {getattr(exc2, 'code', '?')}：{exc2}"
                 return res
@@ -326,7 +339,8 @@ def probe(url, insecure_fallback=True):
     except Exception as exc:  # noqa: BLE001
         if insecure_fallback and _is_cert_error(exc):
             try:
-                resp = _open(url, {"Range": "bytes=0-0"}, insecure=True)
+                resp = _open(url, {"Range": "bytes=0-0"}, insecure=True,
+                             proxy=proxy)
                 insecure = True
                 res.messages.append("服务器证书校验失败，已临时忽略校验继续")
             except Exception as exc2:  # noqa: BLE001
@@ -391,7 +405,8 @@ class DownloadTask:
     上层只需定时调用 `snapshot()` 读取状态，不必处理高频信号。
     """
 
-    def __init__(self, url, save_path, threads=None, probe_result=None):
+    def __init__(self, url, save_path, threads=None, probe_result=None,
+                 proxy=None):
         self.url = (url or "").strip()
         self.save_path = save_path
         # threads=None 时按本机核心数自动取"中档"，这样换一台电脑不用改代码
@@ -399,6 +414,8 @@ class DownloadTask:
             threads = threads_for_level(DEFAULT_LEVEL)
         self.threads = max(1, min(int(threads or 1), MAX_THREADS))
         self._probe = probe_result
+        # None = 系统代理；"direct" = 绕过代理直连（见 _open 注释）
+        self._proxy = proxy
 
         # 完成前的文件先叫 xxx.part，全部写完再原子改名，
         # 避免「下到一半的文件」被误当成完整文件使用
@@ -408,6 +425,11 @@ class DownloadTask:
         self._cancel = threading.Event()
         self._threads = []
         self._sampler = None
+        # 在途响应登记：cancel 时立即 close，让阻塞在 read()/connect() 的
+        # worker **秒退**，而不是等最长 20 秒的 socket 超时（v0.8.5beta：
+        # 取消是高优先级操作）
+        self._resp_lock = threading.Lock()
+        self._active_resps = []
 
         self._status = STATUS_IDLE
         self._error = ""
@@ -456,14 +478,33 @@ class DownloadTask:
         return True
 
     def cancel(self):
-        """请求取消（异步）。
+        """请求取消（**高优先级**）。
 
-        这里**只发信号，不改状态**：worker 线程此刻还在写文件，
-        若立刻把状态置为「已取消」，UI 会以为任务已结束，
-        实际后台仍在写盘（曾经导致"取消了但 .part 还留着/还在被占用"）。
-        状态由 `_run` 在 worker 全部退出后统一落定。
+        ① 置位取消事件：worker 在每个分块边界检查；
+        ② 立即关闭所有在途响应：阻塞在 read()/connect() 里的 worker
+           会马上抛异常退出，而不是干等 20 秒 socket 超时——
+           用户点取消后界面应在 1 秒内响应，而不是"卡在正在取消"。
+        状态仍由 `_run` 在 worker 全部退出后统一落定。
         """
         self._cancel.set()
+        with self._resp_lock:
+            resps = list(self._active_resps)
+        for r in resps:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    def _track(self, resp):
+        with self._resp_lock:
+            self._active_resps.append(resp)
+
+    def _untrack(self, resp):
+        with self._resp_lock:
+            try:
+                self._active_resps.remove(resp)
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------ 主流程
     def _run(self):
@@ -583,7 +624,9 @@ class DownloadTask:
                         self.url,
                         {"Range": f"bytes={pos}-{req_end}"},
                         insecure=getattr(self._probe, "insecure", False),
+                        proxy=self._proxy,
                     )
+                    self._track(resp)
                     try:
                         data = resp.read(want)
                     finally:
@@ -591,6 +634,7 @@ class DownloadTask:
                             resp.close()
                         except Exception:
                             pass
+                        self._untrack(resp)
                 except urllib.error.HTTPError as exc:
                     if exc.code == 416:      # 区间越界 = 这段已经下完
                         break
@@ -633,7 +677,9 @@ class DownloadTask:
         self._start_sampler()
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.part_path)) or ".", exist_ok=True)
-            resp = _open(self.url, insecure=getattr(self._probe, "insecure", False))
+            resp = _open(self.url, insecure=getattr(self._probe, "insecure", False),
+                         proxy=self._proxy)
+            self._track(resp)
         except Exception as exc:  # noqa: BLE001
             self._stop_sampler()
             self._fail(f"连接失败：{exc}")
@@ -666,6 +712,7 @@ class DownloadTask:
                 resp.close()
             except Exception:
                 pass
+            self._untrack(resp)
             self._stop_sampler()
 
     # ------------------------------------------------------------ 采样

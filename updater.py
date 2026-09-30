@@ -137,15 +137,45 @@ class ReleaseInfo:
                    d.get("published", ""))
 
 
-def _http_json(url, timeout=HTTP_TIMEOUT):
-    """GET 一个 JSON 接口，返回解析后的 dict。失败抛异常。"""
+def _http_json(url, timeout=HTTP_TIMEOUT, proxy=None):
+    """GET 一个 JSON 接口，返回解析后的 dict。失败抛异常。
+
+    proxy="direct" 时绕过系统代理直连（见 downloader._open 的说明）。
+    """
     req = urllib.request.Request(url, headers={
         "User-Agent": _UA,
         "Accept": "application/vnd.github+json",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
+    if proxy == "direct":
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read()
+    else:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
     return json.loads(raw.decode("utf-8"))
+
+
+def _bounded(fn, timeout):
+    """带上限地执行 fn()。返回 {"res": 值} 或 {"err": 异常}；超时返回 {}。
+
+    DNS 解析（getaddrinfo）不受 socket 超时控制——「检查更新/下载一直
+    卡住」的元凶。把请求放进守护线程，join 到点就放弃（遗弃的 daemon
+    线程自生自灭），调用方换下一个候选。
+    """
+    box = {}
+
+    def _job():
+        try:
+            box["res"] = fn()
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+
+    t = threading.Thread(target=_job, daemon=True)
+    t.start()
+    t.join(timeout)
+    return box
 
 
 def pick_asset(assets, prefer=("Yuhub.exe", ".exe")):
@@ -198,56 +228,71 @@ def fetch_release(owner=REPO_OWNER, repo=REPO_NAME, timeout=HTTP_TIMEOUT,
                   api_base="https://api.github.com"):
     """取最新 Release。返回 (ReleaseInfo | None, error_str)。
 
-    ⚠️ 关键陷阱：GitHub 的 `releases/latest` **会跳过 prerelease 和 draft**。
-    对一个还在 beta 阶段的项目（tag 就叫 v0.8beta），如果发布时勾了
-    "pre-release"，这个接口会直接 404 —— 客户端就永远检查不到更新。
+    v0.8.5beta：检查阶段也走候选源 + 限时。
+      * API 候选：官方 api.github.com → 三个中转镜像 → 无代理直连，
+        逐个尝试（镜像前缀同样能代理 api.github.com 的路径）；
+      * 每次请求限时 timeout+2 秒，DNS 挂起时放弃换下一个，
+        「检查更新卡住」从此不可能超过候选数 × (timeout+2)。
 
-    所以策略是：先试 `latest`，拿不到再退到 releases 列表，
-    取**第一个非 draft** 的版本（预发布也认，因为本项目当前正处在 beta 阶段）。
+    ⚠️ 关键陷阱（保留）：GitHub 的 `releases/latest` **会跳过 prerelease
+    和 draft**。所以单个候选内仍维持「先 latest，404 再退列表」两级策略。
     """
-    base = api_base.rstrip("/")
-    latest_url = "%s/repos/%s/%s/releases/latest" % (base, owner, repo)
-
-    # ---- ① 优先 latest（正式版走得通，语义最准）----
-    try:
-        data = _http_json(latest_url, timeout=timeout)
-        if data.get("tag_name"):
-            return parse_release(data), ""
-    except urllib.error.HTTPError as e:
-        if e.code not in (404, 403):
-            return None, "服务返回 HTTP %d" % e.code
-        if e.code == 403:
-            return None, "请求过于频繁或网络受限（HTTP 403）"
-        # 404：要么没有任何 Release，要么只有 prerelease —— 往下走列表
-    except urllib.error.URLError as e:
-        return None, "网络不可达：%s" % (getattr(e, "reason", e),)
-    except Exception as e:
-        return None, "检查失败：%s" % (e,)
-
-    # ---- ② 退到列表：取第一个非 draft 的版本 ----
-    list_url = "%s/repos/%s/%s/releases?per_page=10" % (base, owner, repo)
-    try:
-        arr = _http_json(list_url, timeout=timeout)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None, ""          # 仓库里一个 Release 都没有
-        return None, "服务返回 HTTP %d" % e.code
-    except urllib.error.URLError as e:
-        return None, "网络不可达：%s" % (getattr(e, "reason", e),)
-    except Exception as e:
-        return None, "检查失败：%s" % (e,)
-
-    if not isinstance(arr, list) or not arr:
-        return None, ""
-
-    for item in arr:
-        if item.get("draft"):
-            continue                  # 草稿不该被客户端看到
-        if not item.get("tag_name"):
+    last_err = ""
+    for base, proxy_mode in _api_attempts(api_base):
+        latest_url = "%s/repos/%s/%s/releases/latest" % (base, owner, repo)
+        box = _bounded(
+            lambda u=latest_url, m=proxy_mode: _http_json(
+                u, timeout=timeout, proxy=m),
+            timeout + 2,
+        )
+        if "res" in box:
+            data = box["res"]
+            if isinstance(data, dict) and data.get("tag_name"):
+                return parse_release(data), ""
+            last_err = "服务响应异常"
             continue
-        return parse_release(item), ""
 
-    return None, ""
+        err = box.get("err")
+        if isinstance(err, urllib.error.HTTPError):
+            if err.code == 404:
+                # ① latest 404 → 同一候选内退到 releases 列表
+                list_url = "%s/repos/%s/%s/releases?per_page=10" % (
+                    base, owner, repo)
+                box2 = _bounded(
+                    lambda u=list_url, m=proxy_mode: _http_json(
+                        u, timeout=timeout, proxy=m),
+                    timeout + 2,
+                )
+                if "res" in box2:
+                    arr = box2["res"]
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if item.get("draft"):
+                                continue          # 草稿不该被客户端看到
+                            if not item.get("tag_name"):
+                                continue
+                            return parse_release(item), ""
+                        return None, ""           # 仓库里一个 Release 都没有
+                    last_err = "服务响应异常"
+                else:
+                    last_err = _net_err(box2.get("err"))
+                continue
+            if err.code == 403:
+                last_err = "请求过于频繁或网络受限（HTTP 403）"
+            else:
+                last_err = "服务返回 HTTP %d" % err.code
+            continue
+        last_err = _net_err(err)
+    return None, last_err
+
+
+def _net_err(err):
+    """把网络异常翻译成给用户看的短句。"""
+    if err is None:
+        return ""
+    if isinstance(err, urllib.error.URLError):
+        return "网络不可达：%s" % (getattr(err, "reason", err),)
+    return "检查失败：%s" % (err,)
 
 
 def github_latest(owner=REPO_OWNER, repo=REPO_NAME, timeout=HTTP_TIMEOUT,
@@ -350,11 +395,15 @@ def _url_allowed(url):
 # 连不上或 DNS 挂起。下载源按顺序尝试：官方直连 → 中转镜像。
 # 镜像只是给原 URL 加前缀，文件字节完全一致——info.sha256 校验仍然生效，
 # 被篡改的镜像过不了校验，所以这里不存在安全降级。
-DOWNLOAD_MIRRORS = ("ghproxy.net", "gh-proxy.com")
+#
+# 镜像列表为 2026-10-01 实测存活的（Range 探测返回 206）；
+# 社区镜像会周期性失效，失效的源会被限时探测自动跳过。
+DOWNLOAD_MIRRORS = ("ghfast.top", "gh-proxy.com", "ghproxy.net")
+API_MIRRORS = DOWNLOAD_MIRRORS          # 镜像同样能代理 api.github.com 路径
 
 
 def _download_candidates(asset_url):
-    """生成候选下载地址：官方直连优先，镜像兜底。"""
+    """生成候选下载地址：官方直连 → 镜像。"""
     urls = [asset_url]
     tail = asset_url.split("://", 1)[1] if "://" in asset_url else ""
     if tail.startswith("github.com/"):
@@ -363,21 +412,39 @@ def _download_candidates(asset_url):
     return urls
 
 
-def _probe_bounded(url, timeout=25.0):
-    """带**上限**的探测。返回 ProbeResult；超时返回 None。
+def _api_attempts(api_base):
+    """生成候选 API 端点：(base, proxy_mode) 序列。
 
-    「一直卡在准备下载」的根因：DNS 解析（getaddrinfo）**不受 socket
-    超时控制**——urlopen(timeout=20) 管得住连接和读，管不住域名解析，
-    而解析 github.com 卡住几分钟是国内网络的常态。这里把探测放进
-    守护线程，join 到点就放弃（遗弃的 daemon 线程自生自灭，无害），
-    主流程换下一个源。
+    官方直连 → 镜像（前缀代理）→ 无代理直连。最后那步是给
+    「系统代理配置了但代理软件已死」的用户兜底——这种情况下走系统
+    代理的所有请求都会卡死，直连反而通。
+    """
+    base = api_base.rstrip("/")
+    attempts = [(base, None)]
+    tail = base.split("://", 1)[1] if "://" in base else ""
+    if tail.startswith("api.github.com"):
+        for m in API_MIRRORS:
+            attempts.append(("https://%s/%s" % (m, tail), None))
+        attempts.append((base, "direct"))
+    else:
+        attempts.append((base, "direct"))
+    return attempts
+
+
+def _probe_line(url, timeout=15.0, proxy=None, cancel=None):
+    """探测一条下载线路，**取消以 0.1 秒粒度生效**。
+
+    返回：ProbeResult（探测完成）/ None（超时）/ "CANCELLED"（用户取消）。
+    探测放在守护线程里跑（DNS 挂起不受 socket 超时控制，必须可遗弃），
+    主流程每 0.1 秒轮询一次取消标志——用户点取消后最多 0.1 秒就响应，
+    这是"取消优先级要很高"的关键。
     """
     box = {}
 
     def _job():
         try:
             import downloader
-            box["res"] = downloader.probe(url)
+            box["res"] = downloader.probe(url, proxy=proxy)
         except Exception as exc:  # noqa: BLE001
             try:
                 import downloader
@@ -388,25 +455,26 @@ def _probe_bounded(url, timeout=25.0):
 
     t = threading.Thread(target=_job, name="YuhubUpdProbe", daemon=True)
     t.start()
-    t.join(timeout)
-    return box.get("res")
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cancel is not None and cancel():
+            return "CANCELLED"
+        if not t.is_alive():
+            return box.get("res")
+        time.sleep(0.1)
+    return None
 
 
 def download_update(info, on_progress=None, cancel=None, threads=None):
     """下载更新包。返回 (ok, message, path)。
 
-    v0.8.3beta 修复两个用户实测的 bug：
-      1. **卡在「准备下载」**：原实现走 downloader.download()，其探测
-         阶段的 DNS 不受 socket 超时控制，直连 github.com 卡住就永远
-         卡住。现在：候选源 = 官方直连 + 两个中转镜像，逐个尝试；
-         每个源的探测上限 25 秒，卡住就换下一个。
-      2. **点取消后卡在「正在取消」**：原来取消标志只在分块之间检查，
-         线程卡在探测/DNS 时永远到不了下一个分块。现在取消在每个
-         阶段边界（换源前 / 进度泵每 0.2 秒）都会生效，探测本身也
-         有上限，不存在永远等不到的等待。
-
-    下载复用 downloader.DownloadTask（断点续传式分块 / 进度快照），
-    与下载页体验一致；下载后的 sha256 校验对镜像同样生效。
+    v0.8.5beta：下载线路矩阵 = 官方直连 + 三个中转镜像 × 两种网络路径
+    （系统代理 / 无代理直连），每条线路限时探测 15 秒，谁通用谁。
+    覆盖两类用户：
+      * 纯国内网络（无代理）→ 直连 github 不通，镜像通；
+      * 系统代理配置了但代理软件已死 → 走系统代理的全挂，直连兜底。
+    取消在每个阶段边界即时生效（v0.8.3beta 行为保留）。
+    下载后的 sha256 校验对所有线路同样生效，安全性不打折。
     """
     if not info or not info.asset_url:
         return False, "没有可下载的更新包", ""
@@ -425,78 +493,85 @@ def download_update(info, on_progress=None, cancel=None, threads=None):
         return bool(cancel and cancel())
 
     def report_status(text):
-        # 让 UI 的状态行知道"正在换源"（snapshot 里带 status_text 扩展键）
+        # 探测/换线阶段：UI 的进度条转忙碌动画（snapshot 里带 phase 标记）
         if on_progress:
             try:
-                on_progress({"status_text": text})
+                on_progress({"status_text": text, "phase": "probing"})
             except Exception:
                 pass
 
+    mode_label = {None: "系统代理", "direct": "直连"}
     candidates = _download_candidates(info.asset_url)
-    for idx, url in enumerate(candidates, 1):
-        if cancelled():
-            return False, "已取消", ""
-        if idx > 1:
-            report_status("直连失败，正在尝试中转镜像（%d/%d）…"
-                          % (idx - 1, len(candidates) - 1))
-        else:
-            report_status("正在连接更新源…")
+    total = len(candidates) * 2
+    tries = 0
+    for url in candidates:
+        for mode in (None, "direct"):
+            tries += 1
+            if cancelled():
+                return False, "已取消", ""
+            if tries > 2:
+                src = "官方源" if url == candidates[0] else "镜像"
+                report_status("自动切换下载线路（%d/%d）：%s · %s…"
+                              % (tries - 1, total, src,
+                                 mode_label.get(mode, "默认")))
+            else:
+                report_status("正在连接更新源…")
 
-        # ---- ① 限时探测：拿大小/分块支持，同时筛掉连不上的源 ----
-        pres = _probe_bounded(url, timeout=25.0)
-        if cancelled():
-            return False, "已取消", ""
-        if pres is None:
-            last_err = "连接超时（源 %d/%d）" % (idx, len(candidates))
-            continue
-        if not pres.ok:
-            last_err = pres.error or "连接失败（源 %d/%d）" % (idx, len(candidates))
-            continue
+            # ---- ① 限时探测：拿大小/分块支持，同时筛掉连不上的线路 ----
+            pres = _probe_line(url, timeout=15.0, proxy=mode, cancel=cancel)
+            if pres == "CANCELLED" or cancelled():
+                return False, "已取消", ""
+            if pres is None:
+                last_err = "连接超时（已自动换线，共 %d 条线路）" % total
+                continue
+            if not pres.ok:
+                last_err = pres.error or "连接失败"
+                continue
 
-        # ---- ② 下载（探测结果直接传入，任务内不再重复探测） ----
-        task = downloader.DownloadTask(url, dest, threads=threads,
-                                       probe_result=pres)
-        task.start()
-        asked = False
-        while task.running:
+            # ---- ② 下载（探测结果直接传入，任务内不再重复探测） ----
+            task = downloader.DownloadTask(url, dest, threads=threads,
+                                           probe_result=pres, proxy=mode)
+            task.start()
+            asked = False
+            while task.running:
+                snap = task.snapshot()
+                if on_progress:
+                    try:
+                        on_progress(snap)
+                    except Exception:
+                        pass
+                if cancel and not asked and cancel():
+                    asked = True
+                    task.cancel()
+                time.sleep(0.2)
             snap = task.snapshot()
             if on_progress:
                 try:
                     on_progress(snap)
                 except Exception:
                     pass
-            if cancel and not asked and cancel():
-                asked = True
-                task.cancel()
-            time.sleep(0.2)
-        snap = task.snapshot()
-        if on_progress:
-            try:
-                on_progress(snap)
-            except Exception:
-                pass
 
-        if snap["status"] == downloader.STATUS_CANCELLED:
-            return False, "已取消", ""
-        if snap["status"] != downloader.STATUS_DONE:
-            last_err = snap["error"] or "下载失败（源 %d/%d）" % (idx, len(candidates))
-            continue                     # 这个源不行，换下一个
+            if snap["status"] == downloader.STATUS_CANCELLED:
+                return False, "已取消", ""
+            if snap["status"] != downloader.STATUS_DONE:
+                last_err = snap["error"] or "下载失败"
+                continue                 # 这条线路不行，换下一条
 
-        # ---- ③ 校验（大小 + sha256，镜像下载的字节同样要过这一关） ----
-        if not os.path.isfile(dest):
-            return False, "下载完成但文件不存在", ""
-        if info.asset_size and os.path.getsize(dest) < info.asset_size:
-            return False, ("文件不完整（%d / %d 字节）"
-                           % (os.path.getsize(dest), info.asset_size)), ""
-        if not verify_sha256(dest, info.sha256):
-            try:
-                os.remove(dest)
-            except OSError:
-                pass
-            return False, "校验失败，文件可能已损坏或被篡改，已删除", ""
-        return True, "下载完成", dest
+            # ---- ③ 校验（大小 + sha256，镜像下载的字节同样要过这一关） ----
+            if not os.path.isfile(dest):
+                return False, "下载完成但文件不存在", ""
+            if info.asset_size and os.path.getsize(dest) < info.asset_size:
+                return False, ("文件不完整（%d / %d 字节）"
+                               % (os.path.getsize(dest), info.asset_size)), ""
+            if not verify_sha256(dest, info.sha256):
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                return False, "校验失败，文件可能已损坏或被篡改，已删除", ""
+            return True, "下载完成", dest
 
-    return False, last_err or "所有更新源均不可达", ""
+    return False, last_err or "所有下载线路均不可达，请检查网络后重试", ""
 
 
 # ================================================================ 进程工具

@@ -291,7 +291,11 @@ class MainWindow(QWidget):
             # 从下载线程回调 → 用队列式信号回到主线程更新 UI
             try:
                 s = dict(snap)
-                # updater 换下载源（直连失败转镜像）时的状态提示
+                if s.get("phase") == "probing":
+                    # 探测/换线阶段：进度条转忙碌动画
+                    text = s.pop("status_text", "")
+                    QTimer.singleShot(0, lambda t=text: prog.set_probing(t))
+                    return
                 text = s.pop("status_text", None)
                 if text:
                     QTimer.singleShot(0, lambda t=text: prog.set_status(t))
@@ -323,6 +327,9 @@ class MainWindow(QWidget):
                 prog.finish_ok("更新包已就绪")
                 prog.exec()
                 self._apply_update(info, path)
+            elif msg == "已取消":
+                prog.finish_fail("已取消下载")
+                prog.exec()
             else:
                 prog.finish_fail("下载失败：%s" % msg)
                 prog.exec()

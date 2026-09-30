@@ -274,11 +274,22 @@ class UpdateProgressDialog(_BaseDialog):
         self.status.setText("正在取消…")
         self.btn_cancel.setEnabled(False)
 
+    def set_probing(self, text):
+        """线路探测/切换阶段：进度条转来回滚动的忙碌动画。"""
+        try:
+            self.status.setText(text or "正在连接更新源…")
+            self.bar.setRange(0, 0)          # 0,0 = Qt 忙碌指示
+            self.detail.setText(" ")
+        except RuntimeError:
+            pass
+
     def set_progress(self, snap):
         """由下载线程的进度回调驱动（经 Qt 信号回到主线程后调用）。"""
         try:
             total = snap.get("total") or 0
             got = snap.get("downloaded") or 0
+            if self.bar.maximum() == 0:
+                self.bar.setRange(0, 1000)   # 从忙碌态恢复正常
             if total:
                 self.bar.setValue(int(got * 1000 / total))
             else:
@@ -286,8 +297,12 @@ class UpdateProgressDialog(_BaseDialog):
             speed = snap.get("speed") or 0
             left = snap.get("eta")
             import downloader
-            parts = ["%s / %s" % (downloader.human_bytes(got),
-                                  downloader.human_bytes(total) if total else "未知")]
+            parts = []
+            if total:
+                parts.append("%.1f%%" % (got * 100.0 / total))
+            parts.append("%s / %s" % (downloader.human_bytes(got),
+                                      downloader.human_bytes(total)
+                                      if total else "未知"))
             if speed:
                 parts.append(downloader.human_speed(speed))
             if left:
