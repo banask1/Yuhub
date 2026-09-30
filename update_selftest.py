@@ -260,19 +260,25 @@ def _test_download_bad_sha(port, good_sha):
          "残留=%s" % (path or "无"))
 
 
-def _test_download_sources_and_cancel():
-    """v0.8.3beta 回归：镜像候选、限时探测、取消即时生效。
+def _test_download_sources_and_cancel(port):
+    """v0.8.5beta 回归：镜像候选、限时探测、代理兜底、取消即时生效。
 
     线上 bug：直连 github.com 时 DNS 挂起 → 永远卡在「准备下载」；
     取消标志只在分块之间检查 → 卡在「正在取消」只能强杀进程。
     """
-    # ① github URL 生成 直连 + 2 个镜像候选；本地 URL 不加镜像
+    import downloader as _dl
+
+    def _selftest_base():
+        return "http://127.0.0.1:%d" % port
+
+    # ① github URL 生成 直连 + 3 个镜像候选；本地 URL 不加镜像
     cands = updater._download_candidates(
         "https://github.com/u/r/releases/download/v1/Yuhub.exe")
-    ok1 = (len(cands) == 3
+    ok1 = (len(cands) == 4
            and cands[0].startswith("https://github.com/")
-           and any("ghproxy" in c for c in cands[1:]))
-    _add("下载源候选：github URL 附带镜像兜底", ok1,
+           and any("ghfast.top" in c for c in cands[1:])
+           and any("ghproxy.net" in c for c in cands[1:]))
+    _add("下载源候选：github URL 附带 3 个镜像", ok1,
          "候选=%d 个" % len(cands))
 
     cands2 = updater._download_candidates("http://127.0.0.1:9/x.exe")
@@ -287,29 +293,83 @@ def _test_download_sources_and_cancel():
     _add("下载前已取消时立即返回", (not ok2) and msg2 == "已取消",
          "ok=%s msg=%r" % (ok2, msg2))
 
-    # ③ 全部源都连不上：逐个尝试后返回最后一个错误，且换源时给 UI 状态提示
-    import downloader as _dl
-    info3 = updater.ReleaseInfo(
+    # ③ 系统代理故障 → 自动切直连并成功下载（真实本地服务器）
+    info3, _ = updater.check_for_update("0.7.0", owner="u", repo="r",
+                                        api_base=_selftest_base())
+    calls = []
+
+    def _fake_probe_system_fail(url, timeout=15.0, proxy=None, cancel=None):
+        calls.append(proxy)
+        if proxy is None:
+            return _dl.ProbeResult(url=url, ok=False,
+                                   error="模拟系统代理故障")
+        return _dl.probe(url)             # 直连走真实本地服务器
+
+    saved = updater._probe_line
+    updater._probe_line = _fake_probe_system_fail
+    try:
+        ok3, msg3, path3 = updater.download_update(info3)
+    finally:
+        updater._probe_line = saved
+    _add("系统代理故障时自动切直连并下载成功",
+         ok3 and calls == [None, "direct"],
+         "ok=%s 线路顺序=%r msg=%r" % (ok3, calls, msg3))
+
+    # ④ 全部线路都失败：镜像×代理模式逐条尝试后报最后错误 + 状态提示
+    info4 = updater.ReleaseInfo(
         tag="v9", name="x", notes="", asset_name="Yuhub.exe",
         asset_url="https://github.com/u/r/releases/download/v1/Yuhub.exe",
         asset_size=0)
     statuses = []
+    calls4 = []
 
-    def _fake_probe(url, timeout=25.0):
+    def _fake_probe_all_fail(url, timeout=15.0, proxy=None, cancel=None):
+        calls4.append(proxy)
         return _dl.ProbeResult(url=url, ok=False, error="模拟连接失败")
 
-    saved = updater._probe_bounded
-    updater._probe_bounded = _fake_probe
+    updater._probe_line = _fake_probe_all_fail
     try:
-        ok3, msg3, _ = updater.download_update(
-            info3, on_progress=lambda s: statuses.append(dict(s)))
+        ok4, msg4, _ = updater.download_update(
+            info4, on_progress=lambda s: statuses.append(dict(s)))
     finally:
-        updater._probe_bounded = saved
-    _add("所有源失败时逐个尝试并报最后错误",
-         (not ok3) and "模拟连接失败" in msg3, "msg=%r" % msg3)
-    _add("换源时向 UI 报状态提示",
-         any("中转镜像" in str(s.get("status_text", "")) for s in statuses),
-         "状态=%r" % [s.get("status_text") for s in statuses if s.get("status_text")])
+        updater._probe_line = saved
+    _add("所有线路失败时逐条尝试并报最后错误",
+         (not ok4) and "模拟连接失败" in msg4 and len(calls4) == 8,
+         "尝试=%d msg=%r" % (len(calls4), msg4))
+    _add("换线时向 UI 报状态提示",
+         any("切换下载线路" in str(s.get("status_text", ""))
+             for s in statuses),
+         "状态数=%d" % len([s for s in statuses
+                            if s.get("status_text")]))
+
+    # ⑤ 取消高优先级：真实 _probe_line + 模拟"网络卡死"（底层 probe 阻塞 5 秒），
+    #    取消轮询必须 0.1 秒粒度生效 → 整体应在 ~0.5 秒内返回
+    info5, _ = updater.check_for_update("0.7.0", owner="u", repo="r",
+                                        api_base=_selftest_base())
+    flag = {"c": False}
+
+    def _slow_network_probe(url, insecure_fallback=True, proxy=None):
+        time.sleep(5.0)               # 模拟探测被网络彻底卡死
+        return _dl.ProbeResult(url=url, ok=False, error="slow network")
+
+    saved_dl_probe = _dl.probe
+    _dl.probe = _slow_network_probe
+    t0 = time.monotonic()
+
+    def _flip():
+        time.sleep(0.3)
+        flag["c"] = True
+
+    threading.Thread(target=_flip, daemon=True).start()
+    try:
+        ok5, msg5, _ = updater.download_update(
+            info5, cancel=lambda: flag["c"])
+    finally:
+        _dl.probe = saved_dl_probe
+    elapsed = time.monotonic() - t0
+    _add("探测卡死时取消高优先级生效（秒级响应）",
+         (not ok5) and msg5 == "已取消" and elapsed < 2.0,
+         "msg=%r 耗时=%.2fs" % (msg5, elapsed))
 
 
 
@@ -566,7 +626,7 @@ def run(out_path):
             _test_download_bad_sha(port, sha)
 
         _test_http_downgrade_rejected()
-        _test_download_sources_and_cancel()
+        _test_download_sources_and_cancel(port)
         _test_replace_flow(port, tag, sha, fake_exe)
         _test_selftest_mode_guarded()
         _test_checker_signals_connectable()
