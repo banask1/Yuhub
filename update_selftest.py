@@ -260,6 +260,59 @@ def _test_download_bad_sha(port, good_sha):
          "残留=%s" % (path or "无"))
 
 
+def _test_download_sources_and_cancel():
+    """v0.8.3beta 回归：镜像候选、限时探测、取消即时生效。
+
+    线上 bug：直连 github.com 时 DNS 挂起 → 永远卡在「准备下载」；
+    取消标志只在分块之间检查 → 卡在「正在取消」只能强杀进程。
+    """
+    # ① github URL 生成 直连 + 2 个镜像候选；本地 URL 不加镜像
+    cands = updater._download_candidates(
+        "https://github.com/u/r/releases/download/v1/Yuhub.exe")
+    ok1 = (len(cands) == 3
+           and cands[0].startswith("https://github.com/")
+           and any("ghproxy" in c for c in cands[1:]))
+    _add("下载源候选：github URL 附带镜像兜底", ok1,
+         "候选=%d 个" % len(cands))
+
+    cands2 = updater._download_candidates("http://127.0.0.1:9/x.exe")
+    _add("下载源候选：非 github URL 不加镜像", len(cands2) == 1,
+         "候选=%d 个" % len(cands2))
+
+    # ② 取消标志在探测前就生效 → 立即返回「已取消」，不发起任何网络请求
+    info = updater.ReleaseInfo(
+        tag="v9", name="x", notes="", asset_name="Yuhub.exe",
+        asset_url="http://127.0.0.1:1/Yuhub.exe", asset_size=0)
+    ok2, msg2, _ = updater.download_update(info, cancel=lambda: True)
+    _add("下载前已取消时立即返回", (not ok2) and msg2 == "已取消",
+         "ok=%s msg=%r" % (ok2, msg2))
+
+    # ③ 全部源都连不上：逐个尝试后返回最后一个错误，且换源时给 UI 状态提示
+    import downloader as _dl
+    info3 = updater.ReleaseInfo(
+        tag="v9", name="x", notes="", asset_name="Yuhub.exe",
+        asset_url="https://github.com/u/r/releases/download/v1/Yuhub.exe",
+        asset_size=0)
+    statuses = []
+
+    def _fake_probe(url, timeout=25.0):
+        return _dl.ProbeResult(url=url, ok=False, error="模拟连接失败")
+
+    saved = updater._probe_bounded
+    updater._probe_bounded = _fake_probe
+    try:
+        ok3, msg3, _ = updater.download_update(
+            info3, on_progress=lambda s: statuses.append(dict(s)))
+    finally:
+        updater._probe_bounded = saved
+    _add("所有源失败时逐个尝试并报最后错误",
+         (not ok3) and "模拟连接失败" in msg3, "msg=%r" % msg3)
+    _add("换源时向 UI 报状态提示",
+         any("中转镜像" in str(s.get("status_text", "")) for s in statuses),
+         "状态=%r" % [s.get("status_text") for s in statuses if s.get("status_text")])
+
+
+
 def _test_http_downgrade_rejected():
     """非 https 的更新地址必须被拒绝（防降级到明文）。"""
     info = updater.ReleaseInfo(
@@ -513,6 +566,7 @@ def run(out_path):
             _test_download_bad_sha(port, sha)
 
         _test_http_downgrade_rejected()
+        _test_download_sources_and_cancel()
         _test_replace_flow(port, tag, sha, fake_exe)
         _test_selftest_mode_guarded()
         _test_checker_signals_connectable()

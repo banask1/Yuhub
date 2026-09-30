@@ -600,9 +600,12 @@ class MemberTracker:
     PING_FAIL_EVICT = 4      # 连续 ping 失败次数达到该值才可能判离线
     CONFIRM_GRACE = 12.0     # 最后一次确认（ARP 见到 / ping 通）后的宽限（秒）
 
-    def __init__(self, my_ip, on_log=None):
+    def __init__(self, my_ip, on_log=None, name_lookup=None):
         self._my_ip = my_ip
         self._on_log = on_log or (lambda msg: None)
+        # 可选的昵称查询回调（NickBeacon.get_name）：信标查得到就不用走
+        # gethostbyaddr——后者在 EasyTier 虚拟网里基本解析不出 --hostname。
+        self._name_lookup = name_lookup
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread = None
@@ -695,12 +698,212 @@ class MemberTracker:
         for ip in need:
             if self._stop_evt.is_set():
                 return
-            name = _resolve_name(ip, timeout=0.8)
+            # ① 信标优先（应用层，可靠）；② gethostbyaddr 兜底
+            name = ""
+            if self._name_lookup:
+                try:
+                    name = self._name_lookup(ip) or ""
+                except Exception:
+                    name = ""
+            if not name:
+                name = _resolve_name(ip, timeout=0.8)
             if name:
                 with self._lock:
                     p = self._peers.get(ip)
                     if p is not None:
                         p["name"] = name
+
+
+# ---------------------------------------------------------------------------
+# 昵称信标：解决"成员列表总是显示不了昵称"
+# ---------------------------------------------------------------------------
+# 根因：EasyTier 的 --hostname 只存在于它自己的对等协议里，**不进
+# DNS/NetBIOS**——socket.gethostbyaddr 在虚拟网卡上基本查不出对方昵称。
+# 双方又都是 Yuhub，所以直接做应用层信标：
+#
+#   * 每 3 秒向 10.126.126.255:41234 **UDP 广播**自己的昵称。
+#     启动 EasyTier 时已开 --enable-udp-broadcast-relay，广播能跨到
+#     所有节点（这正是异地"局域网"广播联机能工作的同一机制）。
+#   * 同时监听虚拟 IP 的同端口，收到广播就记下 ip → 昵称（15 秒新鲜期）。
+#   * 广播偶发丢包的兜底：向 peer 的 41234 端口发起 **TCP 查询**，
+#     对方立即回一行昵称后关闭。出站连接不受防火墙入站规则限制；
+#     监听方向由 watchdog 提权时统一加防火墙入站规则（见
+#     _preflight_silence_windows，只放行 41234 端口 + Yuhub.exe）。
+#
+# 套接字全部绑定在**虚拟 IP** 上（而不是 0.0.0.0）：昵称只在房间内
+# 传播，不往物理局域网泄漏一个字节。
+NICK_PORT = 41234
+_NICK_MAGIC = "yuhub-nick-v1"
+
+
+class NickBeacon:
+    """一个跨网房间对应一个实例。线程安全。"""
+
+    ANNOUNCE_INTERVAL = 3.0      # 广播间隔（秒）
+    PEER_FRESH = 15.0            # 信标记录的新鲜期（秒），过期走 TCP 查询
+    TCP_QUERY_TIMEOUT = 1.0      # TCP 查询超时
+    TCP_FAIL_BACKOFF = 30.0      # TCP 查询失败后的重试间隔（秒）
+
+    def __init__(self, my_ip, nick, on_log=None):
+        self._my_ip = my_ip
+        self._nick = (nick or "").strip()[:32]
+        self._on_log = on_log or (lambda msg: None)
+        self._stop_evt = threading.Event()
+        self._lock = threading.Lock()
+        self._threads = []
+        # ip -> [nick, fresh_until]
+        self._peers = {}
+        # ip -> 上次 TCP 查询失败的 monotonic（失败节流）
+        self._tcp_fail = {}
+
+    # ------------------------------------------------ 对外接口
+    def start(self):
+        if self._threads:
+            return
+        self._stop_evt.clear()
+        for target, name in (
+            (self._announce_loop, "NickBeaconTx"),
+            (self._udp_listen_loop, "NickBeaconRx"),
+            (self._tcp_serve_loop, "NickBeaconTcp"),
+        ):
+            t = threading.Thread(target=target, name=name, daemon=True)
+            self._threads.append(t)
+            t.start()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def get_name(self, ip, timeout=None):
+        """查某虚拟 IP 的昵称。信标缓存 → TCP 查询 → 都没有返回 ""。"""
+        if not ip or ip == self._my_ip:
+            return ""
+        now = time.monotonic()
+        with self._lock:
+            hit = self._peers.get(ip)
+            if hit and hit[1] > now:
+                return hit[0]
+            last_fail = self._tcp_fail.get(ip, 0.0)
+        if now - last_fail < self.TCP_FAIL_BACKOFF:
+            return ""                       # 刚 TCP 查过失败，别反复试探
+        nick = self._tcp_query(ip, timeout or self.TCP_QUERY_TIMEOUT)
+        if nick:
+            with self._lock:
+                self._peers[ip] = [nick, time.monotonic() + self.PEER_FRESH]
+            return nick
+        with self._lock:
+            self._tcp_fail[ip] = time.monotonic()
+        return ""
+
+    # ------------------------------------------------ 内部：三个小线程
+    def _announce_loop(self):
+        """定时向虚拟网广播自己的昵称。"""
+        payload = json.dumps({_NICK_MAGIC: self._nick}).encode("utf-8")
+        baddr = VIRTUAL_NET_PREFIX + "255"
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            while not self._stop_evt.is_set():
+                if self._nick:
+                    try:
+                        sock.sendto(payload, (baddr, NICK_PORT))
+                    except Exception:
+                        pass
+                self._stop_evt.wait(self.ANNOUNCE_INTERVAL)
+        except Exception:
+            pass
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _udp_listen_loop(self):
+        """收别人的广播，维护 ip → 昵称 新鲜表。"""
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self._my_ip, NICK_PORT))
+            sock.settimeout(0.5)
+            while not self._stop_evt.is_set():
+                try:
+                    data, addr = sock.recvfrom(1024)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                nick = self._parse(data)
+                if nick and addr[0] != self._my_ip:
+                    with self._lock:
+                        self._peers[addr[0]] = [nick,
+                                                time.monotonic() + self.PEER_FRESH]
+        except Exception:
+            pass
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _tcp_serve_loop(self):
+        """TCP 查询兜底：连上就回一行昵称，立即关闭。"""
+        srv = None
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self._my_ip, NICK_PORT))
+            srv.listen(4)
+            srv.settimeout(0.5)
+            while not self._stop_evt.is_set():
+                try:
+                    conn, _addr = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    conn.settimeout(2.0)
+                    conn.sendall(json.dumps(
+                        {_NICK_MAGIC: self._nick}).encode("utf-8"))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            self._on_log("昵称信标监听失败（不影响联机）：%s" % exc)
+        finally:
+            if srv:
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+
+    def _tcp_query(self, ip, timeout):
+        """主动向对方查昵称（出站连接，无防火墙问题）。"""
+        if not self._nick and not self._threads:
+            return ""
+        try:
+            with socket.create_connection((ip, NICK_PORT), timeout=timeout) as c:
+                c.settimeout(timeout)
+                return self._parse(c.recv(256))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse(data):
+        try:
+            d = json.loads((data or b"").decode("utf-8"))
+            if _NICK_MAGIC in d:
+                return str(d[_NICK_MAGIC]).strip()[:32]
+        except Exception:
+            pass
+        return ""
 
 
 def pick_host_ip(my_ip, exclude_ips=None, hostname="", wait=0.0, interval=0.8):
@@ -886,6 +1089,35 @@ def _preflight_silence_windows(core_exe_path):
             winreg.SetValueEx(key, "NewNetworks", 0, winreg.REG_DWORD, 0)
     except Exception:
         pass
+
+
+    # 4) **昵称信标端口**：Yuhub.exe 要在虚拟网卡上收 UDP 广播、接受
+    #    TCP 昵称查询（NickBeacon，端口 NICK_PORT）。虚拟网卡默认是
+    #    "公共网络"配置文件，Windows 默认拦入站——没有这条规则，
+    #    广播收不到、TCP 查询应不上，昵称就显示不出来。watchdog 正好
+    #    是提权进程，顺手放行；范围严格限定"本程序 + 该端口"。
+    beacon_rule = "Yuhub 联机昵称信标"
+    own_exe = os.path.abspath(sys.executable)
+    for direction in ("in", "out"):
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "delete", "rule",
+             "name=" + beacon_rule],
+            capture_output=True, encoding="gbk", errors="replace",
+            timeout=8, creationflags=_CREATE_NO_WINDOW,
+        )
+    for proto in ("udp", "tcp"):
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             "name=" + beacon_rule,
+             "dir=in",
+             "action=allow",
+             "program=" + own_exe,
+             "protocol=" + proto,
+             "localport=" + str(NICK_PORT),
+             "enable=yes"],
+            capture_output=True, encoding="gbk", errors="replace",
+            timeout=10, creationflags=_CREATE_NO_WINDOW,
+        )
 
 
 def _physical_network_fingerprint():

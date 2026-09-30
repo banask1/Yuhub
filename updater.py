@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -344,44 +345,158 @@ def _url_allowed(url):
     return False
 
 
+# ---------------------------------------------------------------- 下载源与探测
+# 国内直连 github.com（下载还要再跳 objects.githubusercontent.com）经常
+# 连不上或 DNS 挂起。下载源按顺序尝试：官方直连 → 中转镜像。
+# 镜像只是给原 URL 加前缀，文件字节完全一致——info.sha256 校验仍然生效，
+# 被篡改的镜像过不了校验，所以这里不存在安全降级。
+DOWNLOAD_MIRRORS = ("ghproxy.net", "gh-proxy.com")
+
+
+def _download_candidates(asset_url):
+    """生成候选下载地址：官方直连优先，镜像兜底。"""
+    urls = [asset_url]
+    tail = asset_url.split("://", 1)[1] if "://" in asset_url else ""
+    if tail.startswith("github.com/"):
+        for m in DOWNLOAD_MIRRORS:
+            urls.append("https://%s/https://%s" % (m, tail))
+    return urls
+
+
+def _probe_bounded(url, timeout=25.0):
+    """带**上限**的探测。返回 ProbeResult；超时返回 None。
+
+    「一直卡在准备下载」的根因：DNS 解析（getaddrinfo）**不受 socket
+    超时控制**——urlopen(timeout=20) 管得住连接和读，管不住域名解析，
+    而解析 github.com 卡住几分钟是国内网络的常态。这里把探测放进
+    守护线程，join 到点就放弃（遗弃的 daemon 线程自生自灭，无害），
+    主流程换下一个源。
+    """
+    box = {}
+
+    def _job():
+        try:
+            import downloader
+            box["res"] = downloader.probe(url)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                import downloader
+                box["res"] = downloader.ProbeResult(url=url, ok=False,
+                                                    error=str(exc))
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_job, name="YuhubUpdProbe", daemon=True)
+    t.start()
+    t.join(timeout)
+    return box.get("res")
+
+
 def download_update(info, on_progress=None, cancel=None, threads=None):
     """下载更新包。返回 (ok, message, path)。
 
-    复用 downloader.py（断点续传 / 多线程 / 进度回调），
-    与下载页体验一致。
+    v0.8.3beta 修复两个用户实测的 bug：
+      1. **卡在「准备下载」**：原实现走 downloader.download()，其探测
+         阶段的 DNS 不受 socket 超时控制，直连 github.com 卡住就永远
+         卡住。现在：候选源 = 官方直连 + 两个中转镜像，逐个尝试；
+         每个源的探测上限 25 秒，卡住就换下一个。
+      2. **点取消后卡在「正在取消」**：原来取消标志只在分块之间检查，
+         线程卡在探测/DNS 时永远到不了下一个分块。现在取消在每个
+         阶段边界（换源前 / 进度泵每 0.2 秒）都会生效，探测本身也
+         有上限，不存在永远等不到的等待。
+
+    下载复用 downloader.DownloadTask（断点续传式分块 / 进度快照），
+    与下载页体验一致；下载后的 sha256 校验对镜像同样生效。
     """
     if not info or not info.asset_url:
         return False, "没有可下载的更新包", ""
-    url = info.asset_url
-    if not _url_allowed(url):
+    if not _url_allowed(info.asset_url):
         return False, "更新地址不是 https，已拒绝", ""
 
-    dest = package_path(info)
     try:
         import downloader
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, "下载模块不可用：%s" % (e,), ""
 
-    ok, msg = downloader.download(url, dest, threads=threads,
-                                  on_progress=on_progress, cancel=cancel)
-    if not ok:
-        return False, msg, ""
-    if not os.path.isfile(dest):
-        return False, "下载完成但文件不存在", ""
+    dest = package_path(info)
+    last_err = ""
 
-    # 大小比对（GitHub 会给出准确 size；本地文件明显偏小说明下到一半）
-    if info.asset_size and os.path.getsize(dest) < info.asset_size:
-        return False, ("文件不完整（%d / %d 字节）"
-                       % (os.path.getsize(dest), info.asset_size)), ""
+    def cancelled():
+        return bool(cancel and cancel())
 
-    if not verify_sha256(dest, info.sha256):
-        try:
-            os.remove(dest)
-        except OSError:
-            pass
-        return False, "校验失败，文件可能已损坏或被篡改，已删除", ""
+    def report_status(text):
+        # 让 UI 的状态行知道"正在换源"（snapshot 里带 status_text 扩展键）
+        if on_progress:
+            try:
+                on_progress({"status_text": text})
+            except Exception:
+                pass
 
-    return True, "下载完成", dest
+    candidates = _download_candidates(info.asset_url)
+    for idx, url in enumerate(candidates, 1):
+        if cancelled():
+            return False, "已取消", ""
+        if idx > 1:
+            report_status("直连失败，正在尝试中转镜像（%d/%d）…"
+                          % (idx - 1, len(candidates) - 1))
+        else:
+            report_status("正在连接更新源…")
+
+        # ---- ① 限时探测：拿大小/分块支持，同时筛掉连不上的源 ----
+        pres = _probe_bounded(url, timeout=25.0)
+        if cancelled():
+            return False, "已取消", ""
+        if pres is None:
+            last_err = "连接超时（源 %d/%d）" % (idx, len(candidates))
+            continue
+        if not pres.ok:
+            last_err = pres.error or "连接失败（源 %d/%d）" % (idx, len(candidates))
+            continue
+
+        # ---- ② 下载（探测结果直接传入，任务内不再重复探测） ----
+        task = downloader.DownloadTask(url, dest, threads=threads,
+                                       probe_result=pres)
+        task.start()
+        asked = False
+        while task.running:
+            snap = task.snapshot()
+            if on_progress:
+                try:
+                    on_progress(snap)
+                except Exception:
+                    pass
+            if cancel and not asked and cancel():
+                asked = True
+                task.cancel()
+            time.sleep(0.2)
+        snap = task.snapshot()
+        if on_progress:
+            try:
+                on_progress(snap)
+            except Exception:
+                pass
+
+        if snap["status"] == downloader.STATUS_CANCELLED:
+            return False, "已取消", ""
+        if snap["status"] != downloader.STATUS_DONE:
+            last_err = snap["error"] or "下载失败（源 %d/%d）" % (idx, len(candidates))
+            continue                     # 这个源不行，换下一个
+
+        # ---- ③ 校验（大小 + sha256，镜像下载的字节同样要过这一关） ----
+        if not os.path.isfile(dest):
+            return False, "下载完成但文件不存在", ""
+        if info.asset_size and os.path.getsize(dest) < info.asset_size:
+            return False, ("文件不完整（%d / %d 字节）"
+                           % (os.path.getsize(dest), info.asset_size)), ""
+        if not verify_sha256(dest, info.sha256):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return False, "校验失败，文件可能已损坏或被篡改，已删除", ""
+        return True, "下载完成", dest
+
+    return False, last_err or "所有更新源均不可达", ""
 
 
 # ================================================================ 进程工具
