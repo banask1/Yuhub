@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 
 from PySide6.QtCore import Qt, QEvent, QSettings, QTimer
 from PySide6.QtGui import QCursor, QGuiApplication, QIcon
@@ -18,9 +19,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
-from . import VERSION_LABEL
+from . import VERSION, VERSION_LABEL
 from .tray import TrayIcon, tray_available
 from .widgets import show_toast
+from .update_ui import UpdateChecker, UpdateAvailableDialog, UpdateProgressDialog
 from .pages.home_page import HomePage
 from .pages.cleaner_page import CleanerPage
 from .pages.download_page import DownloadPage
@@ -240,6 +242,145 @@ class MainWindow(QWidget):
         if self.started_hidden:
             self.hide()
 
+        # 自动更新：启动后延迟一点在后台静默检查（不阻塞启动、失败不打扰）。
+        # 用户可在设置里关掉（"自动检查更新"开关）。
+        self._update_busy = False
+        self._updater_thread = None
+        self._update_pending = None
+        self._dl_cancel = None
+        if read_bool(self._settings, "auto_check_update", True):
+            QTimer.singleShot(2500, self._check_update_silent)
+
+    # ------------------------------------------------------------ 自动更新
+    def _check_update_silent(self):
+        """启动时的静默检查：只有发现新版本才弹窗，任何失败都不打扰用户。"""
+        if self._update_busy:
+            return
+        self._update_busy = True
+        th = UpdateChecker(VERSION)
+        th.found.connect(self._on_update_found)
+        th.finished_.connect(self._on_update_check_done)
+        self._updater_thread = th
+        th.start()
+
+    def _on_update_check_done(self):
+        self._update_busy = False
+
+    def _on_update_found(self, info):
+        """子线程发现新版 → 主线程弹窗。"""
+        # 开机自启（静默进托盘）时不弹窗打扰；等用户真的打开窗口再说
+        if self.started_hidden and not self.isVisible():
+            self._update_pending = info
+            return
+        self._prompt_update(info)
+
+    def _prompt_update(self, info):
+        dlg = UpdateAvailableDialog(info, VERSION_LABEL, parent=self)
+        dlg.exec()
+        if dlg.action == "update":
+            self._start_update_download(info)
+
+    def _start_update_download(self, info):
+        """下载更新包（后台线程），完成后询问是否重启并更新。"""
+        import updater
+
+        prog = UpdateProgressDialog(info, parent=self)
+        self._dl_cancel = False
+
+        def on_progress(snap):
+            # 从下载线程回调 → 用队列式信号回到主线程更新 UI
+            try:
+                QTimer.singleShot(0, lambda s=dict(snap): prog.set_progress(s))
+            except RuntimeError:
+                pass
+
+        def cancel():
+            return bool(self._dl_cancel)
+
+        holder = {}
+
+        def work():
+            try:
+                ok, msg, path = updater.download_update(
+                    info, on_progress=on_progress, cancel=cancel)
+            except Exception as e:
+                ok, msg, path = False, "下载异常：%s" % (e,), ""
+            holder["r"] = (ok, msg, path)
+            try:
+                QTimer.singleShot(0, done)
+            except RuntimeError:
+                pass
+
+        def done():
+            ok, msg, path = holder.get("r", (False, "未知错误", ""))
+            if ok:
+                prog.finish_ok("更新包已就绪")
+                prog.exec()
+                self._apply_update(info, path)
+            else:
+                prog.finish_fail("下载失败：%s" % msg)
+                prog.exec()
+
+        def on_cancel():
+            self._dl_cancel = True
+
+        prog.cancelled.connect(on_cancel)
+        threading.Thread(target=work, name="YuhubUpdateDownload", daemon=True).start()
+        prog.exec()
+
+    def _apply_update(self, info, package):
+        """把更新交给替换器：拷一份自己做替换器 → 拉起 → 自己退出。"""
+        import updater
+
+        try:
+            payload = updater.build_request(
+                package, updater.sys_executable(), os.getpid(),
+                new_version=info.tag,
+            )
+            staged = updater.stage_updater(payload)
+            need_admin = updater.needs_elevation(payload["target_exe"])
+            ok, msg = updater.launch_updater(staged, payload, elevated=need_admin)
+        except Exception as e:
+            show_toast(self, "启动更新失败：%s" % (e,))
+            return
+
+        if not ok:
+            show_toast(self, msg)
+            return
+
+        # 更新程序已接手，本进程必须退出，否则它等不到旧 PID 结束
+        show_toast(self, "正在更新，程序即将重启…")
+        QTimer.singleShot(600, self.request_quit)
+
+    def show_update_if_pending(self):
+        """窗口真正显示出来时，把静默期间挂起的更新提示补上。"""
+        info = self._update_pending
+        if info is not None:
+            self._update_pending = None
+            QTimer.singleShot(400, lambda i=info: self._prompt_update(i))
+
+    def check_update_now(self, interactive=True):
+        """设置页「检查更新」按钮入口。返回是否发起了检查。"""
+        if self._update_busy:
+            if interactive:
+                show_toast(self, "正在检查更新…")
+            return False
+        self._update_busy = True
+        th = UpdateChecker(VERSION)
+        if interactive:
+            th.found.connect(self._on_update_found)
+            th.failed.connect(lambda e: show_toast(self, "检查失败：%s" % e))
+            th.finished_.connect(
+                lambda: (setattr(self, "_update_busy", False),
+                         show_toast(self, "已是最新版本") if th.result is None
+                         and not th.error else None))
+        else:
+            th.found.connect(self._on_update_found)
+            th.finished_.connect(self._on_update_check_done)
+        self._updater_thread = th
+        th.start()
+        return True
+
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         self._outer = QVBoxLayout(self)
@@ -396,6 +537,8 @@ class MainWindow(QWidget):
             home = self._pages.get("home")
             if home is not None and hasattr(home, "start_hardware_scan"):
                 QTimer.singleShot(120, home.start_hardware_scan)
+        # 开机自启静默进托盘期间发现的更新，等窗口真打开时再提示
+        self.show_update_if_pending()
 
     # -------------------------------------------------------------- 行为
     def closeEvent(self, event):
@@ -426,6 +569,8 @@ class MainWindow(QWidget):
         if self._torn_down:
             return
         self._torn_down = True
+        # 下载中的更新要能优雅取消（.part 保留，下次续传）
+        self._dl_cancel = True
         for page in self._pages.values():
             if hasattr(page, "shutdown"):
                 try:
