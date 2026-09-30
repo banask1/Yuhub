@@ -41,19 +41,38 @@ def _add(name, passed, detail=""):
 class _Handler(http.server.BaseHTTPRequestHandler):
     """按路径返回不同的伪装响应。
 
-    /repos/<o>/<r>/releases/latest  → 假 Release JSON
+    /repos/<o>/<r>/releases/latest  → 假 Release JSON（可切换成 404）
+    /repos/<o>/<r>/releases         → 假 Release 列表
     /download/<file>                → 假 exe 字节流
     """
 
     release = {}
+    release_list = []
     payload = b""
+    latest_404 = False          # True 时 latest 返回 404（模拟"只有 prerelease"）
 
     def log_message(self, *a):
         pass                                   # 静音
 
     def do_GET(self):
         if self.path.startswith("/repos/") and self.path.endswith("/releases/latest"):
+            if self.latest_404:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                body = b'{"message":"Not Found"}'
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = json.dumps(self.release).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if "/releases" in self.path and "latest" not in self.path:
+            body = json.dumps(self.release_list).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -169,6 +188,35 @@ def _test_check_update(port, tag):
          "err=%r（不应崩溃）" % (err3,))
 
     return info
+
+
+def _test_prerelease_fallback(port, tag):
+    """⚠️ 关键回归：GitHub 的 releases/latest **跳过 prerelease**。
+
+    本项目 tag 就叫 v0.8beta，发布时如果勾了 pre-release，
+    latest 接口会 404 —— 客户端就永远看不到更新。
+    这里模拟"latest 404，但列表里有 prerelease"，验证能正确兜底。
+    """
+    base = "http://127.0.0.1:%d" % port
+    _Handler.latest_404 = True
+    try:
+        info, err = updater.check_for_update(
+            "0.7.0", owner="u", repo="r", api_base=base)
+        _add("latest 404 时退到 releases 列表（prerelease 也能发现）",
+             info is not None and info.tag == tag and not err,
+             "tag=%s err=%r" % (info.tag if info else None, err))
+
+        # 列表里全是 draft → 应当视为没有可更新版本
+        saved = _Handler.release_list
+        _Handler.release_list = [dict(saved[0], draft=True)]
+        info2, err2 = updater.check_for_update(
+            "0.7.0", owner="u", repo="r", api_base=base)
+        _add("draft 版本不被当作更新",
+             info2 is None and not err2,
+             "info=%r err=%r" % (info2, err2))
+        _Handler.release_list = saved
+    finally:
+        _Handler.latest_404 = False
 
 
 def _test_download_and_verify(info):
@@ -397,7 +445,9 @@ def run(out_path):
         # ---- 跑各项检查 ----
         _test_version_compare()
         _test_pick_asset()
+        _Handler.release_list = [_Handler.release]      # 供 latest-404 兜底测试用
         info = _test_check_update(port, tag)
+        _test_prerelease_fallback(port, tag)
 
         if info is not None:
             _test_download_and_verify(info)

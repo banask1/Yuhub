@@ -193,19 +193,67 @@ def parse_release(d):
     )
 
 
+def fetch_release(owner=REPO_OWNER, repo=REPO_NAME, timeout=HTTP_TIMEOUT,
+                  api_base="https://api.github.com"):
+    """取最新 Release。返回 (ReleaseInfo | None, error_str)。
+
+    ⚠️ 关键陷阱：GitHub 的 `releases/latest` **会跳过 prerelease 和 draft**。
+    对一个还在 beta 阶段的项目（tag 就叫 v0.8beta），如果发布时勾了
+    "pre-release"，这个接口会直接 404 —— 客户端就永远检查不到更新。
+
+    所以策略是：先试 `latest`，拿不到再退到 releases 列表，
+    取**第一个非 draft** 的版本（预发布也认，因为本项目当前正处在 beta 阶段）。
+    """
+    base = api_base.rstrip("/")
+    latest_url = "%s/repos/%s/%s/releases/latest" % (base, owner, repo)
+
+    # ---- ① 优先 latest（正式版走得通，语义最准）----
+    try:
+        data = _http_json(latest_url, timeout=timeout)
+        if data.get("tag_name"):
+            return parse_release(data), ""
+    except urllib.error.HTTPError as e:
+        if e.code not in (404, 403):
+            return None, "服务返回 HTTP %d" % e.code
+        if e.code == 403:
+            return None, "请求过于频繁或网络受限（HTTP 403）"
+        # 404：要么没有任何 Release，要么只有 prerelease —— 往下走列表
+    except urllib.error.URLError as e:
+        return None, "网络不可达：%s" % (getattr(e, "reason", e),)
+    except Exception as e:
+        return None, "检查失败：%s" % (e,)
+
+    # ---- ② 退到列表：取第一个非 draft 的版本 ----
+    list_url = "%s/repos/%s/%s/releases?per_page=10" % (base, owner, repo)
+    try:
+        arr = _http_json(list_url, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, ""          # 仓库里一个 Release 都没有
+        return None, "服务返回 HTTP %d" % e.code
+    except urllib.error.URLError as e:
+        return None, "网络不可达：%s" % (getattr(e, "reason", e),)
+    except Exception as e:
+        return None, "检查失败：%s" % (e,)
+
+    if not isinstance(arr, list) or not arr:
+        return None, ""
+
+    for item in arr:
+        if item.get("draft"):
+            continue                  # 草稿不该被客户端看到
+        if not item.get("tag_name"):
+            continue
+        return parse_release(item), ""
+
+    return None, ""
+
+
 def github_latest(owner=REPO_OWNER, repo=REPO_NAME, timeout=HTTP_TIMEOUT,
                   api_base="https://api.github.com"):
     """取最新 Release。拿不到返回 None（静默失败，不抛）。"""
-    url = "%s/repos/%s/%s/releases/latest" % (api_base.rstrip("/"), owner, repo)
-    try:
-        return parse_release(_http_json(url, timeout=timeout))
-    except urllib.error.HTTPError as e:
-        # 404 = 还没有任何 release（新仓库很常见），不算错误
-        if e.code == 404:
-            return None
-        return None
-    except Exception:
-        return None
+    info, _ = fetch_release(owner, repo, timeout, api_base)
+    return info
 
 
 def check_for_update(current_version, owner=REPO_OWNER, repo=REPO_NAME,
@@ -217,24 +265,11 @@ def check_for_update(current_version, owner=REPO_OWNER, repo=REPO_NAME,
     - 已最新： (None, "")
     - 出错：   (None, "原因")
     """
-    url = "%s/repos/%s/%s/releases/latest" % (api_base.rstrip("/"), owner, repo)
-    try:
-        data = _http_json(url, timeout=timeout)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None, ""      # 没有 release，视为已最新
-        if e.code == 403:
-            return None, "请求过于频繁或网络受限（HTTP 403）"
-        return None, "服务返回 HTTP %d" % e.code
-    except urllib.error.URLError as e:
-        return None, "网络不可达：%s" % (getattr(e, "reason", e),)
-    except Exception as e:
-        return None, "检查失败：%s" % (e,)
-
-    try:
-        info = parse_release(data)
-    except Exception as e:
-        return None, "解析更新信息失败：%s" % (e,)
+    info, err = fetch_release(owner, repo, timeout, api_base)
+    if err:
+        return None, err
+    if info is None:
+        return None, ""              # 没有 Release，视为已最新
 
     if not info.asset_url:
         return None, "该版本没有可下载的文件"
