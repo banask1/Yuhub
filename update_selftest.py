@@ -402,6 +402,65 @@ def _test_selftest_mode_guarded():
     _add("空路径 → 拒绝执行", rc2 == 3, "返回码=%r" % rc2)
 
 
+def _test_checker_signals_connectable():
+    """回归：UpdateChecker 的 Qt 信号必须能 connect。
+
+    曾经的严重 bug —— UpdateChecker 只继承了 threading.Thread，
+    而 Qt 的 Signal 只有在 QObject 派生类上才被元对象系统接管，
+    于是 `th.found.connect(...)` 抛
+      AttributeError: 'Signal' object has no attribute 'connect'
+    导致「启动静默检查」和「手动检查更新」**两条路都在第一步就崩**，
+    自动更新等于完全没生效（而 --update-selftest 只测 updater 纯逻辑，
+    覆盖不到这一层，所以此前一直没暴露）。
+
+    这里不去 import ui.update_ui（那需要 QApplication），
+    而是直接检查类的 MRO 里有没有 QObject —— 轻量且足够。
+    """
+    try:
+        from PySide6.QtCore import QObject
+    except Exception as e:
+        _add("Qt 可用（信号回归检查前置）", False, str(e))
+        return
+
+    try:
+        from ui.update_ui import UpdateChecker
+    except Exception as e:
+        _add("能导入 UpdateChecker", False, str(e))
+        return
+
+    mro_names = [c.__name__ for c in UpdateChecker.__mro__]
+    has_qobject = issubclass(UpdateChecker, QObject)
+    _add("UpdateChecker 继承 QObject（信号才能 connect）",
+         has_qobject, "MRO=%s" % " → ".join(mro_names))
+
+    # ⚠️ 在**类**上取信号拿到的是 Signal 描述符，它本身没有 connect；
+    # 只有绑定到**实例**后才变成 bound signal。所以必须实例化再检查。
+    # 构造不启动线程，也不需要 QApplication。
+    try:
+        inst = UpdateChecker("0.0.0.0")
+    except Exception as e:
+        _add("能实例化 UpdateChecker", False, str(e))
+        return
+
+    _add("能实例化 UpdateChecker", True, "已构造")
+
+    for sig_name in ("found", "failed", "finished_"):
+        sig = getattr(inst, sig_name, None)
+        ok = sig is not None and hasattr(sig, "connect")
+        _add("信号 %s 可连接" % sig_name, ok, "类型=%s" % type(sig).__name__)
+
+    # 真正连一次（不发射），彻底确认不会抛 AttributeError
+    try:
+        inst.found.connect(lambda _o: None)
+        inst.failed.connect(lambda _s: None)
+        inst.finished_.connect(lambda: None)
+        _add("三个信号实际 connect 不报错", True, "已连接空槽")
+    except Exception as e:
+        _add("三个信号实际 connect 不报错", False, repr(e))
+
+
+
+
 # ================================================================ 入口
 
 def run(out_path):
@@ -456,6 +515,7 @@ def run(out_path):
         _test_http_downgrade_rejected()
         _test_replace_flow(port, tag, sha, fake_exe)
         _test_selftest_mode_guarded()
+        _test_checker_signals_connectable()
 
     except Exception as e:
         import traceback

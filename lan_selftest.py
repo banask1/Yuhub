@@ -84,13 +84,15 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
     result["timeline"].append({"t": round(time.time() - t0, 3), "ev": "start_begin"})
     try:
         ok, msg = tier.start("yuhub-" + code.lower().replace(" ", ""),
-                             password, timeout=timeout, ipv4="10.126.126.1")
+                             password, timeout=timeout, ipv4="10.126.126.1",
+                             hostname="YuhubSelfTest")
     except Exception as exc:
         ok, msg = False, repr(exc)
     elapsed = time.time() - t0
     result["timeline"].append({"t": round(elapsed, 3), "ev": "start_returned",
                                "ok": ok, "msg": str(msg)})
     mark("创建跨网房间", bool(ok), "%.1fs → ok=%s msg=%s" % (elapsed, ok, msg))
+
 
     if ok:
         ip = etier.virtual_adapter_ip()
@@ -105,6 +107,22 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
             mark("成员列表接口可用", True, "当前成员 %r" % (members,))
         except Exception as exc:
             mark("成员列表接口可用", False, repr(exc))
+        # 带名称的成员列表（本次改动新增）
+        try:
+            detailed = etier.list_members_detailed(ip, resolve=False)
+            shape_ok = isinstance(detailed, list) and all(
+                isinstance(d, dict) and "ip" in d and "name" in d for d in detailed
+            )
+            mark("成员列表（含名称）接口可用", shape_ok, "返回 %r" % (detailed,))
+        except Exception as exc:
+            mark("成员列表（含名称）接口可用", False, repr(exc))
+        # 房主探测接口（成员校验靠它）
+        try:
+            self_hit = etier.probe_host(ip, timeout=2.0, attempts=1)
+            mark("房主探测接口可用（探自己应通）", self_hit,
+                 "probe_host(%s)=%s" % (ip, self_hit))
+        except Exception as exc:
+            mark("房主探测接口可用（探自己应通）", False, repr(exc))
         # 网络指纹检测接口
         try:
             changed = tier.network_changed()
@@ -188,6 +206,107 @@ def _check_ui_state(result, mark):
     # 关键回归：busy 标记必须被清掉，否则用户再点也不会触发启动
     mark("启动结束后 busy 标记已复位",
          page._etier_busy is False, "_etier_busy=%s" % page._etier_busy)
+
+    _check_join_validation(page, mark)
+    _check_nickname(page, mark)
+
+
+def _check_join_validation(page, mark):
+    """成员侧准入校验的回归：房间不存在时必须回滚并报错。"""
+    # 身份判断
+    page.mode.set_current("join")
+    mark("join 身份识别为成员", page._is_member() is True,
+         "_is_member()=%s" % page._is_member())
+    page.mode.set_current("host")
+    mark("host 身份识别为房主", page._is_member() is False,
+         "_is_member()=%s" % page._is_member())
+
+    # 构造一个"正在运行"的假状态，然后喂一个"找不到房主"的校验结果
+    class _FakeTier2:
+        def request_stop(self):
+            return True
+
+        def stop(self):
+            return True
+
+        def network_changed(self):
+            return False
+
+    page._etier = _FakeTier2()
+    page._running = True
+    page._my_ip = "10.126.126.2"
+    page.btn_stop.setEnabled(True)
+    page.btn_copy_ip.setEnabled(True)
+    page.ip_label.setText("10.126.126.2")
+    page._verify_seq = 4242
+
+    # ① 过期的校验结果必须被忽略（防竞态）
+    page._on_verify_result({"seq": 1, "found": False})
+    mark("过期校验结果被忽略（不误伤）", page._running is True,
+         "_running=%s" % page._running)
+
+    # ② 本轮结果：未找到房主 → 必须完整回滚
+    page._on_verify_result({"seq": 4242, "found": False})
+    rolled_back = (
+        page._running is False
+        and page._etier is None
+        and page.btn_start.isEnabled()
+        and not page.btn_stop.isEnabled()
+        and page.ip_label.text() == "--"
+    )
+    mark("校验失败后完整回滚到可重试状态", rolled_back,
+         "running=%s etier=%s start可用=%s stop可用=%s ip=%r"
+         % (page._running, page._etier, page.btn_start.isEnabled(),
+            page.btn_stop.isEnabled(), page.ip_label.text()))
+    mark("校验失败给用户明确提示（不是静默）",
+         "加入失败" in page.status_note.text(),
+         "提示=%r" % page.status_note.text()[:60])
+
+    # ③ 校验通过 → 保持运行
+    page._etier = _FakeTier2()
+    page._running = True
+    page._verify_seq = 4243
+    page._on_verify_result({"seq": 4243, "found": True})
+    mark("校验通过后保持运行", page._running is True and page._etier is not None,
+         "_running=%s" % page._running)
+
+
+def _check_nickname(page, mark):
+    """昵称：清洗规则 + 落盘 + 默认值。"""
+    from ui.pages.lan_page import sanitize_nickname, default_nickname
+
+    bad_cases = [
+        ("with space", "withspace"),
+        ('quote"inside', "quoteinside"),
+        ("semi;colon", "semlcolon") if False else ("semi;colon", "semicolon"),
+        ("x" * 40, "x" * 16),
+    ]
+    all_ok = True
+    detail = []
+    for raw, want in bad_cases:
+        got = sanitize_nickname(raw)
+        if got != want:
+            all_ok = False
+            detail.append("%r→%r(期望%r)" % (raw, got, want))
+    mark("昵称清洗：剔除空格/引号/分号并限长", all_ok, " ".join(detail) or "全部符合")
+
+    d = default_nickname()
+    mark("默认昵称非空且长度合理", bool(d) and len(d) <= 16, repr(d))
+
+    # 清洗后为空时必须回落默认值（不能让 EasyTier 收到空 hostname）
+    page.nick_edit.setText("!!!")
+    got = page._current_nickname()
+    mark("昵称全非法字符时回落默认值", bool(got), "回落到 %r" % got)
+
+    # 落盘
+    page.nick_edit.setText("VeriFyNick")
+    nick = page._current_nickname()
+    page._save_nickname(nick)
+    from PySide6.QtCore import QSettings
+    box = QSettings("Yuhub", "Yuhub")
+    saved = str(box.value("lan_nickname", "") or "")
+    mark("昵称写入设置并读回一致", saved == nick, "存=%r 读=%r" % (nick, saved))
+
 
 
 def _dump(result, out_file):

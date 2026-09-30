@@ -61,6 +61,7 @@ import ctypes.wintypes as wt
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -372,6 +373,68 @@ def virtual_adapter_ip():
     return ""
 
 
+def _resolve_name(ip, timeout=0.6):
+    """把虚拟 IP 反查成主机名（昵称）。
+
+    EasyTier 的虚拟网卡走的是 NetBIOS/LLMNR 名称解析，`socket.gethostbyaddr`
+    在 Windows 上会走系统解析链，多数情况能把设置过 --hostname 的节点查出来。
+    查不到返回空串——调用方回落到只显示 IP。
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        name, _aliases, _addrs = socket.gethostbyaddr(ip)
+        return (name or "").strip()
+    except Exception:
+        return ""
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+def list_members_detailed(my_ip="", resolve=True):
+    """列出在线成员，尽量带上名称。
+
+    返回 [{"ip": "10.126.126.3", "name": "XiaoYu"}, ...]，不含自己。
+
+    名称来源优先级：
+      1. 反查主机名（EasyTier 的 --hostname 会体现在这里）
+      2. 查不到就留空，UI 只显示 IP
+
+    反查有超时（每个 0.6 秒），所以成员多时耗时会线性增长——
+    调用方（lan_page 的 800ms tick）应传入 resolve=False 做快速刷新，
+    只在需要时偶尔做一次带名称的完整刷新。
+    """
+    ips = list_members(my_ip)
+    out = []
+    for ip in ips:
+        name = _resolve_name(ip) if resolve else ""
+        out.append({"ip": ip, "name": name})
+    return out
+
+
+def probe_host(host_ip, timeout=2.0, attempts=2):
+    """探测某个虚拟 IP 是否在线（用于成员校验"房主是否真的在房间里"）。
+
+    用 ping 而不是 ARP：ARP 条目可能是陈旧的缓存，ping 是主动探测更可信。
+    Windows 的 ping 即使不通也返回 0，所以必须看输出里的 TTL/时间字段。
+    """
+    for _ in range(max(1, attempts)):
+        try:
+            r = subprocess.run(
+                ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host_ip],
+                capture_output=True, text=True, encoding="gbk",
+                errors="replace", timeout=timeout + 2,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            out = (r.stdout or "")
+            # 中文系统输出 "TTL=" / 英文 "TTL="；不通时是 "无法访问目标主机"/"timed out"
+            if "TTL=" in out.upper() or "ttl=" in out:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+
 def list_members(my_ip=""):
     """列出当前跨网网络里的在线成员（虚拟 IP 列表，不含自己）。
 
@@ -596,11 +659,13 @@ class EasyTier:
         time.sleep(1.5)                 # 给提权进程一点时间跑完 taskkill
         return not core_running()
 
-    def start(self, name, secret, timeout=20.0, ipv4=""):
+    def start(self, name, secret, timeout=20.0, ipv4="", hostname=""):
         """创建/加入跨网网络。阻塞直到虚拟网卡就绪或超时。
 
         name/secret 即 EasyTier 的 network-name / network-secret。
         ipv4：固定虚拟 IP（房主 10.126.126.1 / 成员 10.126.126.2），为空用 DHCP。
+        hostname：本节点在房间里的显示名（队友在成员列表里看到的就是它）；
+                  为空则 EasyTier 用系统计算机名（DESKTOP-XXXX 不好认）。
         返回 (成功, 说明)。成功后 virtual_adapter() 可查虚拟 IP。
         """
         with self._lock:
@@ -637,7 +702,14 @@ class EasyTier:
                 "--network-secret", secret,
                 "--latency-first",
                 "--no-listener",
+                # 捕获物理网卡上的 UDP 广播包并转发给对等节点：让依赖
+                # 局域网广播发现房间的游戏（Minecraft 等）能看到彼此。
+                # 仅 Windows 生效，需要管理员权限——watchdog 本来就是提权进程。
+                "--enable-udp-broadcast-relay", "true",
             ]
+            if hostname:
+                # 队友在成员列表里看到的名字（不传就是计算机名 DESKTOP-XXXX）
+                args += ["--hostname", hostname]
             if ipv4:
                 # 固定虚拟 IP：只给 -i、不加 -d，否则 DHCP 会覆盖它（-d 与 -i 互斥）
                 args += ["-i", ipv4]

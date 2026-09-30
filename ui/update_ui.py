@@ -10,7 +10,7 @@
 
 import threading
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QProgressBar,
     QPushButton, QScrollArea, QWidget,
@@ -22,11 +22,16 @@ from .widgets import ghost_button, primary_button
 
 # ================================================================ 后台检查
 
-class UpdateChecker(threading.Thread):
+class UpdateChecker(QObject, threading.Thread):
     """启动时的静默检查（后台线程）。
 
     在子线程里只做纯网络 + 纯逻辑（updater.check_for_update），
     结果通过 Qt 信号回到主线程处理——**绝不在子线程碰 UI**。
+
+    ⚠️ 必须同时继承 QObject：Qt 的 Signal 只有在 QObject 派生类上才会
+    被元对象系统接管，否则 `th.found.connect(...)` 会抛
+    `AttributeError: 'Signal' object has no attribute 'connect'`。
+    mro 里 QObject 必须排在 threading.Thread 前面。
     """
 
     found = Signal(object)      # 有新版：ReleaseInfo
@@ -34,7 +39,10 @@ class UpdateChecker(threading.Thread):
     finished_ = Signal()        # 无论成败都会发
 
     def __init__(self, current_version, owner=None, repo=None, timeout=8):
-        super().__init__(name="YuhubUpdateCheck", daemon=True)
+        # ⚠️ 多重继承下 super() 只会走 MRO 第一个（QObject），
+        # Thread.__init__ 必须显式调用，否则 start() 时内部状态未初始化。
+        QObject.__init__(self)
+        threading.Thread.__init__(self, name="YuhubUpdateCheck", daemon=True)
         self._current = current_version
         self._owner = owner
         self._repo = repo
