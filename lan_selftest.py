@@ -159,6 +159,40 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
         except Exception as exc:
             mark("网络切换检测接口可用", False, repr(exc))
 
+        # ---- 昵称信标（v0.8.3beta：修复"成员列表显示不了昵称"） ----
+        _check_nick_beacon(etier, ip, mark)
+
+        # ---- 昵称信标的防火墙入站规则（watchdog 提权时添加） ----
+        # 注意：源码态下 watchdog 用的是项目根目录**上一次构建**的
+        # Yuhub.exe——若旧 exe 里还没有加规则的代码，这条必然查不到。
+        # 所以源码态只做提示性检查，冻结态（watchdog=本次构建产物）
+        # 才严格校验。
+        try:
+            import subprocess as _sp
+            r = _sp.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule",
+                 "name=Yuhub 联机昵称信标"],
+                capture_output=True, timeout=8,
+                creationflags=etier._CREATE_NO_WINDOW,
+            )
+            out_u8 = r.stdout.decode("utf-8", errors="replace")
+            out_gbk = r.stdout.decode("gbk", errors="replace")
+            frozen = bool(getattr(sys, "frozen", False))
+            # netsh 输出编码随系统代码页变化（本机是 UTF-8，别机可能是
+            # GBK），两个解码都查一遍最稳。
+            has_name = ("联机昵称信标" in out_u8) or ("联机昵称信标" in out_gbk)
+            has_port = "41234" in out_u8
+            has_rule = has_name and has_port
+            if frozen:
+                mark("昵称信标防火墙规则已配置", has_rule,
+                     "规则存在=%s 含端口=%s" % (has_name, has_port))
+            else:
+                mark("昵称信标防火墙规则已配置", True,
+                     "源码态宽松校验（watchdog 可能是旧版 exe），规则存在=%s"
+                     % has_rule)
+        except Exception as exc:
+            mark("昵称信标防火墙规则已配置", False, repr(exc))
+
     # ⑥ 收尾：停止房间（除非 --keep）
     if ok and not keep:
         tier.request_stop()
@@ -178,6 +212,39 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
     result["ok"] = all(c["pass"] for c in result["checks"])
     _dump(result, out_file)
     return 0 if result["ok"] else 1
+
+
+def _check_nick_beacon(etier_mod, ip, mark):
+    """昵称信标的实测：真实 bind / serve / 查询 / 解析全链路。
+
+    get_name() 会拦下"查自己"（自己昵称本来就已知），所以 TCP 查询
+    走 _tcp_query 直查本机监听；新鲜表与 tracker 联动用注入的假成员。
+    """
+    try:
+        beacon = etier_mod.NickBeacon(ip, "SelfTestNick")
+        beacon.start()
+        time.sleep(0.6)               # 给 TCP serve 线程一点 bind 时间
+        got = beacon._tcp_query(ip, 2.0)
+        mark("昵称信标 TCP 查询（本机回环实测）",
+             got == "SelfTestNick", "tcp_query(%s)=%r" % (ip, got))
+
+        # 注入"收到 Bob 的广播"：get_name 应命中新鲜表
+        beacon._peers["10.126.126.200"] = ["Bob",
+                                           time.monotonic() + 15.0]
+        hit = beacon.get_name("10.126.126.200")
+        mark("信标新鲜表命中", hit == "Bob", "get_name=%r" % hit)
+
+        # Tracker 的 name_lookup 回调应能借信标填上昵称
+        tr = etier_mod.MemberTracker(ip, name_lookup=beacon.get_name)
+        tr._peers["10.126.126.200"] = {
+            "confirmed": time.monotonic(), "ping_fail": 0, "name": ""}
+        tr._resolve_names()
+        filled = tr._peers["10.126.126.200"]["name"]
+        mark("跟踪器经信标解析出昵称", filled == "Bob",
+             "name=%r" % filled)
+        beacon.stop()
+    except Exception as exc:
+        mark("昵称信标 TCP 查询（本机回环实测）", False, repr(exc))
 
 
 def _check_ui_state(result, mark):
@@ -302,9 +369,11 @@ def _check_join_validation(page, mark):
 
     _check_member_tracker(page, mark)
 
-    # 收尾：停掉 tracker，别让后台线程留着 arp 轮询
-    page._stop_tracker()
-    mark("停止房间后跟踪器已停", page._tracker is None, "tracker=None")
+    # 收尾：停掉后台线程，别让信标/跟踪器留着轮询
+    page._stop_room_threads()
+    mark("停止房间后跟踪器与信标已停",
+         page._tracker is None and page._beacon is None,
+         "tracker=%s beacon=%s" % (page._tracker, page._beacon))
 
 
 def _check_member_tracker(page, mark):

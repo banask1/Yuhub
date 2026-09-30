@@ -290,7 +290,13 @@ class MainWindow(QWidget):
         def on_progress(snap):
             # 从下载线程回调 → 用队列式信号回到主线程更新 UI
             try:
-                QTimer.singleShot(0, lambda s=dict(snap): prog.set_progress(s))
+                s = dict(snap)
+                # updater 换下载源（直连失败转镜像）时的状态提示
+                text = s.pop("status_text", None)
+                if text:
+                    QTimer.singleShot(0, lambda t=text: prog.set_status(t))
+                if s:
+                    QTimer.singleShot(0, lambda s=s: prog.set_progress(s))
             except RuntimeError:
                 pass
 

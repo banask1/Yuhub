@@ -98,6 +98,7 @@ class LanPage(BasePage):
         self._running = False         # 是否在运行（用于状态显示）
         self._my_ip = ""              # 本机虚拟 IP（运行中）
         self._tracker = None          # etier.MemberTracker：成员在线稳定视图
+        self._beacon = None           # etier.NickBeacon：昵称信标（广播+TCP）
         self._members_row = []        # 当前渲染出来的成员 IP 顺序（用于增删行）
         self._host_nick = ""          # 本次启动用的昵称（成员列表第一行显示）
         self._started_wall = 0.0      # 本次进房的时间戳（time.time，给温和提示用）
@@ -581,10 +582,20 @@ class LanPage(BasePage):
             #
             # 成员的稳定在线视图交给 MemberTracker（后台 ping 保活 + 宽限
             # 判定），它同时把名称解析也挪出了 UI 线程。
-            self._stop_tracker()
-            self._tracker = etier.MemberTracker(
+            # 昵称靠 NickBeacon 应用层信标（UDP 广播 + TCP 查询兜底）：
+            # --hostname 不进 DNS/NetBIOS，gethostbyaddr 在虚拟网里查不出
+            # 昵称——这就是"成员列表总显示不了昵称"的根因（v0.8.3beta 修）。
+            self._stop_room_threads()
+            beacon_log = lambda m: self._event.emit("_etier_log", m)
+            self._beacon = etier.NickBeacon(
                 self._my_ip,
-                on_log=lambda m: self._event.emit("_etier_log", m),
+                self._host_nick or self._current_nickname(),
+                on_log=beacon_log,
+            )
+            self._beacon.start()
+            self._tracker = etier.MemberTracker(
+                self._my_ip, name_lookup=self._beacon.get_name,
+                on_log=beacon_log,
             )
             self._tracker.start()
             self._append_log("已进入房间（虚拟 IP %s）" % self._my_ip)
@@ -592,7 +603,7 @@ class LanPage(BasePage):
         else:
             self._running = False
             self._my_ip = ""
-            self._stop_tracker()
+            self._stop_room_threads()
             self._refresh_start_gate()
             self._set_status_note("")
             msg = payload.get("msg") or "未知原因"
@@ -603,14 +614,16 @@ class LanPage(BasePage):
                             "异地联机组件」里点「一键修复」重新安装")
             self.toast("启动失败：%s" % msg)
 
-    def _stop_tracker(self):
-        """停掉成员跟踪线程（重复调用安全）。"""
-        if self._tracker is not None:
-            try:
-                self._tracker.stop()
-            except Exception:
-                pass
-            self._tracker = None
+    def _stop_room_threads(self):
+        """停掉成员跟踪与昵称信标的后台线程（重复调用安全）。"""
+        for attr in ("_tracker", "_beacon"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.stop()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     def _on_stop(self):
         if self._etier_busy:
@@ -644,7 +657,7 @@ class LanPage(BasePage):
         self._running = False
         self._my_ip = ""
         self._host_nick = ""
-        self._stop_tracker()
+        self._stop_room_threads()
         self._set_running(False)
         self._set_status_note("")
         self._clear_members()
