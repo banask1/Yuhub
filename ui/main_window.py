@@ -76,8 +76,23 @@ def read_bool(settings, key, default):
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def init_theme_from_settings(settings):
+    """按 QSettings 里保存的偏好恢复主题包与深浅模式。
+
+    单独抽出来是因为启动画面（ui/splash.py）必须在**主窗口构建之前**
+    就拿到正确的深浅色——用户双击 exe 后启动画面第一个出现，
+    而构建全部页面要几百毫秒，不能让浅色用户先看一屏深色。
+    MainWindow.__init__ 也会再调一次（幂等：重复 set_pack/set_theme 无副作用）。
+    """
+    theme.reload_packs()
+    saved_pack = settings.value("theme_pack", "")
+    if saved_pack and saved_pack in theme.packs():
+        theme.set_pack(saved_pack)
+    theme.set_theme(theme.resolve_theme(settings.value("theme", "dark")))
+
+
 class NavButton(QPushButton):
-    """侧栏导航按钮：左侧一个纯色方块作为功能标识。"""
+    """侧栏导航按钮：极简色块模式是纯色小方块；玻璃主题是拟物玻璃贴片。"""
 
     def __init__(self, key, icon, text, parent=None):
         super().__init__(parent)
@@ -88,22 +103,51 @@ class NavButton(QPushButton):
         self._label = text
         self._tint_key = NAV_TINTS.get(key, "tile_1")
         theme.bus.changed.connect(lambda _: self._refresh())
+        # 选中态变化时也要刷新（玻璃贴片选中时描边换成主题色）
+        self.toggled.connect(lambda *_: self._refresh())
         self.set_expanded(True)
 
     def _refresh(self):
-        color = theme.current().get(self._tint_key, theme.current()["accent"])
-        self._dot.setStyleSheet(
-            f"background: {color}; border: none; border-radius: 3px;"
-        )
+        cur = theme.current()
+        color = cur.get(self._tint_key, cur["accent"])
+        if theme.glass_on():
+            # 拟物玻璃模式：emoji 装进 30x30 玻璃贴片（对角渐变 + 高光描边），
+            # 选中时描边换成主题色，像玻璃边缘被点亮
+            self._dot.setVisible(False)
+            self._icon_lbl.setVisible(False)
+            self._tile.setVisible(True)
+            hl = cur.get("accent", color) if self.isChecked() else None
+            self._tile.setStyleSheet(theme.glass_tile(color, radius=9,
+                                                      highlight=hl))
+        else:
+            self._tile.setVisible(False)
+            self._icon_lbl.setVisible(True)
+            self._dot.setVisible(True)
+            self._dot.setStyleSheet(
+                f"background: {color}; border: none; border-radius: 3px;"
+            )
 
     def set_expanded(self, expanded):
         if self.layout() is None:
             lay = QHBoxLayout(self)
             lay.setContentsMargins(14, 0, 12, 0)
             lay.setSpacing(10)
+            # 极简色块模式的标识：12x12 纯色方块
             self._dot = QFrame()
             self._dot.setFixedSize(12, 12)
             lay.addWidget(self._dot, 0, Qt.AlignVCenter)
+            # 玻璃主题的标识：30x30 拟物贴片 + emoji（两种模式各建一份，
+            # 按当前主题切显示，切换主题包时无需重建布局）
+            self._tile = QFrame()
+            self._tile.setFixedSize(30, 30)
+            tile_lay = QVBoxLayout(self._tile)
+            tile_lay.setContentsMargins(0, 0, 0, 0)
+            self._tile_icon = QLabel(self._icon)
+            self._tile_icon.setAlignment(Qt.AlignCenter)
+            self._tile_icon.setStyleSheet(
+                "font-size: 15px; background: transparent;")
+            tile_lay.addWidget(self._tile_icon)
+            lay.addWidget(self._tile, 0, Qt.AlignVCenter)
             self._icon_lbl = QLabel(self._icon)
             self._icon_lbl.setStyleSheet("font-size: 14px; background: transparent;")
             lay.addWidget(self._icon_lbl, 0, Qt.AlignVCenter)
@@ -209,11 +253,8 @@ class MainWindow(QWidget):
 
         # 主题包：先从文档目录扫一遍（首次运行会创建 YuUI），
         # 然后恢复上次选中的那套。主题目录被删/改名时自动落回默认。
-        theme.reload_packs()
-        saved_pack = self._settings.value("theme_pack", "")
-        if saved_pack and saved_pack in theme.packs():
-            theme.set_pack(saved_pack)
-        theme.set_theme(theme.resolve_theme(self.theme_setting))
+        # （main.py 在弹出启动画面之前已经调过一次，这里再调是幂等的。）
+        init_theme_from_settings(self._settings)
 
         # 关闭窗口时是否留在托盘。托盘不可用时这个开关没有意义（藏起来就真没了）。
         self._close_to_tray = read_bool(self._settings, "close_to_tray", True)
@@ -364,6 +405,15 @@ class MainWindow(QWidget):
         # 更新程序已接手，本进程必须退出，否则它等不到旧 PID 结束
         show_toast(self, "正在更新，程序即将重启…")
         QTimer.singleShot(600, self.request_quit)
+
+    def apply_repair_package(self, info, package):
+        """一键修复软件的替换入口（设置中心调用）。
+
+        与 _apply_update 完全同一条替换链路：两步改名 + 失败回滚。
+        单独起个公开名字是为了语义清晰：这里替换下来的可能是
+        「与当前版本一致的修复包」，不一定是新版本。
+        """
+        self._apply_update(info, package)
 
     def show_update_if_pending(self):
         """窗口真正显示出来时，把静默期间挂起的更新提示补上。"""
@@ -552,6 +602,50 @@ class MainWindow(QWidget):
                 QTimer.singleShot(120, home.start_hardware_scan)
         # 开机自启静默进托盘期间发现的更新，等窗口真打开时再提示
         self.show_update_if_pending()
+
+    # ---------------------------------------------------- 启动画面联动
+    def launch_with_data_wait(self, on_ready, timeout_ms=12000):
+        """启动画面模式：先不显示窗口，等首页硬件数据就绪后回调 on_ready。
+
+        与常规启动（show() → showEvent 里触发扫描）的区别：
+        这里窗口保持隐藏，直接驱动 HomePage 开始采集；CPU / 显卡 / 硬盘
+        等配置读完（或采集失败 / 超时）才调 on_ready —— 由 main.py 在
+        on_ready 里显示窗口并让启动画面做模糊淡出。
+        """
+        self._launch_cb = on_ready
+        self._launch_done = False
+        home = self._pages.get("home")
+        started = False
+        if home is not None and hasattr(home, "start_hardware_scan"):
+            home.start_hardware_scan()
+            hp = getattr(home, "hw_panel", None)
+            if hp is not None:
+                # 采集成功(_scanned)与失败(_failed)都要放行——启动画面
+                # 不能因为一次采集失败就永远转圈。参数签名不同，槽用 *_。
+                hp._scanned.connect(self._on_launch_data_ready)
+                hp._failed.connect(self._on_launch_data_ready)
+                started = True
+        if not started:
+            QTimer.singleShot(0, self._on_launch_data_ready)
+            return
+        # 兜底：信号一个都没来（线程卡死等异常情形）也不能把用户关在门外
+        QTimer.singleShot(timeout_ms, self._on_launch_data_ready)
+
+    def _on_launch_data_ready(self, *args):
+        if getattr(self, "_launch_done", True):
+            return
+        self._launch_done = True
+        cb = getattr(self, "_launch_cb", None)
+        self._launch_cb = None
+        if cb is not None:
+            try:
+                cb()
+                return
+            except Exception:
+                pass
+        # 回调缺失或抛异常时兜底显示窗口，绝不能出现"没有任何窗口"
+        if not self.isVisible() and not self.started_hidden:
+            self.show()
 
     # -------------------------------------------------------------- 行为
     def closeEvent(self, event):

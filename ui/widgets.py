@@ -123,10 +123,16 @@ class FeatureCard(QFrame):
         lay.addWidget(arrow, 0, Qt.AlignVCenter)
 
     def _apply_tint(self, tint_key):
-        color = theme.current().get(tint_key, theme.current()["accent"])
-        self._tile.setStyleSheet(
-            f"QFrame#Tile {{ background: {color}; border: none; border-radius: 4px; }}"
-        )
+        cur = theme.current()
+        color = cur.get(tint_key, cur["accent"])
+        if theme.glass_on():
+            # 液态玻璃主题：拟物玻璃贴片（对角渐变 + 高光描边）
+            self._tile.setStyleSheet(
+                "QFrame#Tile { %s }" % theme.glass_tile(color, radius=12))
+        else:
+            self._tile.setStyleSheet(
+                f"QFrame#Tile {{ background: {color}; border: none; border-radius: 4px; }}"
+            )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -569,7 +575,11 @@ class HardwarePanel(QFrame):
                 detail = main["vram"] + " · " + main["resolution"] + extra
             self._cells["gpu"].set_value(_shorten(main["name"], 44), detail)
             self._cells["gpu"].setToolTip(
-                "\n".join(g["name"] + "  " + g["vram"] for g in gpus)
+                "\n".join(
+                    (g.get("vendor_label") and g["vendor_label"] + " · " or "")
+                    + g["name"] + "  " + g["vram"]
+                    for g in gpus
+                )
             )
         else:
             self._cells["gpu"].set_value("未检测到", "")

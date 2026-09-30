@@ -233,6 +233,115 @@ def read_gpu():
 
 
 # ---------------------------------------------------------------------------
+# GPU：AMD/Intel 兜底 —— Windows PDH 性能计数器（跨厂商，零依赖）
+# ---------------------------------------------------------------------------
+# nvidia-smi 只覆盖 NVIDIA。AMD/Intel 显卡之前一律返回 None、UI 显示
+# "无 NVIDIA 显卡"。这里用 Windows 自带的 PDH 计数器做兜底：
+#   * GPU Engine 计数器（"GPU Engine(*)\Utilization Percentage"）
+#     → 各引擎利用率，取最大即近似 GPU 占用
+#   * GPU Adapter Memory（"...\Dedicated Usage" / "...\Dedicated Limit"）
+#     → 显存占用与总量
+# PDH 是系统自带、全厂商通用，代价是拿不到温度/功耗（那是 ADL/NVAPI 专属）。
+# 用 ctypes 直调 pdh.dll（比 Get-Counter 首次 ~4s 快两个数量级）。
+_PDH_FMT_DOUBLE = 0x00000200
+
+
+def _pdh_read_counter_paths(paths, timeout_ms=1500):
+    """读一组 PDH 计数器，返回 [(path, value)]，失败返回 []。"""
+    if not IS_WIN:
+        return []
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _w
+        pdh = _ct.windll.pdh
+        q = _w.HANDLE()
+        if pdh.PdhOpenQueryW(None, 0, _ct.byref(q)) != 0:
+            return []
+        counters = []
+        try:
+            for path in paths:
+                h = _w.HANDLE()
+                if pdh.PdhAddCounterW(q, path, 0, _ct.byref(h)) != 0:
+                    continue
+                counters.append((path, h))
+            pdh.PdhCollectQueryData(q)
+            time.sleep(0.25)
+            pdh.PdhCollectQueryData(q)
+            out = []
+            for path, h in counters:
+                typ = _ct.c_ulong()
+                val = _ct.c_double()
+                if pdh.PdhGetFormattedCounterValue(
+                        h, _PDH_FMT_DOUBLE, _ct.byref(typ),
+                        _ct.byref(val)) == 0:
+                    out.append((path, val.value))
+            return out
+        finally:
+            pdh.PdhCloseQuery(q)
+    except Exception:
+        return []
+
+
+_GPU_ENGINE_COUNTER = r"\GPU Engine(*)\Utilization Percentage"
+# 显存计数器名随 GPU 厂商/驱动版本不同而不同（实测本机是
+# "GPU Local Adapter Memory(*)\Local Usage"，旧驱动/Intel 是
+# "GPU Adapter Memory(*)\Dedicated Usage"），两个都试，命中哪个用哪个。
+_GPU_MEM_USED_CANDIDATES = (
+    r"\GPU Local Adapter Memory(*)\Local Usage",
+    r"\GPU Adapter Memory(*)\Dedicated Usage",
+)
+_GPU_MEM_TOTAL_CANDIDATES = (
+    r"\GPU Adapter Memory(*)\Dedicated Limit",
+)
+
+
+def read_gpu_pdh():
+    """用 PDH 读 GPU 利用率 + 显存（AMD/Intel/NVIDIA 全通用）。
+
+    返回 dict 或 None。与 read_gpu() 同构，但 temp/power/clock 为 None
+    （PDH 拿不到），UI 需据此降级显示。
+    """
+    paths = [_GPU_ENGINE_COUNTER]
+    paths += list(_GPU_MEM_USED_CANDIDATES)
+    paths += list(_GPU_MEM_TOTAL_CANDIDATES)
+    vals = _pdh_read_counter_paths(paths)
+    if not vals:
+        return None
+
+    eng_utils = [v for p, v in vals if "GPU Engine" in p]
+    mem_used = [v for p, v in vals
+                if "Dedicated Usage" in p or "Local Usage" in p]
+    mem_total = [v for p, v in vals if "Dedicated Limit" in p]
+
+    def to_mb(values):
+        if not values:
+            return None
+        v = max(values)
+        # PDH 的显存计数器默认字节（部分系统是 MB），按大小归一
+        return round(v / 1048576.0, 1) if v > 1_000_000 else round(v, 1)
+
+    util = None
+    if eng_utils:
+        util = max(0.0, min(100.0, max(eng_utils)))
+
+    if util is None and not mem_used:
+        return None
+
+    return {
+        "util": util,
+        "mem_used_mb": to_mb(mem_used),
+        "mem_total_mb": to_mb(mem_total),
+        "temp": None,
+        "power_w": None,
+        "power_limit_w": None,
+        "clock_sm_mhz": None,
+        "clock_max_mhz": None,
+        "fan_percent": None,
+        "vendor": "pdh",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 采样线程
 # ---------------------------------------------------------------------------
 class LiveMonitor(QObject):
@@ -293,6 +402,9 @@ class LiveMonitor(QObject):
             if self._enable_gpu and self._gpu_fail_streak < 5:
                 if self._tick % gpu_period == 0:
                     g = read_gpu()
+                    if g is None:
+                        # NVIDIA 不可用（无卡/驱动缺失/AMD/Intel）→ PDH 兜底
+                        g = read_gpu_pdh()
                     if g is None:
                         self._gpu_fail_streak += 1
                         last_gpu = None

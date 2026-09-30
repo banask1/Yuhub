@@ -532,7 +532,7 @@ class LiveMonitorPanel(QFrame):
                 bits.append(f"{gpu['temp']:.0f}°C")
             self.tiles["gpu"].set_metric(gpu.get("util"), " · ".join(bits))
         else:
-            self.tiles["gpu"].set_metric(None, "无 NVIDIA 显卡或驱动未安装")
+            self.tiles["gpu"].set_metric(None, "未检测到可用显卡")
 
         # 底部其他实时参数
         parts = []

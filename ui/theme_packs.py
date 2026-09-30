@@ -35,6 +35,8 @@ from PySide6.QtCore import QObject, Signal
 # 主题根目录：C:\Users\<名>\Documents\Yuhub
 DOCS_DIRNAME = "Yuhub"
 FIRST_THEME = "YuUI"
+# 内置第二主题（首次启动也会自动落盘）
+SECOND_THEME = "sky glass"
 
 # 主题包内约定文件名
 FILE_PALETTE = "theme.json"
@@ -206,6 +208,581 @@ DEFAULT_LIGHT = {
 
 
 # ---------------------------------------------------------------------------
+# 内置第二主题：sky glass（天空玻璃）
+# ---------------------------------------------------------------------------
+# 设计手法参考纯 CSS 液态玻璃（gitee greyd097/yzrt「纯CSS液态玻璃」）：
+#   - 窗口本体是深靛蓝渐变（模拟桌面壁纸透进来的一层彩色底）
+#   - 所有表面用 rgba 半透明白叠加在渐变上 —— 真实的"透底"玻璃感
+#     （Qt 的 rgba 背景会与父控件的渐变混合，等效 backdrop 的透底效果）
+#   - 玻璃边缘：1px 白色高光描边（glass_highlight），模拟折射
+# ⚠️ 以下键会被 QColor() 直接解析（splash 画启动屏、监控图表取色），
+#    必须保持 hex，不能写成 rgba()：
+#    window_top / window_bottom / window_border / border_strong /
+#    toggle_off / accent 系 / tile_* / text 系 / green / red / amber 等。
+SKY_DARK = {
+    "window_radius": "14px",
+    # 窗口渐变（上→下），深色模式是"深夜靛蓝"
+    "window_top": "#161b34",
+    "window_bottom": "#0c0f22",
+    "window_border": "#2c3560",
+    "bg": "#10142a",
+    # 玻璃表面：白色半透明叠加
+    "titlebar_bg": "rgba(255,255,255,18)",
+    "titlebar_separator": "rgba(255,255,255,26)",
+    "sidebar_bg": "rgba(255,255,255,22)",
+    "sidebar_separator": "rgba(255,255,255,26)",
+    "card_top": "rgba(255,255,255,26)",
+    "card_bottom": "rgba(255,255,255,14)",
+    "surface_hover": "rgba(255,255,255,46)",
+    "surface_sunken": "rgba(6,8,20,120)",
+    "border": "rgba(255,255,255,34)",
+    "border_strong": "#39406e",
+    "text": "#f2f4ff",
+    "text_dim": "#c2c9e8",
+    "text_faint": "#8f97c4",
+    "accent": "#7aa2ff",
+    "accent_hover": "#93b4ff",
+    "accent_soft": "rgba(122,162,255,52)",
+    "accent_text": "#0a0f24",
+    "green": "#5eead4",
+    "red": "#ff7b8a",
+    "amber": "#ffc75a",
+    "purple": "#c0a6ff",
+    "cyan": "#6fd8ff",
+    "input_bg": "rgba(8,10,26,150)",
+    "toggle_off": "#3a4270",
+    "scrollbar_handle": "rgba(255,255,255,80)",
+    "toast_bg": "rgba(22,27,52,246)",
+    "banner_start": "#5b7cff",
+    "banner_end": "#8b5cf6",
+    "tile_1": "#7aa2ff",
+    "tile_2": "#5eead4",
+    "tile_3": "#ffc75a",
+    "tile_4": "#c0a6ff",
+    "tile_5": "#6fd8ff",
+    "tile_6": "#ff8fa8",
+    # ---- sky glass 专属键 ----
+    # 玻璃边缘高光（描边色）
+    "glass_highlight": "rgba(255,255,255,105)",
+    # 图标贴片切换到拟物玻璃样式
+    "icon_tile_style": "glass",
+    # 右键菜单/弹层：接近不透明的深玻璃（太高透明度会让文字压在桌面上读不清）
+    "menu_bg": "rgba(20,24,48,242)",
+    "menu_border": "rgba(255,255,255,60)",
+}
+
+SKY_LIGHT = {
+    "window_radius": "14px",
+    # 窗口渐变，浅色模式是"晨雾蓝白"
+    "window_top": "#eaf0ff",
+    "window_bottom": "#d6e2f5",
+    "window_border": "#b9c6e2",
+    "bg": "#eef2fb",
+    "titlebar_bg": "rgba(255,255,255,150)",
+    "titlebar_separator": "rgba(120,140,190,60)",
+    "sidebar_bg": "rgba(255,255,255,140)",
+    "sidebar_separator": "rgba(120,140,190,60)",
+    "card_top": "rgba(255,255,255,190)",
+    "card_bottom": "rgba(255,255,255,150)",
+    "surface_hover": "rgba(255,255,255,225)",
+    "surface_sunken": "rgba(140,160,210,70)",
+    "border": "rgba(120,140,190,90)",
+    "border_strong": "#a9b6d6",
+    "text": "#1c2440",
+    "text_dim": "#4a5470",
+    "text_faint": "#7d87a8",
+    "accent": "#3f6fff",
+    "accent_hover": "#2e5ae8",
+    "accent_soft": "rgba(63,111,255,45)",
+    "accent_text": "#ffffff",
+    "green": "#0ea5a0",
+    "red": "#e5484d",
+    "amber": "#d98a00",
+    "purple": "#7c5cff",
+    "cyan": "#0d94d2",
+    "input_bg": "rgba(255,255,255,220)",
+    "toggle_off": "#c3cde6",
+    "scrollbar_handle": "rgba(90,110,160,120)",
+    "toast_bg": "rgba(255,255,255,250)",
+    "banner_start": "#4c7dff",
+    "banner_end": "#8b5cf6",
+    "tile_1": "#4c7dff",
+    "tile_2": "#14b8a6",
+    "tile_3": "#f59e0b",
+    "tile_4": "#8b5cf6",
+    "tile_5": "#0ea5e9",
+    "tile_6": "#f43f6e",
+    "glass_highlight": "rgba(255,255,255,235)",
+    "icon_tile_style": "glass",
+    "menu_bg": "rgba(252,253,255,248)",
+    "menu_border": "rgba(120,140,190,140)",
+}
+
+
+# sky glass 专属 QSS 模板：与内置极简色块模板覆盖**完全相同的选择器**，
+# 但把所有表面换成玻璃质感（渐变窗口 + rgba 半透明叠加 + 大圆角）。
+SKY_QSS = """\
+* {
+    font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif;
+    outline: none;
+    selection-background-color: $accent;
+    selection-color: $accent_text;
+}
+
+QWidget {
+    color: $text;
+    background: transparent;
+    font-size: 13px;
+}
+
+/* ---------- 窗口外壳：深靛蓝渐变（玻璃的"彩底"） ---------- */
+#Root { background: transparent; }
+
+QFrame#AppFrame {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 $window_top, stop:1 $window_bottom);
+    border: 1px solid $window_border;
+}
+QFrame#AppFrame[rounded="true"] { border-radius: $window_radius; }
+QFrame#AppFrame[rounded="false"] { border-radius: 0px; }
+
+/* ---------- 标题栏：玻璃横条 ---------- */
+#TitleBar {
+    background: $titlebar_bg;
+    border-bottom: 1px solid $titlebar_separator;
+}
+QLabel#AppTitle { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+QLabel#AppSubtitle {
+    color: $text_dim;
+    font-size: 11px;
+    background: $surface_hover;
+    border: 1px solid $glass_highlight;
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+
+QPushButton#TitleButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: $text_dim;
+    font-size: 13px;
+}
+QPushButton#TitleButton:hover {
+    background: $surface_hover;
+    border-color: $glass_highlight;
+    color: $text;
+}
+QPushButton#TitleButton:checked { background: $accent_soft; border-color: $accent; color: $accent; }
+QPushButton#TitleButton[danger="true"]:hover { background: #e81123; border-color: #e81123; color: #ffffff; }
+
+/* ---------- 侧边栏：整条竖玻璃 ---------- */
+#Sidebar {
+    background: $sidebar_bg;
+    border-right: 1px solid $sidebar_separator;
+}
+QLabel#SidebarSection {
+    color: $text_faint;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    padding: 4px 14px;
+    background: transparent;
+}
+
+/* 导航按钮：玻璃药丸；选中时染色玻璃 + 高光描边 */
+QPushButton#SidebarButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    color: $text_dim;
+    text-align: left;
+    padding: 9px 12px;
+    font-size: 13px;
+    margin: 1px 10px;
+}
+QPushButton#SidebarButton:hover {
+    background: $surface_hover;
+    border-color: $glass_highlight;
+    color: $text;
+}
+QPushButton#SidebarButton:checked {
+    background: $accent_soft;
+    color: $accent;
+    border: 1px solid $accent;
+    font-weight: 700;
+}
+
+/* ---------- 卡片：玻璃面板 ---------- */
+QFrame#Card {
+    background: $card_top;
+    border: 1px solid $border;
+    border-radius: 12px;
+}
+QFrame#Card[clickable="true"]:hover {
+    background: $surface_hover;
+    border: 1px solid $accent;
+}
+
+/* ---------- 文本 ---------- */
+QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; }
+QLabel#PageSubtitle { font-size: 13px; color: $text_dim; }
+QLabel#CardTitle { font-size: 14px; font-weight: 700; color: $text; }
+QLabel#CardDesc { font-size: 12px; color: $text_dim; }
+
+QLabel#Badge {
+    color: $text_dim;
+    background: $surface_hover;
+    border: 1px solid $border_strong;
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 11px;
+}
+QLabel#BadgeOk {
+    color: $green;
+    background: $surface_hover;
+    border: 1px solid $green;
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 11px;
+}
+QLabel#BadgeWarn {
+    color: $amber;
+    background: $surface_hover;
+    border: 1px solid $amber;
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 11px;
+}
+
+QLabel#Muted { color: $text_dim; }
+QLabel#Faint { color: $text_faint; }
+QLabel#Warn { color: $amber; }
+QLabel#Success { color: $green; }
+QLabel#Danger { color: $red; }
+QLabel#Accent { color: $accent; }
+
+/* ---------- 下拉框（玻璃输入件 + 玻璃弹层） ---------- */
+QComboBox {
+    background: $input_bg;
+    border: 1px solid $border_strong;
+    border-radius: 8px;
+    padding: 7px 10px;
+    color: $text;
+    min-height: 20px;
+}
+QComboBox:hover { border-color: $accent; }
+QComboBox:focus { border-color: $accent; }
+QComboBox:disabled { color: $text_faint; border-color: $border; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 22px;
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url($arrow);
+    width: 10px;
+    height: 6px;
+    margin-right: 8px;
+}
+QComboBox::down-arrow:hover { image: url($arrow_hover); }
+QComboBox::down-arrow:disabled { image: url($arrow_faint); }
+QComboBox QAbstractItemView {
+    background: $menu_bg;
+    border: 1px solid $menu_border;
+    border-radius: 8px;
+    padding: 4px;
+    color: $text;
+    outline: none;
+    selection-background-color: $accent;
+    selection-color: $accent_text;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px;
+    border-radius: 5px;
+    min-height: 20px;
+}
+QComboBox QAbstractItemView::item:hover {
+    background: $surface_hover;
+    color: $text;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: $accent;
+    color: $accent_text;
+}
+
+/* ---------- 按钮：主按钮是"彩色玻璃"（渐变） ---------- */
+QPushButton#PrimaryButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 $accent_hover, stop:1 $accent);
+    color: $accent_text;
+    border: 1px solid $glass_highlight;
+    border-radius: 9px;
+    padding: 10px 20px;
+    font-weight: 700;
+}
+QPushButton#PrimaryButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 $accent, stop:1 $accent_hover);
+}
+QPushButton#PrimaryButton:pressed { background: $accent; }
+QPushButton#PrimaryButton:disabled {
+    background: $surface_hover; border-color: $border_strong; color: $text_faint;
+}
+
+QPushButton#GhostButton {
+    background: $card_top;
+    color: $text_dim;
+    border: 1px solid $border_strong;
+    border-radius: 9px;
+    padding: 9px 18px;
+}
+QPushButton#GhostButton:hover { border-color: $accent; color: $accent; background: $accent_soft; }
+QPushButton#GhostButton:disabled { color: $text_faint; border-color: $border; }
+
+QPushButton#DangerButton {
+    background: transparent;
+    color: $red;
+    border: 1px solid $red;
+    border-radius: 9px;
+    padding: 9px 18px;
+}
+QPushButton#DangerButton:hover { background: $red; color: #ffffff; }
+
+QPushButton#MiniButton {
+    background: $card_top;
+    color: $text_dim;
+    border: 1px solid $border_strong;
+    border-radius: 6px;
+    padding: 2px 12px;
+    font-size: 11px;
+}
+QPushButton#MiniButton:hover { border-color: $accent; color: $accent; background: $accent_soft; }
+QPushButton#MiniButton:disabled { color: $text_faint; border-color: $border; }
+
+/* ---------- 输入框：下沉玻璃 ---------- */
+QLineEdit {
+    background: $input_bg;
+    border: 1px solid $border_strong;
+    border-radius: 8px;
+    padding: 9px 12px;
+    color: $text;
+}
+QLineEdit:focus { border-color: $accent; }
+
+/* ---------- 右键菜单：深玻璃浮层 ---------- */
+QMenu {
+    background: $menu_bg;
+    border: 1px solid $menu_border;
+    border-radius: 10px;
+    padding: 6px;
+    color: $text;
+}
+QMenu::item {
+    background: transparent;
+    color: $text;
+    padding: 7px 28px 7px 14px;
+    border-radius: 6px;
+}
+QMenu::item:selected {
+    background: $accent;
+    color: $accent_text;
+}
+QMenu::item:disabled { color: $text_faint; }
+QMenu::separator {
+    height: 1px;
+    background: $border;
+    margin: 5px 8px;
+}
+
+/* ---------- 进度条 ---------- */
+QProgressBar {
+    background: $surface_sunken;
+    border: 1px solid $border;
+    border-radius: 4px;
+    text-align: center;
+    color: transparent;
+    height: 8px;
+}
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 $accent, stop:1 $cyan);
+    border-radius: 3px;
+}
+
+/* ---------- 复选框：玻璃小方片 ---------- */
+QCheckBox { spacing: 9px; color: $text; background: transparent; }
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid $border_strong;
+    border-radius: 5px;
+    background: $input_bg;
+}
+QCheckBox::indicator:hover { border-color: $accent; }
+QCheckBox::indicator:checked {
+    background: $accent;
+    border-color: $glass_highlight;
+}
+QCheckBox::indicator:disabled { border-color: $border; background: $surface_sunken; }
+
+/* 清理项行 */
+QFrame#CleanRow {
+    background: $card_top;
+    border: 1px solid $border;
+    border-radius: 8px;
+}
+QFrame#CleanRow:hover { border-color: $border_strong; }
+QLabel#CleanName { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+QLabel#CleanDesc { font-size: 11px; color: $text_dim; background: transparent; }
+QLabel#CleanSize { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+QLabel#GroupTitle { font-size: 12px; font-weight: 700; color: $text_dim; background: transparent; }
+
+/* 磁盘占用条 */
+QFrame#DiskBar {
+    background: $surface_sunken;
+    border: 1px solid $border;
+    border-radius: 5px;
+}
+
+/* ---------- 多线程下载页 ---------- */
+QFrame#DlMetric {
+    background: $card_top;
+    border: 1px solid $border;
+    border-radius: 8px;
+}
+QLabel#DlMetricLabel { font-size: 11px; color: $text_faint; background: transparent; }
+QLabel#DlMetricValue {
+    font-size: 14px; font-weight: 700; color: $text; background: transparent;
+}
+QLabel#DlFileName { font-size: 14px; font-weight: 700; color: $text; background: transparent; }
+QLabel#DlSub { font-size: 11px; color: $text_faint; background: transparent; }
+QLabel#DlState {
+    font-size: 11px; font-weight: 700; background: transparent;
+    border-radius: 4px; padding: 2px 9px;
+}
+QLabel#DlStateIdle { font-size: 11px; font-weight: 700; color: $text_dim;
+                     background: transparent; border: 1px solid $border_strong;
+                     border-radius: 4px; padding: 2px 9px; }
+QLabel#DlStateOk { font-size: 11px; font-weight: 700; color: $green;
+                   background: transparent; border: 1px solid $green;
+                   border-radius: 4px; padding: 2px 9px; }
+QLabel#DlStateErr { font-size: 11px; font-weight: 700; color: $red;
+                    background: transparent; border: 1px solid $red;
+                    border-radius: 4px; padding: 2px 9px; }
+QLabel#DlStateWarn { font-size: 11px; font-weight: 700; color: $amber;
+                     background: transparent; border: 1px solid $amber;
+                     border-radius: 4px; padding: 2px 9px; }
+QLabel#DlBlockLabel { font-size: 11px; color: $text_faint; background: transparent; }
+
+/* ---------- 分段选择器 ---------- */
+QFrame#Segment {
+    background: $surface_sunken;
+    border: 1px solid $border;
+    border-radius: 9px;
+}
+QPushButton#SegmentButton {
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    padding: 6px 14px;
+    color: $text_dim;
+}
+QPushButton#SegmentButton:hover { color: $text; background: $surface_hover; }
+QPushButton#SegmentButton:checked { background: $accent; color: $accent_text; font-weight: 700; }
+
+/* ---------- 弹窗 ---------- */
+QDialog {
+    background: transparent;
+    color: $text;
+}
+QFrame#DialogFrame {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 $window_top, stop:1 $window_bottom);
+    border: 1px solid $window_border;
+    border-radius: $window_radius;
+}
+QFrame#DialogHeader { background: transparent; border: none; }
+QDialog QLabel { color: $text; background: transparent; }
+QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; background: transparent; }
+QLabel#DialogSection {
+    color: $text_dim;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    background: transparent;
+    padding: 12px 0 6px 0;
+}
+QLabel#DialogKey { color: $text_dim; background: transparent; }
+QLabel#DialogVal { color: $text; background: transparent; }
+QLabel#DialogValStrong { color: $text; font-weight: 700; background: transparent; }
+QFrame#DetailRow { background: $card_top; border: 1px solid $border; border-radius: 8px; }
+QDialog QScrollArea { background: transparent; }
+QDialog QScrollArea > QWidget > QWidget { background: transparent; }
+
+/* ---------- 局域网联机页 ---------- */
+QLabel#LanCode {
+    font-size: 25px;
+    font-weight: 800;
+    color: $accent;
+    background: $accent_soft;
+    border: 1px solid $accent;
+    border-radius: 8px;
+    padding: 5px 16px;
+    letter-spacing: 3px;
+}
+QLabel#LanCode[off="true"] {
+    color: $text_faint;
+    background: $surface_sunken;
+    border: 1px solid $border_strong;
+}
+QFrame#LanMember {
+    background: $card_top;
+    border: 1px solid $border;
+    border-radius: 8px;
+}
+QLabel#LanMemberName { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+QLabel#LanMemberMeta { font-size: 11px; color: $text_faint; background: transparent; }
+QFrame#LanStat { background: $card_top; border: 1px solid $border; border-radius: 8px; }
+QLabel#LanStatLabel { font-size: 11px; color: $text_faint; background: transparent; }
+QLabel#LanStatValue { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+QFrame#LanFwd { background: $card_top; border: 1px solid $border; border-radius: 8px; }
+QPlainTextEdit#LanLog {
+    background: $input_bg;
+    border: 1px solid $border;
+    border-radius: 8px;
+    color: $text_dim;
+    font-family: "Consolas", "Cascadia Mono", "Courier New", monospace;
+    font-size: 11px;
+    padding: 6px;
+}
+
+/* ---------- 滚动区域 ---------- */
+QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: $scrollbar_handle; border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: $accent; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: $scrollbar_handle; border-radius: 4px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: $accent; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+QToolTip {
+    background: $toast_bg;
+    color: $text;
+    border: 1px solid $menu_border;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # 主题包落盘 / 读取
 # ---------------------------------------------------------------------------
 def _pack_theme_json(name, title, description, dark, light):
@@ -221,9 +798,9 @@ def _pack_theme_json(name, title, description, dark, light):
 
 
 def ensure_builtin_theme():
-    """首次运行：把内置的 YuUI 主题写到文档目录。
+    """首次运行：把内置主题写到文档目录（YuUI + sky glass）。
 
-    返回 (是否新建, 主题目录)。
+    返回 (是否新建, YuUI 主题目录)。
     """
     root = themes_root()
     d = theme_dir(FIRST_THEME)
@@ -245,6 +822,7 @@ def ensure_builtin_theme():
             created = True
         except OSError:
             pass
+    _ensure_sky_glass_theme()
     # 同时放一份 README，告诉用户怎么自制主题
     readme = os.path.join(root, "如何自制主题.txt")
     if not os.path.isfile(readme):
@@ -254,6 +832,38 @@ def ensure_builtin_theme():
         except OSError:
             pass
     return created, d
+
+
+def _ensure_sky_glass_theme():
+    """内置 sky glass 主题：不存在才写，绝不覆盖用户的改动。
+
+    主题包带专属 theme.qss（玻璃质感模板），色板里还有玻璃专属键
+    （glass_highlight / icon_tile_style / menu_bg 等）。
+    """
+    d = theme_dir(SECOND_THEME)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    tjson = os.path.join(d, FILE_PALETTE)
+    if not os.path.isfile(tjson):
+        try:
+            data = _pack_theme_json(
+                SECOND_THEME, "Sky Glass 天空玻璃",
+                "天空玻璃主题：靛蓝渐变底 + 半透明玻璃面板 + 拟物玻璃图标贴片，"
+                "右键菜单为深玻璃浮层。深浅两套模式齐备。",
+                SKY_DARK, SKY_LIGHT)
+            with open(tjson, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+    qss_path = os.path.join(d, FILE_QSS)
+    if not os.path.isfile(qss_path):
+        try:
+            with open(qss_path, "w", encoding="utf-8") as f:
+                f.write(SKY_QSS)
+        except OSError:
+            pass
 
 
 _THEME_README = """\

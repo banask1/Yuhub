@@ -295,6 +295,42 @@ def _net_err(err):
     return "检查失败：%s" % (err,)
 
 
+def fetch_release_by_tag(tag, owner=REPO_OWNER, repo=REPO_NAME,
+                         timeout=HTTP_TIMEOUT, api_base="https://api.github.com"):
+    """取**指定 tag** 的 Release（一键修复软件用：重下当前版本）。
+
+    返回 (ReleaseInfo | None, error_str)：
+      * 找到：   (info, "")
+      * 没有该 tag（确定是版本问题，不是网络问题）： (None, "")
+      * 网络失败： (None, "原因")
+    候选源与限时策略和 fetch_release 完全一致。
+    """
+    last_err = ""
+    for base, proxy_mode in _api_attempts(api_base):
+        url = "%s/repos/%s/%s/releases/tags/%s" % (base, owner, repo, tag)
+        box = _bounded(
+            lambda u=url, m=proxy_mode: _http_json(u, timeout=timeout, proxy=m),
+            timeout + 2,
+        )
+        if "res" in box:
+            data = box["res"]
+            if isinstance(data, dict) and data.get("tag_name"):
+                return parse_release(data), ""
+            last_err = "服务响应异常"
+            continue
+        err = box.get("err")
+        if isinstance(err, urllib.error.HTTPError):
+            if err.code == 404:
+                return None, ""           # tag 不存在，让调用方走兜底逻辑
+            if err.code == 403:
+                last_err = "请求过于频繁或网络受限（HTTP 403）"
+            else:
+                last_err = "服务返回 HTTP %d" % err.code
+            continue
+        last_err = _net_err(err)
+    return None, last_err
+
+
 def github_latest(owner=REPO_OWNER, repo=REPO_NAME, timeout=HTTP_TIMEOUT,
                   api_base="https://api.github.com"):
     """取最新 Release。拿不到返回 None（静默失败，不抛）。"""

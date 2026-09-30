@@ -81,15 +81,43 @@ _CREATE_NO_WINDOW = 0x08000000
 # ---------------------------------------------------------------------------
 # 中继/会合节点。官方公共节点（public.easytier.cn / public.easytier.top /
 # public.kkrainbow.top）2026 年起已从 DNS 摘除（NXDomain，实测确认），
-# 下面这些是 2026-09-27 实测 TCP 可连、且 core 握手成功的社区共享节点
-# （按稳定性排序：无 DNS 依赖的 IP 优先）。节点会失效，连接失败会自动换下一个。
+# 下面这些是实测 TCP 可连、且 core 握手成功的社区共享节点。
+# 其中海波美国 / 海波中国大陆两个节点来自 MCTier（github.com/pmh1314520/MCTier）
+# 的内置节点列表——它们长期维护这三个节点，可靠性有社区背书：
+#   海波美国      udp://us01.225284.xyz:11010
+#   海波中国大陆  tcp://225284.xyz:11010
+#   唯爱厦门      tcp://easytier.weiai.org.cn:11010（Yuhub 原有）
+# 节点会失效，连接失败会自动换下一个。
 PUBLIC_SERVERS = (
-    "tcp://47.108.52.1:11012",
+    "tcp://47.108.52.1:11012",          # 国内 IP 直连，无 DNS 依赖
+    "udp://us01.225284.xyz:11010",      # 海波美国（MCTier 默认节点）
+    "tcp://225284.xyz:11010",           # 海波中国大陆（MCTier 内置）
     "tcp://38.147.105.178:11010",
     "tcp://boi.de5.net:11010",
     "tcp://easytier.weiai.org.cn:11010",
     "tcp://et-hk.clickor.click:11010",
 )
+
+# 「中继节点」下拉框的选项（key, 显示名, 地址）。
+# 地址为空 = 自动模式：把 PUBLIC_SERVERS 全部传给 EasyTier（-p 可重复），
+# 由 EasyTier 自己择优。MCTier 的经验是"节点选择必须具有确定性"——
+# 单选节点时不偷换、不叠加其它节点，用户选哪个就连哪个，
+# 这样"连不上某个节点"和"房间不通"才不会混在一起难排查。
+NODE_CHOICES = (
+    ("auto", "自动（尝试全部节点）", ""),
+    ("haibo_us", "海波美国", "udp://us01.225284.xyz:11010"),
+    ("haibo_cn", "海波中国大陆", "tcp://225284.xyz:11010"),
+    ("weiai", "唯爱厦门", "tcp://easytier.weiai.org.cn:11010"),
+    ("cn_ip", "国内中继（IP 直连）", "tcp://47.108.52.1:11012"),
+)
+
+
+def node_address(key):
+    """按 key 查节点地址；auto / 未知 key 返回空串（= 全部节点）。"""
+    for k, _label, addr in NODE_CHOICES:
+        if k == key:
+            return addr
+    return ""
 
 # 虚拟网卡默认网段（EasyTier DHCP 默认从这里分配）
 VIRTUAL_NET_PREFIX = "10.126.126."
@@ -1319,7 +1347,8 @@ class EasyTier:
         time.sleep(1.5)                 # 给提权进程一点时间跑完 taskkill
         return not core_running()
 
-    def start(self, name, secret, timeout=20.0, ipv4="", hostname=""):
+    def start(self, name, secret, timeout=20.0, ipv4="", hostname="",
+              node=""):
         """创建/加入跨网网络。阻塞直到虚拟网卡就绪或超时。
 
         name/secret 即 EasyTier 的 network-name / network-secret。
@@ -1330,6 +1359,10 @@ class EasyTier:
               `host_ip()` 动态发现（见 lan_page 的成员校验）。
         hostname：本节点在房间里的显示名（队友在成员列表里看到的就是它）；
                   为空则 EasyTier 用系统计算机名（DESKTOP-XXXX 不好认）。
+        node：中继节点（MCTier 式确定性选择）。空串 = 自动，
+              把 PUBLIC_SERVERS 全部传给 EasyTier；非空 = **只连这一个**，
+              不叠加其它节点——否则"用户选的节点有问题"和"房间不通"
+              会混在一起没法排查。
         返回 (成功, 说明)。成功后 virtual_adapter_ip() 可查虚拟 IP。
         """
         with self._lock:
@@ -1380,7 +1413,15 @@ class EasyTier:
             else:
                 # 不指定 IP 时用 DHCP 自动分配（并自动创建虚拟网卡）
                 args += ["-d", "true"]
-            for srv in PUBLIC_SERVERS:
+            if node:
+                # 确定性节点选择（MCTier 实践）：用户选了哪个就只连哪个
+                servers = (node,)
+                self._on_log("中继节点（手动指定）：%s" % node)
+            else:
+                servers = PUBLIC_SERVERS
+                self._on_log("中继节点：自动（共 %d 个，失败自动换下一个）"
+                             % len(servers))
+            for srv in servers:
                 args += ["-p", srv]
             payload = build_watchdog_payload(
                 core_path(), args, _STOP_FILE, install_dir(),

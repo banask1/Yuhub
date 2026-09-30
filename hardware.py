@@ -62,7 +62,7 @@ $out.productname  = $r.product.Name
 $out.productver   = $r.product.Version
 $out.chassis      = @($r.chassis.ChassisTypes)
 $out.cpu          = @($r.cpu | ForEach-Object { [ordered]@{ name=$_.Name; cores=$_.NumberOfCores; threads=$_.NumberOfLogicalProcessors; mhz=$_.MaxClockSpeed; socket=$_.SocketDesignation } })
-$out.gpu          = @($r.gpu | ForEach-Object { [ordered]@{ name=$_.Name; vram=$_.AdapterRAM; driver=$_.DriverVersion; w=$_.CurrentHorizontalResolution; h=$_.CurrentVerticalResolution } })
+$out.gpu          = @($r.gpu | ForEach-Object { [ordered]@{ name=$_.Name; vram=$_.AdapterRAM; driver=$_.DriverVersion; w=$_.CurrentHorizontalResolution; h=$_.CurrentVerticalResolution; pnp=$_.PNPDeviceID } })
 $out.ram          = @($r.ram | ForEach-Object { [ordered]@{ maker=$_.Manufacturer; cap=$_.Capacity; speed=$_.Speed; part=$_.PartNumber; type=$_.SMBIOSMemoryType } })
 $out.disk         = @($r.disk | ForEach-Object { [ordered]@{ model=$_.Model; size=$_.Size; iface=$_.InterfaceType; media=$_.MediaType; pnp=$_.PNPDeviceID } })
 $out.pdisk        = @($r.pdisk | ForEach-Object { [ordered]@{ friendly=$_.FriendlyName; mediatype=$_.MediaType; bustype=$_.BusType; size=$_.Size } })
@@ -185,6 +185,45 @@ def human_bytes(n):
             return f"{n:.1f} {unit}".replace(".0 ", " ")
         n /= 1024
     return "--"
+
+
+# GPU 厂商判断：优先看 PnP 设备 ID 里的 VEN_ 前缀（最权威），
+# 再回落到名称关键词（虚拟/基础显示适配器等特殊情形）。
+_GPU_VENDOR_BY_VEN = {
+    "10DE": ("nvidia", "NVIDIA"),
+    "1002": ("amd", "AMD"),
+    "8086": ("intel", "Intel"),
+    "1414": ("microsoft", "Microsoft"),
+    "1AF4": ("virtio", "Virtual"),
+    "15AD": ("vmware", "VMware"),
+}
+_VIRTUAL_NAME_KEYS = ("virtual", "basic display", "remote", "microsoft basic",
+                      "standard vga", "displaylink", "rdp")
+
+
+def gpu_vendor(name, pnp=""):
+    """判断显卡厂商。返回 (key, 中文标签)。
+
+    key ∈ {"amd","nvidia","intel","microsoft","virtual","other"}。
+    优先解析 PnP 设备 ID 的 VEN_xxxx，其次名称关键词，最后"虚拟/基础显示"。
+    """
+    if pnp:
+        m = re.search(r"VEN_([0-9A-Fa-f]{4})", pnp or "")
+        if m:
+            hit = _GPU_VENDOR_BY_VEN.get(m.group(1).upper())
+            if hit:
+                return hit
+    nl = (name or "").lower()
+    if "radeon" in nl or "amd" in nl or "ati" in nl:
+        return ("amd", "AMD")
+    if "nvidia" in nl or "geforce" in nl or "quadro" in nl or "rtx" in nl or "gtx" in nl:
+        return ("nvidia", "NVIDIA")
+    if "intel" in nl and "arc" in nl or "iris" in nl or "uhd graphics" in nl or "hd graphics" in nl:
+        return ("intel", "Intel")
+    for k in _VIRTUAL_NAME_KEYS:
+        if k in nl:
+            return ("virtual", "虚拟/基础显示")
+    return ("other", "其他")
 
 
 def read_logical_drives():
@@ -433,12 +472,15 @@ def build_profile(raw):
         w, h = item.get("w"), item.get("h")
         if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
             res = f"{w}×{h}"
+        vkey, vlabel = gpu_vendor(name, item.get("pnp") or "")
         gpu_items.append({
             "name": name,
             "vram": vram_txt,
             "driver": (item.get("driver") or "").strip(),
             "resolution": res,
-            "is_virtual": any(k in name.lower() for k in ("virtual", "basic display", "remote")),
+            "vendor": vkey,
+            "vendor_label": vlabel,
+            "is_virtual": vkey in ("virtual", "microsoft"),
         })
 
     # ---- 内存 ----
