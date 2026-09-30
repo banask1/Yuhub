@@ -1,0 +1,39 @@
+# ---- PyInstaller 构建产物 ----
+build/
+dist/
+*.spec.bak
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 自检输出 / 临时文件 ----
+*.json.tmp
+_*.json
+*.log
+
+# ---- 截图 / 预览图 ----
+预览_*.png
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 备份 ----
+*_备份_*/
+*.bak
+*.old

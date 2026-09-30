@@ -1,0 +1,821 @@
+"""Yuhub 通用 UI 组件：开关、卡片、分段选择器、Toast、按钮等。"""
+
+from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QVariantAnimation
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QButtonGroup,
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGraphicsOpacityEffect,
+)
+
+from . import theme
+
+
+class ToggleSwitch(QAbstractButton):
+    """自定义开关控件，带滑块动画，随主题自动换色。"""
+
+    def __init__(self, checked=False, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(42, 24)
+        self._offset = 1.0 if checked else 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(150)
+        self._anim.valueChanged.connect(self._on_anim)
+        self.toggled.connect(self._on_toggled)
+        theme.bus.changed.connect(lambda _: self.update())
+
+    def _on_toggled(self, checked):
+        self._anim.stop()
+        self._anim.setStartValue(self._offset)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def _on_anim(self, value):
+        self._offset = float(value)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = theme.current()
+        off_bg = QColor(c.get("toggle_off", c["surface_sunken"]))
+        on_bg = QColor(c["accent"])
+        t = self._offset
+        col = QColor(
+            int(off_bg.red() + (on_bg.red() - off_bg.red()) * t),
+            int(off_bg.green() + (on_bg.green() - off_bg.green()) * t),
+            int(off_bg.blue() + (on_bg.blue() - off_bg.blue()) * t),
+        )
+        p.setPen(Qt.NoPen)
+        p.setBrush(col)
+        # 极简：小圆角矩形轨道
+        p.drawRoundedRect(0, 0, self.width(), self.height(), 3, 3)
+
+        border = QColor(c["accent"] if t > 0.5 else c["border_strong"])
+        p.setPen(border)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(0, 0, self.width() - 1, self.height() - 1, 3, 3)
+
+        # 方形滑块（非圆形，强化色块感）
+        knob = 16
+        kx = 4 + self._offset * (self.width() - 8 - knob)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(int(kx), 4, knob, knob, 2, 2)
+        p.end()
+
+
+class FeatureCard(QFrame):
+    """首页可点击的功能卡片（极简色块：左侧纯色方块标识 + 文字）。"""
+
+    clicked = Signal()
+
+    def __init__(self, icon, title, desc, tint_key="tile_1", parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self.setProperty("clickable", True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(118)
+        self.setMinimumWidth(230)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(14)
+
+        # 纯色方块：极简色块风格的核心视觉元素
+        self._tile = QFrame()
+        self._tile.setObjectName("Tile")
+        self._tile.setFixedSize(44, 44)
+        tl = QVBoxLayout(self._tile)
+        tl.setContentsMargins(0, 0, 0, 0)
+        ic = QLabel(icon)
+        ic.setAlignment(Qt.AlignCenter)
+        ic.setStyleSheet("font-size: 20px; background: transparent; color: #ffffff;")
+        tl.addWidget(ic)
+        lay.addWidget(self._tile, 0, Qt.AlignTop)
+        self._apply_tint(tint_key)
+        theme.bus.changed.connect(lambda _: self._apply_tint(tint_key))
+
+        box = QVBoxLayout()
+        box.setSpacing(4)
+        t = QLabel(title)
+        t.setStyleSheet("font-size: 15px; font-weight: 700;")
+        d = QLabel(desc)
+        d.setObjectName("Muted")
+        d.setWordWrap(True)
+        d.setStyleSheet("font-size: 12px;")
+        box.addWidget(t)
+        box.addWidget(d)
+        lay.addLayout(box, 1)
+
+        arrow = QLabel("→")
+        arrow.setObjectName("Faint")
+        arrow.setStyleSheet("font-size: 16px; background: transparent;")
+        lay.addWidget(arrow, 0, Qt.AlignVCenter)
+
+    def _apply_tint(self, tint_key):
+        color = theme.current().get(tint_key, theme.current()["accent"])
+        self._tile.setStyleSheet(
+            f"QFrame#Tile {{ background: {color}; border: none; border-radius: 4px; }}"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class SegmentedControl(QFrame):
+    """分段选择器：互斥选项组。"""
+
+    changed = Signal(str)
+
+    def __init__(self, options, current=None, parent=None):
+        """options: [(value, label), ...]"""
+        super().__init__(parent)
+        self.setObjectName("Segment")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._buttons = {}
+        for value, label in options:
+            b = QPushButton(label)
+            b.setObjectName("SegmentButton")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            self._group.addButton(b)
+            self._buttons[value] = b
+            lay.addWidget(b)
+            b.clicked.connect(lambda checked=False, v=value: self.changed.emit(v))
+
+        if current in self._buttons:
+            self._buttons[current].setChecked(True)
+
+    def set_current(self, value):
+        if value in self._buttons:
+            self._buttons[value].setChecked(True)
+
+    def current(self):
+        for value, b in self._buttons.items():
+            if b.isChecked():
+                return value
+        return None
+
+
+def primary_button(text):
+    b = QPushButton(text)
+    b.setObjectName("PrimaryButton")
+    b.setCursor(Qt.PointingHandCursor)
+    return b
+
+
+def ghost_button(text):
+    b = QPushButton(text)
+    b.setObjectName("GhostButton")
+    b.setCursor(Qt.PointingHandCursor)
+    return b
+
+
+def danger_button(text):
+    b = QPushButton(text)
+    b.setObjectName("DangerButton")
+    b.setCursor(Qt.PointingHandCursor)
+    return b
+
+
+def setting_row(label_text, control):
+    """一行「标签 + 右侧控件」的横向布局。"""
+    row = QHBoxLayout()
+    row.setSpacing(10)
+    lbl = QLabel(label_text)
+    lbl.setStyleSheet("font-size: 13px;")
+    row.addWidget(lbl)
+    row.addStretch(1)
+    row.addWidget(control)
+    return row
+
+
+def info_card(title, desc):
+    """说明卡片。"""
+    card = QFrame()
+    card.setObjectName("Card")
+    v = QVBoxLayout(card)
+    v.setContentsMargins(18, 16, 18, 16)
+    v.setSpacing(6)
+    t = QLabel(title)
+    t.setObjectName("CardTitle")
+    d = QLabel(desc)
+    d.setObjectName("CardDesc")
+    d.setWordWrap(True)
+    v.addWidget(t)
+    v.addWidget(d)
+    return card
+
+
+def show_toast(parent, text, duration=2200):
+    """在父窗口底部中央弹出 Toast 提示并自动淡出。"""
+    p = theme.current()
+    toast = QFrame(parent)
+    toast.setObjectName("ToastFrame")
+    toast.setStyleSheet(
+        f"QFrame#ToastFrame {{ background: {p['toast_bg']}; border: 1px solid {p['border_strong']}; "
+        f"border-left: 3px solid {p['accent']}; border-radius: 5px; }}"
+        f"QLabel {{ color: {p['text']}; font-size: 13px; background: transparent; }}"
+    )
+    lay = QHBoxLayout(toast)
+    lay.setContentsMargins(16, 10, 16, 10)
+    lay.setSpacing(8)
+    dot = QLabel("●")
+    dot.setStyleSheet(f"color: {p['accent']}; font-size: 9px; background: transparent;")
+    lay.addWidget(dot)
+    lbl = QLabel(text)
+    lay.addWidget(lbl)
+
+    toast.adjustSize()
+    x = (parent.width() - toast.width()) // 2
+    y = parent.height() - toast.height() - 40
+    toast.move(x, y)
+    toast.raise_()
+    toast.show()
+
+    effect = QGraphicsOpacityEffect(toast)
+    toast.setGraphicsEffect(effect)
+    fade_in = QPropertyAnimation(effect, b"opacity", toast)
+    fade_in.setDuration(180)
+    fade_in.setStartValue(0.0)
+    fade_in.setEndValue(1.0)
+    fade_in.start()
+
+    def _fade_out():
+        out = QPropertyAnimation(effect, b"opacity", toast)
+        out.setDuration(240)
+        out.setStartValue(1.0)
+        out.setEndValue(0.0)
+        out.finished.connect(toast.deleteLater)
+        out.start()
+
+    QTimer.singleShot(duration, _fade_out)
+
+
+# ---------------------------------------------------------------------------
+# 硬件信息展示组件
+# ---------------------------------------------------------------------------
+class SpecChip(QFrame):
+    """设备形态标签：笔记本 / 台式机 / 一体机 的彩色小块。"""
+
+    def __init__(self, kind="unknown", label="检测中", parent=None):
+        super().__init__(parent)
+        self.setObjectName("SpecChip")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 3, 10, 3)
+        lay.setSpacing(6)
+        self._dot = QFrame()
+        self._dot.setFixedSize(8, 8)
+        lay.addWidget(self._dot, 0, Qt.AlignVCenter)
+        self._lbl = QLabel(label)
+        self._lbl.setStyleSheet("font-size: 12px; font-weight: 700; background: transparent;")
+        lay.addWidget(self._lbl)
+        theme.bus.changed.connect(lambda _: self._repaint(kind))
+        self._repaint(kind)
+
+    def set_kind(self, kind, label):
+        self._lbl.setText(label)
+        self._repaint(kind)
+    def _repaint(self, kind):
+        p = theme.current()
+        color = {"laptop": p["cyan"], "desktop": p["green"]}.get(kind, p["amber"])
+        self.setStyleSheet(
+            f"QFrame#SpecChip {{ background: {p['surface_hover']}; "
+            f"border: 1px solid {color}; border-radius: 4px; }}"
+            f"QLabel {{ color: {color}; }}"
+        )
+        self._dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
+
+
+class HardwarePanel(QFrame):
+    """首页电脑配置面板：机型 / CPU / 显卡 / 内存 / 硬盘 + 设备分类。
+
+    用法：
+        panel = HardwarePanel(refresh_cb)      # 采集函数，返回 profile dict
+        panel.refresh()                        # 触发异步采集
+    """
+
+    # 采集与展示状态
+    STATE_IDLE = 0
+    STATE_LOADING = 1
+    STATE_READY = 2
+    STATE_ERROR = 3
+
+    # 子线程 → 主线程的结果投递（Qt 信号是线程安全的，跨线程会自动排队到主线程事件循环）
+    _scanned = Signal(object)
+    _failed = Signal(str)
+
+    def __init__(self, scanner_factory=None, on_profile=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("HwPanel")
+        self._scanner_factory = scanner_factory
+        self._on_profile = on_profile
+        self._state = self.STATE_IDLE
+        self._busy = False
+        self._profile = None
+        self._build()
+        self._scanned.connect(self._on_ready)
+        self._failed.connect(self._set_error)
+        theme.bus.changed.connect(lambda _: self._restyle())
+
+    # ------------------------------------------------------------------ 构建
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        # 头部：标题 + 设备分类标签 + 刷新按钮
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        title = QLabel("💻  本机配置")
+        title.setObjectName("CardTitle")
+        head.addWidget(title)
+
+        self.chip = SpecChip("unknown", "检测中")
+        head.addWidget(self.chip)
+        head.addStretch(1)
+
+        self._status = QLabel("")
+        self._status.setObjectName("Faint")
+        self._status.setStyleSheet("font-size: 11px;")
+        head.addWidget(self._status)
+
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setObjectName("MiniButton")
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.setFixedHeight(26)
+        self.btn_refresh.clicked.connect(self.refresh)
+        head.addWidget(self.btn_refresh)
+        root.addLayout(head)
+
+        # 机型整行
+        self._model_row = self._make_model_row()
+        root.addLayout(self._model_row)
+
+        # 4 个规格块：2×2 网格，保证长型号名有足够宽度
+        self._spec_grid = QGridLayout()
+        self._spec_grid.setSpacing(10)
+        self._cells = {
+            "cpu": SpecCell("CPU", "🧠", "tile_1"),
+            "gpu": SpecCell("显卡", "🎮", "tile_2"),
+            "ram": SpecCell("内存", "🧩", "tile_4"),
+            "disk": SpecCell("硬盘", "💾", "tile_3"),
+        }
+        self._spec_grid.addWidget(self._cells["cpu"], 0, 0)
+        self._spec_grid.addWidget(self._cells["gpu"], 0, 1)
+        self._spec_grid.addWidget(self._cells["ram"], 1, 0)
+        self._spec_grid.addWidget(self._cells["disk"], 1, 1)
+        root.addLayout(self._spec_grid)
+
+        # 存储空间：逐盘列出容量与占用（标注盘号，如 C: / D: / E:）
+        self._drive_section = QFrame()
+        self._drive_section.setObjectName("DriveSection")
+        ds = QVBoxLayout(self._drive_section)
+        ds.setContentsMargins(0, 0, 0, 0)
+        ds.setSpacing(6)
+
+        dhead = QHBoxLayout()
+        dhead.setSpacing(8)
+        dtitle = QLabel("存储空间")
+        dtitle.setObjectName("Faint")
+        dtitle.setStyleSheet("font-size: 11px; font-weight: 700;")
+        dhead.addWidget(dtitle)
+        self._drive_sum = QLabel("")
+        self._drive_sum.setObjectName("Faint")
+        self._drive_sum.setStyleSheet("font-size: 11px;")
+        dhead.addWidget(self._drive_sum)
+        dhead.addStretch(1)
+        ds.addLayout(dhead)
+
+        self._drive_rows = []
+        self._drive_box = QVBoxLayout()
+        self._drive_box.setContentsMargins(0, 0, 0, 0)
+        self._drive_box.setSpacing(5)
+        ds.addLayout(self._drive_box)
+        root.addWidget(self._drive_section)
+
+        # 次级信息（系统 / 主板 / BIOS）
+        self._sub = QLabel("")
+        self._sub.setObjectName("Faint")
+        self._sub.setStyleSheet("font-size: 11px;")
+        self._sub.setWordWrap(True)
+        root.addWidget(self._sub)
+
+        self._set_loading()
+
+    def _make_model_row(self):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self._model_cell = SpecCell("设备型号", "🔖", "tile_5", large=True)
+        row.addWidget(self._model_cell, 1)
+        return row
+
+    # ------------------------------------------------------------------ 样式
+    def _restyle(self):
+        p = theme.current()
+        self.setStyleSheet(
+            f"QFrame#HwPanel {{ background: {p['card_top']}; "
+            f"border: 1px solid {p['border']}; border-radius: 5px; }}"
+        )
+
+    def paintEvent(self, event):
+        # 让 QSS 的背景生效
+        from PySide6.QtWidgets import QStyleOption, QStyle
+        from PySide6.QtGui import QPainter as _P
+
+        opt = QStyleOption()
+        opt.initFrom(self)
+        pt = _P(self)
+        self.style().drawPrimitive(QStyle.PE_Widget, opt, pt, self)
+
+    # ------------------------------------------------------------------ 存储
+    def _clear_drives(self, placeholder=""):
+        """清空逐盘列表（加载中 / 出错时调用）。"""
+        while self._drive_box.count():
+            item = self._drive_box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._drive_rows = []
+        self._drive_sum.setText(placeholder)
+
+    def _set_drives(self, drives, total_text="", free_text=""):
+        """渲染逐盘列表：每个逻辑盘一行（盘符 + 占用条 + 容量）。"""
+        self._clear_drives()
+        if not drives:
+            self._drive_section.setVisible(False)
+            return
+        self._drive_section.setVisible(True)
+        n = len(drives)
+        extra = f"共 {n} 个盘"
+        if total_text:
+            extra += f" · 合计 {total_text}"
+        if free_text:
+            extra += f" · 可用 {free_text}"
+        self._drive_sum.setText(extra)
+        for d in drives:
+            row = DriveRow()
+            row.set_drive(d)
+            self._drive_box.addWidget(row)
+            self._drive_rows.append(row)
+
+    # ------------------------------------------------------------------ 状态
+    def _set_loading(self):
+        self._state = self.STATE_LOADING
+        self.btn_refresh.setEnabled(False)
+        self.btn_refresh.setText("刷新")
+        self._status.setText("正在读取本机硬件信息…")
+        self.chip.set_kind("unknown", "检测中")
+        for cell in self._cells.values():
+            cell.set_value("读取中", "")
+        self._model_cell.set_value("读取中", "")
+        self._clear_drives("读取中…")
+        self._sub.setText("")
+
+    def _set_error(self, message):
+        self._busy = False
+        self._state = self.STATE_ERROR
+        self.btn_refresh.setEnabled(True)
+        self._status.setText(message)
+        self.chip.set_kind("unknown", "读取失败")
+        for cell in self._cells.values():
+            cell.set_value("--", "")
+        self._model_cell.set_value("--", "")
+        self._clear_drives("读取失败")
+
+    def refresh(self):
+        """触发异步采集。scanner_factory 返回一个带 start() 的对象。
+
+        注意：采集在工作线程执行，结果必须通过 Qt 信号投递回主线程，
+        绝不能把 QWidget 的方法直接交给子线程调用（会导致状态静默卡死）。
+        """
+        if self._busy:
+            return
+        self._busy = True
+        self._set_loading()
+        if self._scanner_factory is None:
+            self._busy = False
+            self._set_error("未配置采集器")
+            return
+
+        def _ok(profile):
+            self._scanned.emit(profile)
+
+        def _err(message):
+            self._failed.emit(message)
+
+        self._scanner_factory(_ok, _err).start()
+
+    def load_profile(self, profile):
+        """直接注入已缓存的 profile（同步，用于二次启动秒开）。"""
+        self._on_ready(profile, from_cache=True)
+
+    def _on_ready(self, profile, from_cache=False):
+        if not profile:
+            self._set_error("未能读取到硬件信息")
+            return
+        self._busy = False
+        self._state = self.STATE_READY
+        self._profile = profile
+        self.btn_refresh.setEnabled(True)
+        self._status.setText("缓存数据（点击刷新重新读取）" if from_cache else "已读取本机硬件")
+        if self._on_profile and not from_cache:
+            self._on_profile(profile)
+        self.chip.set_kind(profile["kind"], profile["kind_label"])
+        self.chip.setToolTip("判定依据：" + profile.get("kind_reason", ""))
+
+        # 机型：制造商 + 型号
+        model = profile["model"]
+        maker = profile["manufacturer"]
+        sub_bits = []
+        if maker and maker != "--" and maker.lower() not in model.lower():
+            sub_bits.append(maker)
+        if profile.get("product_version"):
+            sub_bits.append(profile["product_version"])
+        self._model_cell.set_value(model, " · ".join(sub_bits))
+        self._model_cell.setToolTip(profile.get("kind_reason", ""))
+
+        # CPU
+        self._cells["cpu"].set_value(
+            _shorten(profile["cpu_name"], 44), profile["cpu_detail"]
+        )
+        self._cells["cpu"].setToolTip(profile["cpu_name"])
+
+        # 显卡：主显卡名称 + 显存，多卡时标注数量
+        gpus = profile["gpus"]
+        if gpus:
+            main = gpus[0]
+            extra = f"（共 %d 个适配器）" % len(gpus) if len(gpus) > 1 else ""
+            detail = main["vram"] + extra
+            if main.get("resolution"):
+                detail = main["vram"] + " · " + main["resolution"] + extra
+            self._cells["gpu"].set_value(_shorten(main["name"], 44), detail)
+            self._cells["gpu"].setToolTip(
+                "\n".join(g["name"] + "  " + g["vram"] for g in gpus)
+            )
+        else:
+            self._cells["gpu"].set_value("未检测到", "")
+
+        # 内存
+        self._cells["ram"].set_value(profile["ram_total"], profile["ram_detail"])
+
+        # 硬盘 / 存储：主值显示盘号，明细逐盘列出容量
+        disks = profile.get("disks", [])
+        drives = profile.get("drives", [])
+        internal = [d for d in disks if not d["external"]]
+        if drives:
+            letters = " ".join(d["letter"] for d in drives)
+            detail_bits = [f"{len(drives)} 个盘"]
+            if profile.get("drives_total"):
+                detail_bits.append(f"共 {profile['drives_total']}")
+            if profile.get("drives_free"):
+                detail_bits.append(f"可用 {profile['drives_free']}")
+            self._cells["disk"].set_value(_shorten(letters, 44), " · ".join(detail_bits))
+        else:
+            detail = f"{len(internal)} 块内置" if internal else "--"
+            if len(disks) > len(internal):
+                detail += f" · {len(disks) - len(internal)} 外置"
+            self._cells["disk"].set_value(profile.get("disk_total", "--"), detail)
+        # 物理硬盘信息放进 tooltip，避免和逐盘列表重复
+        self._cells["disk"].setToolTip(
+            "\n".join(
+                [f"{d['kind']}　{d['model']}　{d['size']}" for d in disks]
+                + [""]
+                + [f"{d['letter']}　{d['used']} / {d['total']}　可用 {d['free']}"
+                   for d in drives]
+            )
+        )
+        self._set_drives(drives, profile.get("drives_total", ""),
+                         profile.get("drives_free", ""))
+
+        # 次级信息
+        sub = " · ".join(
+            x for x in [
+                profile["os"],
+                f"Build {profile['os_build']}" if profile["os_build"] != "--" else "",
+                profile["os_arch"] if profile["os_arch"] != "--" else "",
+                f"主板 {profile['board']}" if profile["board"] != "--" else "",
+                f"BIOS {profile['bios']}" if profile["bios"] != "--" else "",
+            ] if x
+        )
+        self._sub.setText(sub)
+
+
+class SpecCell(QFrame):
+    """单个规格块：色块图标 + 标签 + 主值 + 副值。"""
+
+    def __init__(self, label, icon, tint_key="tile_1", large=False, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SpecCell")
+        self._tint_key = tint_key
+        self.setMinimumHeight(84 if not large else 62)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(10)
+
+        # 色块图标
+        self._tile = QFrame()
+        self._tile.setFixedSize(34 if not large else 30, 34 if not large else 30)
+        tl = QVBoxLayout(self._tile)
+        tl.setContentsMargins(0, 0, 0, 0)
+        ic = QLabel(icon)
+        ic.setAlignment(Qt.AlignCenter)
+        ic.setStyleSheet("font-size: 15px; background: transparent; color: #ffffff;")
+        tl.addWidget(ic)
+        lay.addWidget(self._tile, 0, Qt.AlignVCenter)
+
+        box = QVBoxLayout()
+        box.setSpacing(2)
+        self._label = QLabel(label)
+        self._label.setObjectName("Faint")
+        self._label.setStyleSheet("font-size: 11px;")
+        self._value = QLabel("读取中")
+        self._value.setStyleSheet(
+            f"font-size: {'13px' if not large else '14px'}; font-weight: 700;"
+        )
+        self._value.setWordWrap(False)
+        self._detail = QLabel("")
+        self._detail.setObjectName("Faint")
+        self._detail.setStyleSheet("font-size: 11px;")
+        box.addWidget(self._label)
+        box.addWidget(self._value)
+        box.addWidget(self._detail)
+        lay.addLayout(box, 1)
+
+        theme.bus.changed.connect(lambda _: self._apply_tint())
+        self._apply_tint()
+
+    def _apply_tint(self):
+        p = theme.current()
+        color = p.get(self._tint_key, p["accent"])
+        self._tile.setStyleSheet(
+            f"QFrame {{ background: {color}; border: none; border-radius: 4px; }}"
+        )
+        self.setStyleSheet(
+            f"QFrame#SpecCell {{ background: {p['surface_sunken']}; "
+            f"border: 1px solid {p['border']}; border-radius: 4px; }}"
+            f"QLabel {{ background: transparent; }}"
+        )
+
+    def set_value(self, value, detail=""):
+        self._value.setText(value or "--")
+        self._detail.setText(detail or "")
+        self._detail.setVisible(bool(detail))
+
+
+def _shorten(text, limit):
+    """过长文本截断并加省略号，避免撑破卡片（用 ASCII 省略号避免字体缺字）。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "..."
+
+
+def usage_color(percent):
+    """按占用率取色：≥90% 红 / ≥75% 琥珀 / 否则绿（与清理页阈值一致）。"""
+    p = theme.current()
+    if percent >= 90:
+        return p["red"]
+    if percent >= 75:
+        return p.get("amber", "#ffb020")
+    return p["green"]
+
+
+class DriveBar(QFrame):
+    """磁盘占用条（自绘，已用部分按占用率变色）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(6)
+        self.setMinimumWidth(60)
+        self._percent = 0.0
+
+    def set_percent(self, percent):
+        self._percent = max(0.0, min(100.0, float(percent or 0.0)))
+        self.update()
+
+    def paintEvent(self, event):
+        p = theme.current()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        # 底槽：必须与行背景（surface_sunken）区分开，否则占用率低的盘
+        # 整条都是"看不见"的（曾经用同色，E 盘 0% 时看起来根本没有进度条）
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(p.get("border_strong", p["border"])))
+        painter.drawRoundedRect(0, 0, w, h, 3, 3)
+        # 已用
+        filled = int(w * self._percent / 100.0)
+        if filled > 0:
+            painter.setBrush(QColor(usage_color(self._percent)))
+            painter.drawRoundedRect(0, 0, max(filled, 3), h, 3, 3)
+        painter.end()
+
+
+class DriveRow(QFrame):
+    """单个逻辑盘一行：[盘符] [占用条] 已用/总计 · 可用。
+
+    盘符（"盘号"）用色块徽标突出，一眼能对应上资源管理器里的 C/D/E 盘。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DriveRow")
+        self._percent = 0.0          # 先声明，避免样式回调早于 set_drive 触发
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 7, 12, 7)
+        lay.setSpacing(10)
+
+        # 盘符徽标
+        self._badge = QLabel("C:")
+        self._badge.setObjectName("DriveBadge")
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setFixedSize(38, 24)
+        lay.addWidget(self._badge, 0, Qt.AlignVCenter)
+
+        # 卷标 / 类型
+        self._meta = QLabel("")
+        self._meta.setObjectName("Faint")
+        self._meta.setStyleSheet("font-size: 11px; background: transparent;")
+        self._meta.setFixedWidth(54)
+        lay.addWidget(self._meta, 0, Qt.AlignVCenter)
+
+        # 占用条
+        self._bar = DriveBar()
+        lay.addWidget(self._bar, 1, Qt.AlignVCenter)
+
+        # 容量文字
+        self._size = QLabel("")
+        self._size.setStyleSheet("font-size: 12px; background: transparent;")
+        self._size.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._size.setMinimumWidth(196)
+        lay.addWidget(self._size, 0, Qt.AlignVCenter)
+
+        # 注意：必须连**绑定方法**（而不是 lambda）。用 lambda 时 Qt 不知道接收者是谁，
+        # 控件被 deleteLater() 回收后仍会收到主题信号 → "Internal C++ object already deleted"。
+        # 连绑定方法后 PySide 会在对象析构时自动断开。
+        theme.bus.changed.connect(self._restyle)
+
+    def set_drive(self, d):
+        """填充一个逻辑盘的数据（d 为 profile["drives"] 里的一项）。"""
+        self._badge.setText(d["letter"])
+        kind = d.get("kind_label", "")
+        label = d.get("label") or ""
+        self._meta.setText(_shorten(label or kind, 6))
+        self._meta.setToolTip(
+            f"{d['letter']}　{d.get('fs', '')}　{kind}"
+            + (f"　卷标：{label}" if label else "")
+        )
+        self._percent = d.get("percent", 0.0)
+        self._bar.set_percent(self._percent)
+        self._size.setText(f"{d['used']} / {d['total']}　·　可用 {d['free']}")
+        self._size.setToolTip(
+            f"{d['letter']} 总计 {d['total']}　已用 {d['used']}　"
+            f"可用 {d['free']}　占用率 {self._percent:.1f}%"
+        )
+        self._restyle()
+
+    def _restyle(self, *args):
+        try:
+            self._apply_styles()
+        except RuntimeError:
+            # 底层 C++ 对象已销毁（主题信号晚于 deleteLater 到达），忽略即可
+            pass
+
+    def _apply_styles(self):
+        p = theme.current()
+        color = usage_color(getattr(self, "_percent", 0.0))
+        self.setStyleSheet(
+            f"QFrame#DriveRow {{ background: {p['surface_sunken']}; "
+            f"border: 1px solid {p['border']}; border-radius: 4px; }}"
+            f"QLabel {{ background: transparent; }}"
+        )
+        self._badge.setStyleSheet(
+            f"background: {color}; color: #ffffff; font-size: 12px; "
+            f"font-weight: 700; border: none; border-radius: 4px;"
+        )
+        self._size.setStyleSheet(
+            f"font-size: 12px; font-weight: 700; color: {p['text']}; "
+            f"background: transparent;"
+        )
+        # 占用条是自绘的，不跟着 QSS 走，主题切换时手动重绘
+        self._bar.update()
