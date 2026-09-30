@@ -37,3 +37,8 @@ desktop.ini
 *_备份_*/
 *.bak
 *.old
+
+# 自检输出与临时备份
+_st_*.json
+_backup_*.exe
+_*.exe
