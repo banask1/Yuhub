@@ -906,6 +906,121 @@ class NickBeacon:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# 虚拟网卡"信任化"：达到 Radmin VPN 的开箱即用体验
+# ---------------------------------------------------------------------------
+# 用户实测：真实局域网能玩 MC、Radmin VPN 能玩、唯独 EasyTier 不能
+# （列表看得到人、游戏列表没人、IP 直连也不通）。原因有两层：
+#
+#   1. **防火墙网络配置文件**：wintun 虚拟网卡被 Windows 归为
+#      「未识别网络 = 公用 profile」，公用默认阻止一切入站——
+#      javaw.exe 没有入站白名单，IP 直连都会被丢。而 Radmin 的网卡
+#      被归为「专用」，用户当年弹窗点过的"允许 Java(专用)"直接生效。
+#      这解释了为什么唯独 Yuhub 不通而 Radmin 通。
+#   2. 广播发现依赖中继旁路搬运（不可控），但 IP 直连是稳的——
+#      只要防火墙放行。
+#
+# 修法（本函数必须在**提权**的 watchdog 里调用，主进程没有权限）：
+#   ① 等虚拟网卡出现（DHCP 拿到 10.126.126.x）；
+#   ② Set-NetConnectionProfile 把它设为「专用」——用户历史点过的
+#      Java 放行规则立即生效；
+#   ③ 再补一条**按接口别名**的入站放行规则（虚拟网里都是持同密码的
+#      伙伴，等同可信局域网）——连当年没点过允许的机器也一并覆盖。
+# 每次进房都要重跑：wintun 网卡每次启动都会重建，规则/配置绑定的是
+# 新网卡实例。
+TRUST_RULE_NAME = "Yuhub 联机游戏放行"
+
+_PS_FIND_ADAPTER = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "$ip = Get-NetIPAddress | Where-Object { $_.IPAddress -like '"
+    + VIRTUAL_NET_PREFIX + "*' } | Select-Object -First 1;"
+    "if ($ip) { Write-Output ('FOUND ' + $ip.InterfaceAlias + ' ' + $ip.IPAddress) }"
+    "else { Write-Output 'WAIT' }"
+)
+
+_PS_APPLY_TRUST = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "$ip = Get-NetIPAddress | Where-Object { $_.IPAddress -like '"
+    + VIRTUAL_NET_PREFIX + "*' } | Select-Object -First 1;"
+    "if (-not $ip) { Write-Output 'NOADAPTER'; exit };"
+    "Set-NetConnectionProfile -InterfaceIndex $ip.InterfaceIndex"
+    " -NetworkCategory Private;"
+    "Remove-NetFirewallRule -DisplayName '" + TRUST_RULE_NAME + "'"
+    " -ErrorAction SilentlyContinue;"
+    "$null = New-NetFirewallRule -DisplayName '" + TRUST_RULE_NAME + "'"
+    " -Direction Inbound -Action Allow"
+    " -InterfaceAlias $ip.InterfaceAlias -Profile Any;"
+    "Write-Output ('OK ' + $ip.InterfaceAlias + ' ' + $ip.IPAddress)"
+)
+
+
+def _ps_run(command, timeout=45):
+    """跑一条 PowerShell（无窗口）。输出按 UTF-8 宽松解码。"""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", command],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def enforce_virtual_net_trust(on_log=None, timeout=60.0):
+    """等虚拟网卡就绪 → 设为专用网络 + 放行入站。返回是否成功。
+
+    由 watchdog（提权进程）在拉起 easytier-core 之后调用；每次进房
+    都会执行一遍（网卡是新建的，规则要重新绑定到它的接口别名）。
+    """
+    on_log = on_log or (lambda msg: None)
+    deadline = time.monotonic() + timeout
+    alias = ip = ""
+    while time.monotonic() < deadline:
+        out = _ps_run(_PS_FIND_ADAPTER, timeout=30)
+        if out.startswith("FOUND"):
+            parts = out.split()
+            if len(parts) >= 3:
+                alias, ip = parts[1], parts[2]
+                break
+        time.sleep(3.0)
+    if not alias:
+        on_log("虚拟网卡信任化：等待网卡超时，本次跳过")
+        return False
+
+    out = _ps_run(_PS_APPLY_TRUST, timeout=60)
+    if out.startswith("OK"):
+        on_log("虚拟网卡已设为专用网络并放行游戏入站（%s）" % alias)
+        return True
+    on_log("虚拟网卡信任化失败（不影响联机本身，但游戏可能被防火墙拦截）")
+    return False
+
+
+def virtual_net_trust_status():
+    """查询当前信任化状态（只读，供自检用）。返回 (profile, rule_exists)。
+
+    profile: 'Private' / 'Public' / ''（查不到网卡）；rule_exists: bool。
+    """
+    out = _ps_run(
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$ip = Get-NetIPAddress | Where-Object { $_.IPAddress -like '"
+        + VIRTUAL_NET_PREFIX + "*' } | Select-Object -First 1;"
+        "if (-not $ip) { Write-Output 'NOADAPTER'; exit };"
+        "$p = Get-NetConnectionProfile -InterfaceIndex $ip.InterfaceIndex;"
+        "$r = Get-NetFirewallRule -DisplayName '" + TRUST_RULE_NAME + "';"
+        "Write-Output ('CAT=' + $p.NetworkCategory + ' RULE=' + [bool]$r)",
+        timeout=45,
+    )
+    cat = ""
+    if "CAT=Private" in out:
+        cat = "Private"
+    elif "CAT=Public" in out:
+        cat = "Public"
+    return cat, ("RULE=True" in out)
+
+
 def pick_host_ip(my_ip, exclude_ips=None, hostname="", wait=0.0, interval=0.8):
     """在虚拟网里找出**房主**的 IP（DHCP 动态分配下用）。
 

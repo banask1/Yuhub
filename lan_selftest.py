@@ -193,6 +193,22 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
         except Exception as exc:
             mark("昵称信标防火墙规则已配置", False, repr(exc))
 
+        # ---- 虚拟网卡信任化（v0.8.4beta：专用网络 + 游戏入站放行） ----
+        # watchdog 在拉起 core 后的线程里执行，这里轮询等待其完成。
+        try:
+            ok_trust = False
+            detail_trust = ""
+            for _ in range(8):                     # 最多等 ~24 秒
+                cat, rule = etier.virtual_net_trust_status()
+                detail_trust = "profile=%s rule=%s" % (cat or "无网卡", rule)
+                if cat == "Private" and rule:
+                    ok_trust = True
+                    break
+                time.sleep(3.0)
+            mark("虚拟网卡已信任化（专用+游戏放行）", ok_trust, detail_trust)
+        except Exception as exc:
+            mark("虚拟网卡已信任化（专用+游戏放行）", False, repr(exc))
+
     # ⑥ 收尾：停止房间（除非 --keep）
     if ok and not keep:
         tier.request_stop()
