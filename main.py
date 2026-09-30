@@ -357,6 +357,16 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- 错误日志钩子（隐藏功能，无 UI）：出错/崩溃时静默写
+    #      文档\Yuhub\error\crash_*.log。必须在建 QApplication 之前装好，
+    #      否则 Qt 初始化阶段的崩溃就抓不到了。所有 --*-selftest 模式
+    #      都在上面早返回了，不会受影响。
+    try:
+        import errorlog
+        errorlog.install()
+    except Exception:
+        pass                        # 日志系统自身故障绝不影响启动
+
     # 高 DPI 适配（Qt6 默认开启，这里显式声明以保证高分屏清晰）
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

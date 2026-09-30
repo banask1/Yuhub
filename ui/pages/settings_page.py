@@ -1,10 +1,13 @@
-"""设置中心页：主题切换、启动与托盘开关、关于。"""
+"""设置中心页：主题切换、启动与托盘开关、异地联机组件、关于。"""
 
-from PySide6.QtCore import Qt, QSettings
+import threading
+
+from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QComboBox)
 
 import autostart
+import etier
 
 from .. import theme, VERSION_LABEL
 from ..widgets import (
@@ -31,6 +34,9 @@ class SettingsPage(BasePage):
     # 页头徽标。基类默认是"功能开发中"，但本页的开关都是真能用的了，
     # 挂着"开发中"自相矛盾（与 C盘清理 / 多线程下载 保持一致口径）。
     BADGE = "已上线"
+
+    # 引擎/修复回调发生在后台线程，必须经信号排队回主线程再碰控件
+    _etier_event = Signal(str, object)
 
     def __init__(
         self,
@@ -64,8 +70,10 @@ class SettingsPage(BasePage):
 
     # ------------------------------------------------------------------ 构建
     def _build_content(self, theme_setting, close_to_tray):
+        self._etier_event.connect(self._on_etier_event)
         self._build_appearance(theme_setting)
         self._build_startup_card(close_to_tray)
+        self._build_etier_card()
         self._build_about()
         self.add_stretch()
 
@@ -236,6 +244,94 @@ class SettingsPage(BasePage):
                 "单实例限制、开机自启。",
             )
         )
+
+    # ------------------------------------------------------ 异地联机组件
+    def _build_etier_card(self):
+        """EasyTier 组件体检 + 一键修复。
+
+        背景：有用户反馈下载后 easytier-core.exe 被杀毒软件直接删掉，
+        联机页报"内置资源缺失"。重新下载 Yuhub 没用（释放出来又被删），
+        所以提供单独重装组件的入口。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+
+        title = QLabel("异地联机组件")
+        title.setObjectName("CardTitle")
+        v.addWidget(title)
+
+        # 状态：后台检测，不在构造函数里起子进程拖慢页面
+        self.etier_status = QLabel("组件检测中…")
+        self.etier_status.setWordWrap(True)
+        self.etier_status.setStyleSheet("font-size: 12px;")
+        v.addWidget(self.etier_status)
+
+        v.addWidget(small_note(
+            "跨网房间依赖 EasyTier 虚拟网卡组件（v%s）。若组件丢失或被"
+            "安全软件误删，点「一键修复」会从网络重新下载**同版本**组件"
+            "并安装（约 32 MB），无需重装 Yuhub。" % etier.EASYTIER_VERSION))
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self.btn_repair = ghost_button("一键修复")
+        self.btn_repair.clicked.connect(self._on_repair_clicked)
+        row.addWidget(self.btn_repair)
+        v.addLayout(row)
+
+        self.add(card)
+
+        # 构建完成后异步做一次体检（tasklist/文件检查很快，但规矩是
+        # 子进程一律不进 GUI 线程）
+        threading.Thread(target=self._do_etier_check, daemon=True).start()
+
+    def _do_etier_check(self):
+        try:
+            ok, detail = etier.core_health()
+        except Exception as exc:
+            ok, detail = False, repr(exc)
+        self._etier_event.emit("check", {"ok": ok, "detail": detail})
+
+    def _on_etier_event(self, kind, payload):
+        """后台线程 → 主线程的事件落地（体检结果 / 修复进度与结果）。"""
+        if kind == "check":
+            ok = payload.get("ok")
+            detail = str(payload.get("detail") or "")
+            if ok:
+                self.etier_status.setText("组件正常（%s）" % detail)
+            else:
+                self.etier_status.setText("组件异常：%s" % detail)
+        elif kind == "progress":
+            self.etier_status.setText(str(payload or ""))
+        elif kind == "repair_done":
+            ok = payload.get("ok")
+            msg = str(payload.get("msg") or "")
+            self.btn_repair.setEnabled(True)
+            if ok:
+                self.etier_status.setText("组件正常（%s）" % msg)
+                self.toast("修复完成：%s" % msg)
+            else:
+                self.etier_status.setText("修复失败：%s" % msg)
+                self.toast("修复失败：%s" % msg)
+
+    def _on_repair_clicked(self):
+        self.btn_repair.setEnabled(False)
+        self.etier_status.setText("正在准备修复…")
+        threading.Thread(
+            target=self._do_repair, name="EtierRepair", daemon=True).start()
+
+    def _do_repair(self):
+        def progress(text):
+            self._etier_event.emit("progress", text)
+
+        try:
+            ok, msg = etier.repair_binaries(progress=progress)
+        except Exception as exc:
+            ok, msg = False, repr(exc)
+        self._etier_event.emit("repair_done", {"ok": ok, "msg": msg})
 
     # ------------------------------------------------------------------ 更新
     def _on_auto_update_toggled(self, checked):

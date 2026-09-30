@@ -75,6 +75,17 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
     ok_bin, bin_msg = etier.release_binaries()
     mark("EasyTier 二进制释放", ok_bin, str(bin_msg))
 
+    # ③b 组件体检接口（设置页"一键修复"的状态来源）
+    try:
+        ok_h, det_h = etier.core_health()
+        ver_ok = etier.EASYTIER_VERSION in etier.EASYTIER_DOWNLOAD_URLS[0]
+        mark("组件体检与修复入口可用",
+             isinstance(ok_h, bool) and bool(det_h) and ver_ok,
+             "core_health=%s/%s 修复版本 v%s"
+             % (ok_h, str(det_h)[:40], etier.EASYTIER_VERSION))
+    except Exception as exc:
+        mark("组件体检与修复入口可用", False, repr(exc))
+
     # ④ 启动前应无残留进程
     pre = etier.core_running()
     mark("启动前无残留 easytier-core", not pre, "core_running=%s" % pre)
@@ -236,11 +247,11 @@ def _check_ui_state(result, mark):
 
 
 def _check_join_validation(page, mark):
-    """准入校验的回归：房间里找不到别人时必须回滚并报错。
+    """v0.8.2beta 回归：15 秒验证已删除 + 成员跟踪器逻辑。
 
-    注意：**不再区分房主/成员**——身份选择器已移除，每个人进入房间后
-    都做同一套校验（房间里有没有别人），因为 EasyTier 密码填错时不会
-    报错、只会给你一个只有自己的空房间。
+    15 秒验证的本意是拦"密码填错进了空房间"，但 peer 发现依赖 ARP/打洞，
+    偶发找不到人就把人踢出房间——队友经常"加入不进来"。现已改为
+    不阻塞进入 + 30 秒温和提示；成员列表稳定性交给 MemberTracker。
     """
     # 身份区分已移除（房主/成员是同一个动作）
     mark("身份选择器已移除（无房主/成员之分）",
@@ -251,7 +262,13 @@ def _check_join_validation(page, mark):
          page.btn_start.text() in ("进入房间", "请先填昵称"),
          "文案=%r" % page.btn_start.text())
 
-    # 构造一个"正在运行"的假状态，然后喂一个"找不到别人"的校验结果
+    # 15 秒验证已删除：相关方法/状态字段都不该存在
+    legacy = [n for n in ("_do_verify_room", "_on_verify_result",
+                          "_rollback_failed_join", "_verify_seq")
+              if hasattr(page, n)]
+    mark("15 秒验证已彻底移除（不阻塞进入房间）", not legacy, "残留=%r" % (legacy,))
+
+    # 启动成功回调必须**立即**进入运行态（没有等待窗口）
     class _FakeTier2:
         def request_stop(self):
             return True
@@ -263,42 +280,83 @@ def _check_join_validation(page, mark):
             return False
 
     page._etier = _FakeTier2()
-    page._running = True
-    page._my_ip = "10.126.126.7"
-    page.btn_stop.setEnabled(True)
-    page.btn_copy_ip.setEnabled(True)
-    page.ip_label.setText("10.126.126.7")
-    page._verify_seq = 4242
+    page._running = False
+    page.nick_edit.setText("VerifyNick")
+    page._on_done({"ok": True, "msg": "10.126.126.7",
+                   "tier": _FakeTier2(), "ipv4": "10.126.126.7"})
+    immediate = (page._running is True and page._etier is not None
+                 and page._etier_busy is False)
+    mark("启动成功后立即进入运行态（无验证等待）", immediate,
+         "running=%s etier=%s busy=%s"
+         % (page._running, page._etier is not None, page._etier_busy))
+    # tracker 应已启动，且成功后要有「已进入房间」的日志
+    mark("成员跟踪器随进入房间启动",
+         page._tracker is not None, "tracker=%s" % (page._tracker is not None))
+    log_text = ""
+    try:
+        log_text = page.log_view.toPlainText()
+    except Exception:
+        pass
+    joined_log = "已进入房间" in log_text
+    mark("进入房间有明确日志", joined_log, "log 含「已进入房间」=%s" % joined_log)
 
-    # ① 过期的校验结果必须被忽略（防竞态）
-    page._on_verify_result({"seq": 1, "found": False})
-    mark("过期校验结果被忽略（不误伤）", page._running is True,
-         "_running=%s" % page._running)
+    _check_member_tracker(page, mark)
 
-    # ② 本轮结果：没找到别人 → 必须完整回滚
-    page._on_verify_result({"seq": 4242, "found": False})
-    rolled_back = (
-        page._running is False
-        and page._etier is None
-        and page.btn_start.isEnabled()
-        and not page.btn_stop.isEnabled()
-        and page.ip_label.text() == "--"
-    )
-    mark("校验失败后完整回滚到可重试状态", rolled_back,
-         "running=%s etier=%s start可用=%s stop可用=%s ip=%r"
-         % (page._running, page._etier, page.btn_start.isEnabled(),
-            page.btn_stop.isEnabled(), page.ip_label.text()))
-    mark("校验失败给用户明确提示（不是静默）",
-         "失败" in page.status_note.text(),
-         "提示=%r" % page.status_note.text()[:60])
+    # 收尾：停掉 tracker，别让后台线程留着 arp 轮询
+    page._stop_tracker()
+    mark("停止房间后跟踪器已停", page._tracker is None, "tracker=None")
 
-    # ③ 校验通过 → 保持运行
-    page._etier = _FakeTier2()
-    page._running = True
-    page._verify_seq = 4243
-    page._on_verify_result({"seq": 4243, "found": True})
-    mark("校验通过后保持运行", page._running is True and page._etier is not None,
-         "_running=%s" % page._running)
+
+def _check_member_tracker(page, mark):
+    """MemberTracker 的核心逻辑（注入假状态，不依赖真实网络）。
+
+    覆盖"人数断断续续"的修复点：
+      1. 已知成员出现在快照里；
+      2. 偶发一次 ping 失败 **不会** 把人从列表里闪没（宽限）；
+      3. 持续失联（连续 ping 失败 + 长时间无 ARP 确认）才判离线。
+    """
+    import etier as etier_mod
+
+    tr = etier_mod.MemberTracker("10.126.126.7")
+    # 注入一个"在线"的假成员
+    tr._peers["10.126.126.9"] = {
+        "confirmed": time.monotonic(), "ping_fail": 0, "name": "Bob"}
+
+    snap = tr.snapshot()
+    mark("跟踪器快照包含已知成员",
+         any(m["ip"] == "10.126.126.9" and m["name"] == "Bob" for m in snap),
+         "快照=%r" % (snap,))
+
+    # 偶发 ping 失败 ×1 → 宽限期内必须还在
+    tr._on_ping_result("10.126.126.9", False)
+    still = any(m["ip"] == "10.126.126.9" for m in tr.snapshot())
+    mark("偶发 ping 失败不判离线（宽限）", still,
+         "失败1次后快照=%r" % ([m["ip"] for m in tr.snapshot()],))
+
+    # ping 失败 ×3 但 ARP 还没超宽限 → 仍在（ARP 单信号不判死）
+    for _ in range(2):
+        tr._on_ping_result("10.126.126.9", False)
+    still2 = any(m["ip"] == "10.126.126.9" for m in tr.snapshot())
+    mark("连续失败但未超宽限不误删", still2, "失败3次后仍在=%s" % still2)
+
+    # 持续失联：ping 连续失败 + 最后确认时间倒退到宽限之外 → 离线
+    tr._peers["10.126.126.9"]["confirmed"] = time.monotonic() - 60.0
+    tr._on_ping_result("10.126.126.9", False)     # 第 4 次失败
+    tr._sweep()
+    gone = not any(m["ip"] == "10.126.126.9" for m in tr.snapshot())
+    mark("持续失联（双信号失效）后判离线", gone,
+         "移除后快照=%r" % ([m["ip"] for m in tr.snapshot()],))
+
+    # ping 成功要刷新确认时间并清零失败计数（保活路径）
+    tr._peers["10.126.126.9"] = {
+        "confirmed": time.monotonic() - 60.0, "ping_fail": 3, "name": ""}
+    tr._on_ping_result("10.126.126.9", True)
+    tr._sweep()
+    revived = any(m["ip"] == "10.126.126.9" for m in tr.snapshot())
+    mark("ping 恢复后成员复活且不被误删", revived,
+         "confirmed刷新=%s fail=%d"
+         % (tr._peers["10.126.126.9"]["confirmed"] > time.monotonic() - 5,
+            tr._peers["10.126.126.9"]["ping_fail"]))
 
 
 def _check_nickname(page, mark):
