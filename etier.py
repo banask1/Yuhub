@@ -152,6 +152,147 @@ def release_binaries(force=False):
 
 
 # ---------------------------------------------------------------------------
+# 一键修复：从网上重新下载同版本 EasyTier 并安装
+# ---------------------------------------------------------------------------
+# 背景：杀毒软件（尤其国内某些）会把刚释放出来的 easytier-core.exe 当风险
+# 程序直接删掉，用户下载完 Yuhub 一进联机页就报"内置资源缺失"。重新下载
+# Yuhub 本体解决不了（再释放再被删），正确姿势是单独把 EasyTier 组件
+# 从官方 GitHub Release 重新拉一份装回去。
+#
+# 版本必须与内置的完全一致（内置 = 2.6.4-8428a89d，实测 `--version` 确认），
+# 否则新旧混跑会出现协议不兼容。下载源按顺序尝试：GitHub 直连 → 两个国内
+# 常见的 GitHub 加速镜像（镜像会失效，失败了自然落到下一个）。
+EASYTIER_VERSION = "2.6.4"
+_EASYTIER_ASSET = ("easytier-windows-x86_64-v%s.zip" % EASYTIER_VERSION)
+_EASYTIER_PATH = ("EasyTier/EasyTier/releases/download/v%s/" % EASYTIER_VERSION)
+EASYTIER_DOWNLOAD_URLS = (
+    "https://github.com/" + _EASYTIER_PATH + _EASYTIER_ASSET,
+    "https://ghproxy.net/https://github.com/" + _EASYTIER_PATH + _EASYTIER_ASSET,
+    "https://gh-proxy.com/https://github.com/" + _EASYTIER_PATH + _EASYTIER_ASSET,
+)
+
+
+def core_health():
+    """检查 EasyTier 组件是否完好。返回 (ok, detail)。
+
+    判据：三个文件都在、easytier-core.exe 大小正常（>1MB，被删一半/截断
+    的文件大小会明显异常）。不在这里跑 --version——那是启动路径的职责，
+    这里只做"文件级"体检，供设置页轮询显示。
+    """
+    core = core_path()
+    if not os.path.isfile(core):
+        return False, "缺少 easytier-core.exe（可能被安全软件删除）"
+    if os.path.getsize(core) < 1_000_000:
+        return False, "easytier-core.exe 大小异常（文件可能损坏）"
+    for name in ("wintun.dll", "Packet.dll"):
+        p = os.path.join(install_dir(), name)
+        if not os.path.isfile(p):
+            return False, "缺少 %s" % name
+    return True, core
+
+
+def repair_binaries(progress=None, timeout=600):
+    """下载与内置同版本的 EasyTier 并重新安装到固定目录。
+
+    progress: callable(str)，汇报进度文字（供 UI 显示）。可为 None。
+    返回 (ok, msg)。ok=True 时 msg 是成功说明，否则是给用户看的原因。
+
+    注意：房间运行中 easytier-core.exe 被占用、覆盖必然失败，所以这里
+    会先尝试停掉它（写停止信号 + 兜底 taskkill，均不弹 UAC）；停不下来
+    就明确让用户手动停止，绝不硬来。
+    """
+    report = progress or (lambda s: None)
+
+    if core_running():
+        report("检测到跨网房间正在运行，先停止它…")
+        tier = EasyTier()
+        tier.request_stop()
+        if not tier.wait_stopped(5.0):
+            force_kill_core()
+            time.sleep(1.0)
+        if core_running():
+            return False, "无法停止正在运行的 easytier-core，请先停止跨网房间再修复"
+
+    tmpdir = os.path.join(install_dir(), "_repair_tmp")
+    zpath = os.path.join(tmpdir, "easytier.zip")
+    last_err = ""
+    try:
+        os.makedirs(tmpdir, exist_ok=True)
+        import urllib.request
+        for i, url in enumerate(EASYTIER_DOWNLOAD_URLS, 1):
+            report("正在下载 EasyTier v%s（第 %d/%d 个源，约 32 MB）…"
+                   % (EASYTIER_VERSION, i, len(EASYTIER_DOWNLOAD_URLS)))
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Yuhub-Repair",
+                    "Accept": "application/octet-stream",
+                })
+                # urlopen 会遵循系统/环境代理（urllib.request.getproxies），
+                # 走系统代理的机器不会因为 GitHub 直连不通而失败。
+                with urllib.request.urlopen(req, timeout=60) as resp, \
+                        open(zpath, "wb") as f:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    got = 0
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total:
+                            report("下载中 %d%%（%.1f / %.1f MB）"
+                                   % (got * 100 // total,
+                                      got / 1048576.0, total / 1048576.0))
+                if got < 10_000_000:
+                    raise IOError("下载不完整（仅 %d 字节）" % got)
+                last_err = ""
+                break
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+        if last_err:
+            return False, "下载失败：%s（请检查网络后重试）" % last_err
+
+        report("下载完成，正在解压安装…")
+        import zipfile
+        extracted = {}
+        with zipfile.ZipFile(zpath) as z:
+            for entry in z.namelist():
+                base = os.path.basename(entry)
+                if base in BIN_NAMES and base not in extracted:
+                    z.extract(entry, tmpdir)
+                    extracted[base] = os.path.join(tmpdir, entry)
+        missing = [w for w in BIN_NAMES if w not in extracted]
+        if missing:
+            return False, "压缩包里缺少 %s（上游资产可能已变更）" % "、".join(missing)
+
+        os.makedirs(install_dir(), exist_ok=True)
+        for name, src in extracted.items():
+            # tmpdir 就在 install_dir 里，同盘 os.replace 是原子改名
+            os.replace(src, os.path.join(install_dir(), name))
+    except Exception as exc:
+        return False, "修复失败：%s" % exc
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    ok, detail = core_health()
+    if not ok:
+        return False, "安装后校验未通过：%s" % detail
+    # 最后跑一次 --version 确认组件真的可用（文件在 ≠ 能跑）
+    try:
+        r = subprocess.run(
+            [core_path(), "--version"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        ver = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        ver = ver[0].strip() if ver else ""
+    except Exception as exc:
+        return False, "安装后 easytier-core 无法运行：%s" % exc
+    return True, ("已重新安装 EasyTier %s" % (ver or EASYTIER_VERSION))
+
+
+# ---------------------------------------------------------------------------
 # 提权启动（UAC）与看门狗
 # ---------------------------------------------------------------------------
 # 看门狗改用 Yuhub.exe --watchdog 模式（自己当 helper），而不是 wscript + VBScript
@@ -432,6 +573,134 @@ def probe_host(host_ip, timeout=2.0, attempts=2):
         except Exception:
             pass
     return False
+
+
+# ---------------------------------------------------------------------------
+# 成员在线跟踪：解决"在线人数断断续续"
+# ---------------------------------------------------------------------------
+# 根因：以前直接拿 `arp -a` 的结果当在线名单。Windows 的 ARP 条目受
+# "可达性超时"控制——一段时间没有流量，条目就从表里消失（哪怕对方还在线）；
+# EasyTier 节点之间没有持续大流量时这几乎是必然发生的。于是成员列表每隔
+# 十几秒就"闪没"又"闪回来"。
+#
+# 解法 = 保活 + 宽限：
+#   1. **保活**：后台线程每 3 秒对已知成员逐个 ping（1 次、0.5s 超时）。
+#      ICMP 流量本身会刷新 ARP 条目（条目不会过期），ping 通同时是对端
+#      活性的主动确认，比被动等 ARP 靠谱。
+#   2. **宽限**：离线判定要求**两个信号同时失效**——ARP 里连续 12 秒
+#      没见到、且连续 4 次 ping 都不通。任何一个信号单独抖动都不会把人
+#      从列表里闪没。
+# 名称解析（gethostbyaddr，每个最长 0.8s）也挪进这个后台线程，解析一次
+# 就缓存——UI 线程从此只读快照，一个子进程都不起、零阻塞。
+class MemberTracker:
+    """一个跨网房间对应一个实例。UI 通过 snapshot() 拿稳定视图。"""
+
+    PING_INTERVAL = 3.0      # 每轮 ping 的间隔（秒）
+    PING_TIMEOUT = 0.5       # 单次 ping 超时（秒）
+    PING_FAIL_EVICT = 4      # 连续 ping 失败次数达到该值才可能判离线
+    CONFIRM_GRACE = 12.0     # 最后一次确认（ARP 见到 / ping 通）后的宽限（秒）
+
+    def __init__(self, my_ip, on_log=None):
+        self._my_ip = my_ip
+        self._on_log = on_log or (lambda msg: None)
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._thread = None
+        # ip -> {"confirmed": monotonic, "ping_fail": int, "name": str}
+        self._peers = {}
+
+    # ------------------------------------------------ 对外接口（UI 用）
+    def start(self):
+        """启动后台跟踪线程。重复调用无害。"""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="MemberTracker", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """停止后台线程（停止房间 / 回滚时调用）。瞬时返回。"""
+        self._stop_evt.set()
+
+    def snapshot(self):
+        """当前在线成员 [{"ip", "name"}]，按 IP 排序。UI 线程调用，零阻塞。"""
+        with self._lock:
+            return [{"ip": ip, "name": (p.get("name") or "")}
+                    for ip, p in sorted(self._peers.items())]
+
+    # ------------------------------------------------ 后台线程主体
+    def _loop(self):
+        while not self._stop_evt.is_set():
+            try:
+                self._round()
+            except Exception:
+                pass                    # 单轮失败不影响下一轮
+            self._stop_evt.wait(self.PING_INTERVAL)
+
+    def _round(self):
+        now = time.monotonic()
+        # ① ARP 扫描：新面孔入场 + 老成员确认在场
+        try:
+            arp = set(list_members(self._my_ip))
+        except Exception:
+            arp = set()
+        with self._lock:
+            for ip in arp:
+                p = self._peers.setdefault(
+                    ip, {"confirmed": now, "ping_fail": 0, "name": ""})
+                p["confirmed"] = now
+                p["ping_fail"] = 0
+        # ② 逐个 ping：保活 ARP + 主动确认活性
+        with self._lock:
+            targets = list(self._peers.keys())
+        for ip in targets:
+            if self._stop_evt.is_set():
+                return
+            alive = probe_host(ip, timeout=self.PING_TIMEOUT, attempts=1)
+            self._on_ping_result(ip, alive, now)
+        # ③ 离线判定（双信号失效才移除）
+        self._sweep(now)
+        # ④ 名称解析：只解析还没名字的，解析一次就缓存
+        self._resolve_names()
+
+    def _on_ping_result(self, ip, alive, now=None):
+        """记录一次 ping 结果（抽出来是为了可测）。"""
+        now = now if now is not None else time.monotonic()
+        with self._lock:
+            p = self._peers.get(ip)
+            if p is None:
+                return
+            if alive:
+                p["confirmed"] = now
+                p["ping_fail"] = 0
+            else:
+                p["ping_fail"] += 1
+
+    def _sweep(self, now=None):
+        """移除确认离线的成员：连续 ping 失败 **且** ARP 长时间未见。"""
+        now = now if now is not None else time.monotonic()
+        with self._lock:
+            gone = [ip for ip, p in self._peers.items()
+                    if p["ping_fail"] >= self.PING_FAIL_EVICT
+                    and now - p["confirmed"] > self.CONFIRM_GRACE]
+            for ip in gone:
+                del self._peers[ip]
+        for ip in gone:
+            self._on_log("成员 %s 已离线" % ip)
+
+    def _resolve_names(self):
+        with self._lock:
+            need = [ip for ip, p in self._peers.items() if not p.get("name")]
+        for ip in need:
+            if self._stop_evt.is_set():
+                return
+            name = _resolve_name(ip, timeout=0.8)
+            if name:
+                with self._lock:
+                    p = self._peers.get(ip)
+                    if p is not None:
+                        p["name"] = name
 
 
 def pick_host_ip(my_ip, exclude_ips=None, hostname="", wait=0.0, interval=0.8):

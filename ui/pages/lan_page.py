@@ -97,11 +97,11 @@ class LanPage(BasePage):
         self._etier_busy = False      # 正在启动/停止跨网房间
         self._running = False         # 是否在运行（用于状态显示）
         self._my_ip = ""              # 本机虚拟 IP（运行中）
-        self._member_tick = 0         # 成员列表刷新计数（控制名称反查频率）
-        self._member_names = {}       # ip -> 已解析到的名称（跨 tick 缓存）
+        self._tracker = None          # etier.MemberTracker：成员在线稳定视图
         self._members_row = []        # 当前渲染出来的成员 IP 顺序（用于增删行）
-        self._verify_seq = 0          # 成员校验的轮次号（防止过期回调生效）
-        self._host_nick = ""          # 本次启动用的昵称（校验回调里要用）
+        self._host_nick = ""          # 本次启动用的昵称（成员列表第一行显示）
+        self._started_wall = 0.0      # 本次进房的时间戳（time.time，给温和提示用）
+        self._alone_hinted = False    # "房间里只有你"的温和提示只给一次
         self._event.connect(self._on_event)
         self._build_content()
 
@@ -275,10 +275,7 @@ class LanPage(BasePage):
             "昵称是必填项：队友在「在线成员」里看到的就是它，没填不能进入房间。"
             "\n"
             "虚拟 IP 由 EasyTier 自动分配（不固定），所以每次启动可能不一样；"
-            "「在线成员」里每个人都带独立的「复制」按钮，直接复制即可，不用记。"
-            "\n"
-            "进入后会在 15 秒内自动校验房间是否真的通了，房间码或密码不对会"
-            "明确提示并自动断开，不会让你以为连上了。",
+            "「在线成员」里每个人都带独立的「复制」按钮，直接复制即可，不用记。",
             warn=False
         ))
 
@@ -572,115 +569,48 @@ class LanPage(BasePage):
             self._my_ip = payload.get("ipv4", "") or etier.virtual_adapter_ip()
             self._set_running(True)
             self._refresh_status_style()
+            self._started_wall = time.time()
+            self._alone_hinted = False
             self._update_ip()
 
-            # 每次进入房间都要做「房间是否真的通了」校验，
-            # **不再分身份**——以前只有"成员"才校验，是因为房主就是自己、
-            # 不需要证明房间存在。现在没有房主概念，每个人进来都要确认
-            # 房间里确实有别人。
+            # 不做"15 秒验证"了（v0.8.2beta）：验证的本意是拦下"密码填错
+            # 进了空房间"，但 peer 发现本身依赖 ARP/打洞，偶发地找不到人
+            # 就把人踢出房间，队友经常"加入不进来"。现在改为**不阻塞**：
+            # 直接进入房间，若 30 秒后成员列表仍然只有自己，给一条温和的
+            # 提示（见 _update_ip），由用户自己判断是不是码/密码填错了。
             #
-            # 为什么必须校验：EasyTier 是纯 P2P、无中心服务器，密码填错时
-            # 它不会报错，只会安静地建出一个"只有自己"的空房间。所以这里
-            # 主动在虚拟网里找对端（IP 是 DHCP 动态分配的，见 pick_host_ip）
-            # ——找不到就说明这个房间没通，直接回滚并明确报错，
-            # 而不是骗用户说"已就绪"。
-            self._append_log("正在校验房间是否真的通了（在虚拟网里寻找其他节点）…")
-            self._set_status_note(
-                "正在校验房间… 若房间码或密码不对，将自动断开并提示。"
+            # 成员的稳定在线视图交给 MemberTracker（后台 ping 保活 + 宽限
+            # 判定），它同时把名称解析也挪出了 UI 线程。
+            self._stop_tracker()
+            self._tracker = etier.MemberTracker(
+                self._my_ip,
+                on_log=lambda m: self._event.emit("_etier_log", m),
             )
-            self._verify_seq += 1
-            seq = self._verify_seq
-            threading.Thread(
-                target=self._do_verify_room, args=(seq,), daemon=True
-            ).start()
+            self._tracker.start()
+            self._append_log("已进入房间（虚拟 IP %s）" % self._my_ip)
+            self.toast("已进入房间")
         else:
             self._running = False
             self._my_ip = ""
+            self._stop_tracker()
             self._refresh_start_gate()
             self._set_status_note("")
             msg = payload.get("msg") or "未知原因"
             self._append_log("跨网房间启动失败：%s" % msg)
+            if any(w in msg for w in ("资源缺失", "缺少", "被占用", "大小异常")):
+                # 组件损坏/被杀毒软件删除：给出可操作的出路
+                msg = (msg + "。组件疑似缺失或损坏，可在「设置中心 → "
+                            "异地联机组件」里点「一键修复」重新安装")
             self.toast("启动失败：%s" % msg)
 
-    def _do_verify_room(self, seq):
-        """后台探测房间里是否有其他节点（准入校验）。
-
-        没有"房主"这个概念了，所以这里要找的是**任意一个对端**：
-        房间码和密码只要是对的，网段里就必然有别人；如果是错的，
-        EasyTier 会给你一个只有自己的空房间，网段里什么都没有。
-
-        IP 是 DHCP 动态分配、无法预测，判定逻辑见 `etier.pick_host_ip`：
-        先按已知昵称反查，再回落到"网段里谁能 ping 通"。
-
-        给 P2P 打洞留时间：EasyTier 建连通常几秒内完成，公网中继兜底
-        可能要更久，所以给 15 秒，期间反复尝试。
-        """
-        deadline = time.monotonic() + 15.0
-        found = False
-        peer_ip = ""
-        while time.monotonic() < deadline:
-            if seq != self._verify_seq:      # 期间用户已停止/重启，放弃本轮
-                return
-            peer_ip = etier.pick_host_ip(
-                self._my_ip, hostname=self._host_nick, wait=0.0,
-            )
-            if peer_ip:
-                found = True
-                break
-            time.sleep(1.5)
-        self._event.emit("_etier_verify",
-                         {"seq": seq, "found": found, "host_ip": peer_ip})
-
-    def _on_verify_result(self, payload):
-        """校验结果：通过就正常用，不通过就回滚并报错。"""
-        if payload.get("seq") != self._verify_seq:
-            return                            # 过期结果，忽略
-        if payload.get("found"):
-            peer_ip = payload.get("host_ip") or ""
-            self._append_log(
-                "房间校验通过：已连上房间里的其他节点（%s）。" % (peer_ip or "?")
-            )
-            self._set_status_note(
-                "虚拟网卡已就绪：本机虚拟 IP %s。游戏里的「局域网」列表"
-                "现在能看到队友开的房间了。" % (self._my_ip or "?")
-            )
-            self.toast("已进入房间")
-            return
-
-        # 网段里没有任何可达对端 → 房间码或密码不对
-        self._append_log(
-            "房间校验失败：15 秒内没有在虚拟网里发现任何其他节点。"
-            "常见原因：房间码拼错、密码不一致，或其他人还没进入这个房间。"
-        )
-        self.toast("房间码或密码不正确，已断开")
-        self._rollback_failed_join()
-
-    def _rollback_failed_join(self):
-        """校验失败后的回滚：停掉刚建的（其实是空的）房间，让界面回到可用态。"""
-        tier, self._etier = self._etier, None
-        self._running = False
-        self._my_ip = ""
-        self._host_nick = ""
-        self._clear_members()
-        self.ip_label.setText("--")
-        self.btn_copy_ip.setEnabled(False)
-        self._set_running(False)
-        self._refresh_status_style()
-        self._set_status_note(
-            "进入房间失败：房间码或密码不正确，或其他人还没进入这个房间。"
-            "请与其他队友核对后重试。"
-        )
-        if tier is not None:
-            threading.Thread(target=lambda: self._safe_stop(tier),
-                             daemon=True).start()
-
-    @staticmethod
-    def _safe_stop(tier):
-        try:
-            tier.stop()
-        except Exception:
-            pass
-
+    def _stop_tracker(self):
+        """停掉成员跟踪线程（重复调用安全）。"""
+        if self._tracker is not None:
+            try:
+                self._tracker.stop()
+            except Exception:
+                pass
+            self._tracker = None
 
     def _on_stop(self):
         if self._etier_busy:
@@ -714,6 +644,7 @@ class LanPage(BasePage):
         self._running = False
         self._my_ip = ""
         self._host_nick = ""
+        self._stop_tracker()
         self._set_running(False)
         self._set_status_note("")
         self._clear_members()
@@ -776,21 +707,18 @@ class LanPage(BasePage):
         self._append_log("已复制本机虚拟 IP %s" % ip)
 
     def _update_ip(self):
-        """轮询虚拟网卡状态，刷新跨网房间状态行、本机 IP 与成员列表。"""
+        """轮询虚拟网卡状态，刷新跨网房间状态行、本机 IP 与成员列表。
+
+        成员列表来自 MemberTracker 的稳定快照（后台线程负责 ARP 扫描、
+        ping 保活与名称解析），UI 线程在这里**不起任何子进程**——
+        800ms 一次的 tick 再也不会被 arp/gethostbyaddr 拖出卡顿。
+        """
         ip = etier.virtual_adapter_ip()
         if ip:
             self._my_ip = ip
             self.ip_label.setText(ip)
             self.btn_copy_ip.setEnabled(True)
-            # 成员列表：名称反查有超时，每 4 次 tick 做一次带名称的完整刷新，
-            # 其余 tick 只刷 IP（避免 800ms 一次都去反查把界面拖慢）。
-            self._member_tick += 1
-            want_names = (self._member_tick % 4 == 1)
-            members = etier.list_members_detailed(ip, resolve=want_names)
-            if want_names:
-                got = {m["ip"]: m["name"] for m in members if m.get("name")}
-                if got:
-                    self._member_names.update(got)
+            members = self._tracker.snapshot() if self._tracker else []
 
             # 自己永远排第一行——用户最常要复制的是自己的地址
             entries = [{"ip": ip, "name": self._host_nick or self._current_nickname(),
@@ -798,31 +726,46 @@ class LanPage(BasePage):
             for m in members:
                 entries.append({
                     "ip": m["ip"],
-                    "name": m.get("name") or self._member_names.get(m["ip"], ""),
+                    "name": m.get("name") or "",
                     "self": False,
                 })
             all_ips = [e["ip"] for e in entries]
             # 只在"行内容真的变了"时重建控件，否则每 800ms 重建一次会闪
-            if all_ips != [r["ip"] for r in self._members_row] or want_names:
+            if all_ips != [r["ip"] for r in self._members_row]:
                 self._render_members(entries)
                 self._members_row = entries
 
             others = len(entries) - 1
             self.members_count.setText("%d 人" % len(entries))
+            # 状态栏文案：有队友就显示常规文案；一直只有自己且超过 30 秒，
+            # 才给一次温和提示（取代被移除的"15 秒验证"，见 _on_done 注释）
+            normal_note = (
+                "虚拟网卡已就绪：本机虚拟 IP %s。把房间码和密码发给队友，"
+                "让他们也启动跨网房间即可。" % ip
+            )
             if others:
                 self.members_hint.setText(
                     "点每行右侧「复制」即可单独复制那个人的 IP。"
                 )
+                self._set_status_note(normal_note)
             else:
                 self.members_hint.setText(
                     "目前只有你自己。把房间码和密码发给队友，"
                     "他们加入后就会出现在这里。"
                 )
+                if (self._running and not self._alone_hinted
+                        and time.time() - self._started_wall > 30.0):
+                    self._alone_hinted = True
+                    self._set_status_note(
+                        "已进入房间 30 秒，成员列表里仍然只有你自己。"
+                        "如果队友确实已经进入，请核对面前的房间码和密码"
+                        "是否与大家完全一致。"
+                    )
+                    self._append_log("提示：房间内暂时没有其他成员（可能是"
+                                     "队友未进入，也可能是房间码/密码不一致）")
+                elif not self._alone_hinted:
+                    self._set_status_note(normal_note)
             self.members_hint.setVisible(True)
-            self._set_status_note(
-                "虚拟网卡已就绪：本机虚拟 IP %s。把房间码和密码发给队友，"
-                "让他们也启动跨网房间即可。" % ip
-            )
             return
         # 只有拿不到 IP 时才做 tasklist 探测（每 800ms 起一个进程太重）
         if etier.core_running():
@@ -838,8 +781,6 @@ class LanPage(BasePage):
                 self._append_log("[EasyTier] %s" % payload)
             elif kind == "_etier_done":
                 self._on_done(payload or {})
-            elif kind == "_etier_verify":
-                self._on_verify_result(payload or {})
             elif kind == "_etier_stopped":
                 self._on_stopped()
         except Exception as exc:                     # 界面出错不该拖垮转发
