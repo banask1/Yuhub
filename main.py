@@ -123,9 +123,10 @@ def _run_watchdog(argv):
     # Pre-flight：本进程已 runas 提权，正是写防火墙例外 + 注册表的时机。
     # （调用 etier.py 的 _preflight_silence_windows——那两个 Windows 自带的
     # 白弹窗没法 hide，只能让用户根本不用回答。）
+    et = None
     try:
-        import etier
-        etier._preflight_silence_windows(core)
+        import etier as et
+        et._preflight_silence_windows(core)
     except Exception:
         pass
 
@@ -143,6 +144,20 @@ def _run_watchdog(argv):
         )
     except Exception:
         return 4
+
+    # 虚拟网卡"信任化"（v0.8.4beta）：等网卡出现后设为专用网络 + 放行
+    # 游戏入站——wintun 被归为公用网络，MC 等游戏的 IP 直连会被防火墙
+    # 丢弃（Radmin 能玩就是因为它归为专用）。必须在这里做：本进程已
+    # 提权，主进程没有权限。网卡每次进房都重建，所以每次都要重跑。
+    if et is not None:
+        try:
+            import threading
+            threading.Thread(
+                target=et.enforce_virtual_net_trust,
+                name="TrustNic", daemon=True,
+            ).start()
+        except Exception:
+            pass
 
     # watchdog 主循环：轮询三个退出条件
     # parent_name 由主进程传入（通常就是 Yuhub.exe），用于防 PID 复用误判。
