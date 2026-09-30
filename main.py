@@ -18,14 +18,15 @@ import subprocess
 import sys
 import time
 
-from PySide6.QtCore import Qt, QLibraryInfo, QTranslator
+from PySide6.QtCore import Qt, QLibraryInfo, QSettings, QTranslator
 from PySide6.QtGui import QIcon, QFont
 from PySide6.QtWidgets import QApplication
 
 from autostart import MINIMIZED_FLAG
 from single_instance import SingleInstance
 from ui import VERSION
-from ui.main_window import MainWindow, resource_path
+from ui.main_window import MainWindow, resource_path, init_theme_from_settings
+from ui.splash import SplashScreen
 
 # 装完的翻译对象必须留一个引用，否则会被 GC 掉、翻译当场失效
 _TRANSLATORS = []
@@ -407,6 +408,17 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     try:
+        # ---- 启动画面：先于主窗口构建弹出（双击 exe 后很快就能看到）----
+        # 主题解析依赖 QSettings，这里先做一次（MainWindow 里再做是幂等的），
+        # 否则浅色用户会先看到一屏默认深色。
+        splash = None
+        if MINIMIZED_FLAG not in sys.argv:
+            init_theme_from_settings(QSettings("Yuhub", "Yuhub"))
+            splash = SplashScreen()
+            splash.show()
+            # 让启动画面先画出来，再继续构建主窗口（构建页面要几百毫秒）
+            app.processEvents()
+
         window = MainWindow(start_minimized=(MINIMIZED_FLAG in sys.argv))
         # 第二个实例来敲门 → 把窗口显示到前台
         guard.activate_requested.connect(window.activate_window)
@@ -416,9 +428,21 @@ def main():
         if window.started_hidden:
             # 开机自启：已经安静地待在托盘里了。
             # 这里不调 show()，于是 showEvent 也不会触发，硬件采集自然跳过——
-            # 等用户真去看首页时再扫，不浪费开机那几秒。
+            # 等用户真去看首页时再扫，不浪费开机那几秒。也不放启动动画。
             pass
+        elif splash is not None:
+            # 窗口保持隐藏，后台采集首页硬件数据（CPU / 显卡 / 硬盘）；
+            # 就绪后显示窗口，启动画面模糊 → 淡出退场。
+            splash.set_status("正在加载硬件信息…")
+
+            def _enter_app():
+                window.show()
+                window.activateWindow()
+                splash.finish()
+
+            window.launch_with_data_wait(_enter_app)
         else:
+            # 开机自启但托盘不可用的回退路径：直接显示窗口，无启动动画
             window.show()
 
         return app.exec()

@@ -93,10 +93,16 @@ class BasePage(QWidget):
         self._apply_icon_tint()
 
     def _apply_icon_tint(self):
-        color = theme.current().get(self._icon_key, theme.current()["accent"])
-        self._icon_tile.setStyleSheet(
-            f"QFrame {{ background: {color}; border: none; border-radius: 5px; }}"
-        )
+        cur = theme.current()
+        color = cur.get(self._icon_key, cur["accent"])
+        if theme.glass_on():
+            # 液态玻璃主题：页头图标换成拟物玻璃贴片
+            self._icon_tile.setStyleSheet(
+                "QFrame { %s }" % theme.glass_tile(color, radius=10))
+        else:
+            self._icon_tile.setStyleSheet(
+                f"QFrame {{ background: {color}; border: none; border-radius: 5px; }}"
+            )
 
     def add(self, widget):
         """向内容区添加一个控件。"""

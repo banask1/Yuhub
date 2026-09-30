@@ -8,8 +8,8 @@ from PySide6.QtWidgets import (
 
 import autostart
 import etier
-
-from .. import theme, VERSION_LABEL
+import updater
+from .. import theme, VERSION, VERSION_LABEL
 from ..widgets import (
     ToggleSwitch, setting_row, info_card, SegmentedControl, ghost_button)
 from .base_page import BasePage
@@ -71,8 +71,12 @@ class SettingsPage(BasePage):
     # ------------------------------------------------------------------ 构建
     def _build_content(self, theme_setting, close_to_tray):
         self._etier_event.connect(self._on_etier_event)
+        # 软件修复的进度/结果也走 _etier_event 通道（后台线程 → 主线程），
+        # 用不同 kind 区分："repair_prog"（进度）/ "repair_ready"（下载完成）/
+        # "repair_done"（结束）。
         self._build_appearance(theme_setting)
         self._build_startup_card(close_to_tray)
+        self._build_repair_card()
         self._build_etier_card()
         self._build_about()
         self.add_stretch()
@@ -245,6 +249,93 @@ class SettingsPage(BasePage):
             )
         )
 
+    # ------------------------------------------------------ 修复软件
+    def _build_repair_card(self):
+        """一键修复软件：从 GitHub Releases 重新下载**当前版本**并替换自身。
+
+        适用场景：exe 被杀毒软件误删/损坏、更新中断后文件异常、
+        手动改动导致程序行为不对——重下同版本覆盖即可，不必等新版本。
+        下载走与自动更新完全相同的线路矩阵（官方直连 → 国内镜像），
+        sha256 校验通过后才替换；替换失败自动回滚，不会把程序弄坏。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+
+        title = QLabel("修复软件")
+        title.setObjectName("CardTitle")
+        v.addWidget(title)
+
+        self.repair_status = QLabel(
+            "当前版本 %s。程序被误删/损坏或行为异常时，"
+            "可从 GitHub 重新下载本版本并自动替换。" % VERSION_LABEL)
+        self.repair_status.setWordWrap(True)
+        self.repair_status.setStyleSheet("font-size: 12px;")
+        v.addWidget(self.repair_status)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self.btn_repair_app = ghost_button("一键修复软件")
+        self.btn_repair_app.clicked.connect(self._on_repair_app_clicked)
+        row.addWidget(self.btn_repair_app)
+        v.addLayout(row)
+
+        self.add(card)
+
+    def _on_repair_app_clicked(self):
+        win = self.window()
+        if not hasattr(win, "apply_repair_package"):
+            self.notify("当前环境不支持在线修复（源码运行时请直接重跑源码）")
+            return
+        self.btn_repair_app.setEnabled(False)
+        self.repair_status.setText("正在查询 Release 信息…")
+        threading.Thread(
+            target=self._do_repair_app, name="AppRepair", daemon=True).start()
+
+    def _do_repair_app(self):
+        """后台线程：定位当前版本的 Release → 下载 → 回主线程执行替换。"""
+        def progress(text):
+            self._etier_event.emit("repair_prog", str(text or ""))
+
+        # ① 定位与当前版本一致的 Release（先 v 前缀 tag，再裸版本 tag）
+        info, err = updater.fetch_release_by_tag("v" + VERSION)
+        if info is None and not err:
+            info, err = updater.fetch_release_by_tag(VERSION)
+        if info is None and not err:
+            # 当前版本不在 Release 列表（本地是未发布版本/tag 改过名）→
+            # 修复到最新版仍然优于报错退出，明确告知用户即可
+            info, err = updater.fetch_release()
+            if info is not None:
+                self._etier_event.emit(
+                    "repair_prog",
+                    "未找到 %s 的发布记录，将修复到最新版 %s"
+                    % (VERSION_LABEL, info.tag))
+        if info is None:
+            self._etier_event.emit(
+                "repair_done",
+                {"ok": False, "msg": err or "GitHub 上找不到当前版本的发布记录"})
+            return
+        if not info.asset_url:
+            self._etier_event.emit(
+                "repair_done", {"ok": False, "msg": "该版本没有可下载的文件"})
+            return
+
+        # ② 下载（线路矩阵 + sha256 校验，与自动更新同一条链路）
+        self._etier_event.emit(
+            "repair_prog", "正在下载 %s（约 %.0f MB）…"
+            % (info.tag, info.asset_size / 1048576.0))
+        ok, msg, path = updater.download_update(info, on_progress=progress)
+        if not ok:
+            self._etier_event.emit("repair_done", {"ok": False, "msg": msg})
+            return
+
+        # ③ 回主线程执行替换（替换器会拉起新 exe，本进程退出）
+        self._etier_event.emit(
+            "repair_ready", {"info": info.to_dict(), "path": path})
+
     # ------------------------------------------------------ 异地联机组件
     def _build_etier_card(self):
         """EasyTier 组件体检 + 一键修复。
@@ -316,6 +407,23 @@ class SettingsPage(BasePage):
             else:
                 self.etier_status.setText("修复失败：%s" % msg)
                 self.toast("修复失败：%s" % msg)
+        elif kind == "repair_prog":
+            # 软件修复进度（区分于上面的组件修复进度）
+            self.repair_status.setText(str(payload or ""))
+        elif kind == "repair_ready":
+            # 下载完成 → 主线程里启动替换器（它会等本进程退出后替换）
+            info = updater.ReleaseInfo.from_dict(payload.get("info") or {})
+            path = str(payload.get("path") or "")
+            if info.tag and path:
+                self.repair_status.setText("下载完成，正在替换程序…")
+                win = self.window()
+                if hasattr(win, "apply_repair_package"):
+                    win.apply_repair_package(info, path)
+            else:
+                self.btn_repair_app.setEnabled(True)
+                self.repair_status.setText("修复失败：下载结果无效")
+        else:
+            return
 
     def _on_repair_clicked(self):
         self.btn_repair.setEnabled(False)

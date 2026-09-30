@@ -389,13 +389,25 @@ def build_rules() -> list[CleanRule]:
         ))
 
     add("gpu_amd_shader", "AMD 着色器缓存",
-        "AMD 显卡的 DX/GL 着色器缓存（会自动重建）。",
+        "AMD 显卡的 DX/GL/Vulkan 着色器缓存（会自动重建）。",
         GROUP_GPU, 3, lambda: (
             _safe_dir(LA, "AMD", "DxCache")
-            + _safe_dir(LA, "AMD", "GLCache")
             + _safe_dir(LA, "AMD", "DxcCache")
+            + _safe_dir(LA, "AMD", "GLCache")
             + _safe_dir(LA, "AMD", "VkCache")
+            # Radeon Software / Adrenalin 的额外缓存与日志
+            + _safe_dir(LA, "AMD", "CN")
+            + _safe_dir(LA, "AMD", "DxCache", "shader_cache")
         ))
+
+    add("gpu_amd_installer", "AMD 驱动安装源缓存",
+        "AMD Radeon Software 下载/解压的驱动安装包与安装源（装完即可删）。",
+        GROUP_DRIVER, 1, lambda: (
+            _safe_dir(PROG, "AMD", "CIM", "Log")
+            + _safe_dir(PROG, "AMD", "CN")
+            + _safe_dir(LA, "AMD", "CN", "Store")
+            + _expand_glob(os.path.join(sysdrive + "\\", "AMD", "Packages"))
+        ), admin=True)
 
     add("gpu_intel_shader", "Intel 着色器缓存",
         "Intel 核显的着色器缓存（会自动重建）。",

@@ -19,6 +19,7 @@ import time
 
 from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -36,6 +37,19 @@ from .base_page import BasePage
 
 # 生成房间码用的字母表：去掉 0/O、1/I/L 这类肉眼易混的字符
 _CODE_CHARS = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+# 游戏快连（参考 MCTier 的同名功能）：常见联机游戏的**专用服务器/直连
+# 端口**预设，运行中一键拼出「虚拟 IP:端口」复制给队友。
+# 注意 Minecraft「对局域网开放」的端口是随机的（看游戏聊天栏提示），
+# 25565 是它开专用服务器(dedicated server)的默认端口，所以保留在列表里。
+GAME_PORTS = (
+    ("Minecraft 服务器", 25565),
+    ("泰拉瑞亚", 7777),
+    ("幻兽帕鲁", 8211),
+    ("饥荒联机版", 10999),
+    ("CS 2 / 起源引擎", 27015),
+    ("七日杀", 26900),
+)
 
 
 def random_room_code():
@@ -246,6 +260,27 @@ class LanPage(BasePage):
         r2.addStretch(1)
         v.addLayout(r2)
 
+        # 中继节点（参考 MCTier 的节点选择）：自动 = 全部内置节点由
+        # EasyTier 择优；手动 = 只连所选节点（确定性，好排查）。
+        r3 = QHBoxLayout()
+        r3.setSpacing(8)
+        r3.addWidget(self._label("中继节点"))
+        self.node_combo = QComboBox()
+        for key, label, _addr in etier.NODE_CHOICES:
+            self.node_combo.addItem(label, key)
+        saved_node = str(self._settings.value("lan_node", "auto") or "auto")
+        idx = self.node_combo.findData(saved_node)
+        self.node_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.node_combo.setMaximumWidth(240)
+        self.node_combo.currentIndexChanged.connect(self._on_node_changed)
+        self.node_combo.setToolTip(
+            "某个节点连不上 / 延迟高时，可手动指定一个。\n"
+            "手动指定后**只连这个节点**（更易排查问题）；\n"
+            "自动则会尝试全部内置节点。")
+        r3.addWidget(self.node_combo)
+        r3.addStretch(1)
+        v.addLayout(r3)
+
         self.status_note = self._note("")
         v.addWidget(self.status_note)
 
@@ -265,6 +300,23 @@ class LanPage(BasePage):
         rip.addWidget(self.btn_copy_ip)
         rip.addStretch(1)
         v.addLayout(rip)
+
+        # 游戏快连（参考 MCTier）：常见联机游戏端口预设，
+        # 运行中一键拼出「虚拟 IP:端口」复制，省得现查端口表。
+        qk = QHBoxLayout()
+        qk.setSpacing(8)
+        qk.addWidget(self._label("游戏快连"))
+        self.game_combo = QComboBox()
+        self.game_combo.setMaximumWidth(220)
+        for name, port in GAME_PORTS:
+            self.game_combo.addItem("%s（%d）" % (name, port), port)
+        qk.addWidget(self.game_combo)
+        self.btn_copy_addr = ghost_button("复制 IP:端口")
+        self.btn_copy_addr.setEnabled(False)
+        self.btn_copy_addr.clicked.connect(self._on_copy_game_addr)
+        qk.addWidget(self.btn_copy_addr)
+        qk.addStretch(1)
+        v.addLayout(qk)
 
         v.addWidget(self._note(
             "约定一组房间码 + 密码（谁定都行，点「随机」可自动生成一个），"
@@ -449,6 +501,16 @@ class LanPage(BasePage):
             "要某台机器的地址时，在「在线成员」里点那一行的「复制」即可，\n"
             "每个人的 IP 都能单独复制。\n"
             "\n"
+            "中继节点：默认「自动」会尝试全部内置节点（含 MCTier 社区维护\n"
+            "的海波美国/海波中国大陆、唯爱厦门等），失败自动换下一个。\n"
+            "某条线路延迟高或连不上时，可以手动指定一个——手动模式下\n"
+            "**只连所选节点**，出问题时更容易定位原因。\n"
+            "\n"
+            "游戏快连：内置常见联机游戏的默认端口（Minecraft 服务器 25565、\n"
+            "泰拉瑞亚 7777、幻兽帕鲁 8211 等），房间运行中点「复制 IP:端口」\n"
+            "就能把直连地址发给队友。Minecraft「对局域网开放」的端口是随机的，\n"
+            "以游戏聊天栏显示的为准。\n"
+            "\n"
             "原理：内嵌 EasyTier（Apache 2.0 开源）创建一块二层虚拟网卡，\n"
             "把填了相同房间码+密码的电脑拉进同一个虚拟局域网。P2P 打洞优先，\n"
             "打洞不通时走社区共享节点中继兜底，无需自建服务器。\n"
@@ -471,6 +533,24 @@ class LanPage(BasePage):
     def _on_reset_nick(self):
         """把昵称恢复为计算机名。"""
         self.nick_edit.setText(default_nickname())
+
+    def _on_node_changed(self, _index):
+        """记住所选中继节点（下次打开还是它，MCTier 同款行为）。"""
+        try:
+            self._settings.setValue("lan_node", self.node_combo.currentData())
+        except Exception:
+            pass
+
+    def _on_copy_game_addr(self):
+        """游戏快连：复制「虚拟 IP:端口」直连地址。"""
+        ip = self._my_ip or etier.virtual_adapter_ip()
+        if not ip:
+            self.toast("当前没有虚拟 IP 可复制")
+            return
+        port = self.game_combo.currentData()
+        addr = "%s:%s" % (ip, port)
+        self._copy_text(addr, "直连地址")
+        self._append_log("已复制游戏直连地址 %s" % addr)
 
     def _current_nickname(self):
         """取当前昵称（已清洗）。**空就是空**，不再回落默认值。
@@ -542,10 +622,12 @@ class LanPage(BasePage):
         self._save_nickname(nick)
         self._host_nick = nick                # 校验回调（后台线程）要用
         # EasyTier.start 会阻塞最长 45 秒（轮询虚拟网卡就绪），必须丢后台
-        threading.Thread(target=self._do_start, args=(code, password, nick),
+        node_addr = etier.node_address(self.node_combo.currentData() or "auto")
+        threading.Thread(target=self._do_start,
+                         args=(code, password, nick, node_addr),
                          daemon=True).start()
 
-    def _do_start(self, code, password, nick):
+    def _do_start(self, code, password, nick, node_addr=""):
         tier = etier.EasyTier(on_log=lambda m: self._event.emit("_etier_log", m))
         # 虚拟 IP 交给 EasyTier 的 DHCP 动态分配（不传 ipv4，走 -d true）：
         # 固定 IP 在"多个房间并存 / 一个房间多人"时会互相抢地址，而 DHCP
@@ -554,7 +636,7 @@ class LanPage(BasePage):
         try:
             ok, msg = tier.start(
                 "yuhub-" + code.lower().replace(" ", ""), password,
-                timeout=20.0, hostname=nick,
+                timeout=20.0, hostname=nick, node=node_addr,
             )
         except Exception as exc:
             ok, msg = False, str(exc)
@@ -679,10 +761,12 @@ class LanPage(BasePage):
             self.btn_start.setText(self._start_button_text())
         else:
             self._refresh_start_gate()
-        for w in (self.code_edit, self.pass_edit, self.btn_random):
+        for w in (self.code_edit, self.pass_edit, self.btn_random,
+                  self.node_combo, self.game_combo):
             w.setEnabled(not flag)
         # IP 显示与复制按钮
         self.btn_copy_ip.setEnabled(flag and bool(self._my_ip))
+        self.btn_copy_addr.setEnabled(flag and bool(self._my_ip))
         if not flag:
             self.ip_label.setText("--")
             self._clear_members()
@@ -731,6 +815,7 @@ class LanPage(BasePage):
             self._my_ip = ip
             self.ip_label.setText(ip)
             self.btn_copy_ip.setEnabled(True)
+            self.btn_copy_addr.setEnabled(True)
             members = self._tracker.snapshot() if self._tracker else []
 
             # 自己永远排第一行——用户最常要复制的是自己的地址

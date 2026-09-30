@@ -204,11 +204,16 @@ class AppAvatar(QFrame):
                 "QFrame { background: transparent; border: none; }"
             )
         else:
-            color = theme.current().get(self._tint, theme.current()["accent"])
-            self.setStyleSheet(
-                f"QFrame {{ background: {color}; border: none;"
-                f" border-radius: 5px; }}"
-            )
+            cur = theme.current()
+            color = cur.get(self._tint, cur["accent"])
+            if theme.glass_on():
+                self.setStyleSheet(
+                    "QFrame { %s }" % theme.glass_tile(color, radius=8))
+            else:
+                self.setStyleSheet(
+                    f"QFrame {{ background: {color}; border: none;"
+                    f" border-radius: 5px; }}"
+                )
 
 
 # ---------------------------------------------------------------------------

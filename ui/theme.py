@@ -143,6 +143,48 @@ def current_pack_name():
     return get_pack().name
 
 
+# ---------------------------------------------------------------------------
+# 拟物玻璃贴片（liquid glass 主题专用，其他主题包自动退回极简色块）
+# ---------------------------------------------------------------------------
+def rgba_str(hex_color, alpha):
+    """'#7aa2ff' -> 'rgba(122,162,255,140)'（alpha 取 0-255 整数）。
+
+    Qt 的 QSS 解析器对 rgba() 第 4 个参数 >1 的值会按 /255 归一化，
+    所以直接给整数 alpha 即可（不能用 CSS 的小数写法）。
+    """
+    c = (hex_color or "#7aa2ff").lstrip("#")
+    if len(c) == 3:
+        c = "".join(ch * 2 for ch in c)
+    try:
+        r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    except (ValueError, IndexError):
+        r = g = b = 122
+    return "rgba(%d,%d,%d,%d)" % (r, g, b, max(0, min(255, int(alpha))))
+
+
+def glass_on():
+    """当前主题包是否启用拟物玻璃贴片（theme.json 里的 icon_tile_style）。"""
+    return current().get("icon_tile_style") == "glass"
+
+
+def glass_tile(color, radius=10, highlight=None):
+    """功能图标贴片的「液态玻璃」样式表。
+
+    手法参考纯 CSS 液态玻璃（gitee greyd097/yzrt「纯CSS液态玻璃」）：
+    - 彩色半透明底，沿对角线 45° 渐变（浅→深），模拟玻璃的厚度感
+    - 1px 白色高光描边，模拟玻璃边缘的环境光折射
+    （Qt QSS 没有 box-shadow/backdrop-filter，这两样就是 Qt 下的等效替代）
+    """
+    if highlight is None:
+        highlight = current().get("glass_highlight", "rgba(255,255,255,105)")
+    return (
+        "background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+        f" stop:0 {rgba_str(color, 150)}, stop:1 {rgba_str(color, 235)});"
+        f" border: 1px solid {highlight};"
+        f" border-radius: {radius}px;"
+    )
+
+
 def resolve_theme(setting):
     """把 'system' 解析成实际的 'dark'/'light'（默认 dark）。"""
     if setting == "system":
