@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 
-from PySide6.QtCore import Qt, QEvent, QSettings, QTimer
+from PySide6.QtCore import Qt, QEvent, QObject, QSettings, QTimer, Signal
 from PySide6.QtGui import QCursor, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QWidget,
@@ -322,65 +322,88 @@ class MainWindow(QWidget):
             self._start_update_download(info)
 
     def _start_update_download(self, info):
-        """下载更新包（后台线程），完成后询问是否重启并更新。"""
+        """下载更新包（后台线程），完成后询问是否重启并更新。
+
+        ⚠️ v0.8.9beta 修复的根因：旧版在工作线程里用
+        `QTimer.singleShot(0, ...)` 把进度/结果抛回主线程——但 0ms
+        单发定时器依附于**调用线程**的事件循环，下载线程没有 Qt 事件
+        循环，回调永远不触发。表现为：进度条永远 0%（像"无法下载"）、
+        下载结束不提示、点取消后界面永远停在「正在取消…」（像"取消
+        没用"）。
+        正确姿势：工作线程只 emit QObject 信号，Qt 自动把跨线程信号
+        排队（QueuedConnection）到接收者所在的主线程执行。
+        """
         import updater
 
         prog = UpdateProgressDialog(info, parent=self)
         self._dl_cancel = False
+        self._upd_result = None
 
-        def on_progress(snap):
-            # 从下载线程回调 → 用队列式信号回到主线程更新 UI
-            try:
-                s = dict(snap)
-                if s.get("phase") == "probing":
-                    # 探测/换线阶段：进度条转忙碌动画
-                    text = s.pop("status_text", "")
-                    QTimer.singleShot(0, lambda t=text: prog.set_probing(t))
-                    return
-                text = s.pop("status_text", None)
-                if text:
-                    QTimer.singleShot(0, lambda t=text: prog.set_status(t))
-                if s:
-                    QTimer.singleShot(0, lambda s=s: prog.set_progress(s))
-            except RuntimeError:
-                pass
+        # ---- 信号桥：下载线程 → 主线程的唯一通道 ----
+        class _Bridge(QObject):
+            probing = Signal(str)
+            status = Signal(str)
+            progress = Signal(object)
+            finished = Signal(bool, str, str)      # ok, msg, path
+
+        bridge = _Bridge()
+        bridge.probing.connect(prog.set_probing)
+        bridge.status.connect(prog.set_status)
+        bridge.progress.connect(prog.set_progress)
 
         def cancel():
             return bool(self._dl_cancel)
 
-        holder = {}
+        def emit_progress(snap):
+            """下载线程的进度回调 → 只 emit 信号，绝不直接碰 UI。"""
+            try:
+                s = dict(snap)
+                if s.get("phase") == "probing":
+                    s.pop("phase", None)
+                    bridge.probing.emit(s.pop("status_text", "")
+                                        or "正在连接更新源…")
+                    return
+                text = s.pop("status_text", None)
+                if text:
+                    bridge.status.emit(text)
+                if s:
+                    bridge.progress.emit(s)
+            except RuntimeError:
+                pass
 
         def work():
             try:
                 ok, msg, path = updater.download_update(
-                    info, on_progress=on_progress, cancel=cancel)
+                    info, on_progress=emit_progress, cancel=cancel)
             except Exception as e:
                 ok, msg, path = False, "下载异常：%s" % (e,), ""
-            holder["r"] = (ok, msg, path)
-            try:
-                QTimer.singleShot(0, done)
-            except RuntimeError:
-                pass
+            bridge.finished.emit(bool(ok), str(msg), str(path or ""))
 
-        def done():
-            ok, msg, path = holder.get("r", (False, "未知错误", ""))
+        def on_finished(ok, msg, path):
+            # 主线程：落定对话框终态。用户点「关闭」accept 后，
+            # 外层 exec() 返回，再由 _start_update_download 收尾。
+            self._upd_result = (ok, msg, path)
             if ok:
                 prog.finish_ok("更新包已就绪")
-                prog.exec()
-                self._apply_update(info, path)
             elif msg == "已取消":
                 prog.finish_fail("已取消下载")
-                prog.exec()
             else:
                 prog.finish_fail("下载失败：%s" % msg)
-                prog.exec()
 
         def on_cancel():
             self._dl_cancel = True
 
+        bridge.finished.connect(on_finished)
         prog.cancelled.connect(on_cancel)
-        threading.Thread(target=work, name="YuhubUpdateDownload", daemon=True).start()
+        threading.Thread(target=work, name="YuhubUpdateDownload",
+                         daemon=True).start()
         prog.exec()
+
+        # 对话框关闭后收尾（单层事件循环，不再嵌套 exec）
+        r = self._upd_result
+        self._upd_result = None
+        if r and r[0] and r[2]:
+            self._apply_update(info, r[2])
 
     def _apply_update(self, info, package):
         """把更新交给替换器：拷一份自己做替换器 → 拉起 → 自己退出。"""
