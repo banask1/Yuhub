@@ -325,6 +325,38 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- apply-update 模式：替换自己的 exe 并重启（同样早返回） ----
+    # 主进程把"当前的自己"拷一份到 %TEMP%\Yuhub_upd_<pid>\Yuhub_updater.exe，
+    # 用 `--apply-update <base64-json>` 拉起它，然后自己退出。
+    # 替换器等旧 PID 死 → 两步改名（旧→.bak，新→原路径）→ 启动新版。
+    # 必须在这里早返回：替换器不该去抢单例锁，也不该建 Qt 界面。
+    if "--apply-update" in sys.argv:
+        idx = sys.argv.index("--apply-update")
+        rest = sys.argv[idx + 1:]
+        if len(rest) != 1:
+            sys.exit(2)
+        try:
+            import updater
+            sys.exit(updater.apply_update_main(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- update-selftest 模式：无窗口自检自动更新全流程 ----
+    # 用法： Yuhub.exe --update-selftest <结果json路径>
+    # 更新流程涉及"改自己的文件 + 重启自己"，在真 exe 上第一次试风险太高，
+    # 所以在 exe 内部用本地 http.server 伪装更新源、用副本 exe 当替换目标，
+    # 把下载 / 校验 / 替换 / 回滚全跑一遍，结果写 JSON 回传。
+    if "--update-selftest" in sys.argv:
+        idx = sys.argv.index("--update-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import update_selftest
+            sys.exit(update_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # 高 DPI 适配（Qt6 默认开启，这里显式声明以保证高分屏清晰）
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

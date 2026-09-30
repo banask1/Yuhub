@@ -1,12 +1,14 @@
 """设置中心页：主题切换、启动与托盘开关、关于。"""
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel, QComboBox
+from PySide6.QtCore import Qt, QSettings
+from PySide6.QtWidgets import (
+    QFrame, QVBoxLayout, QHBoxLayout, QLabel, QComboBox)
 
 import autostart
 
 from .. import theme, VERSION_LABEL
-from ..widgets import (ToggleSwitch, setting_row, info_card, SegmentedControl)
+from ..widgets import (
+    ToggleSwitch, setting_row, info_card, SegmentedControl, ghost_button)
 from .base_page import BasePage
 
 
@@ -54,6 +56,10 @@ class SettingsPage(BasePage):
         self._tray_available = tray_available
         # 挡住"写入失败→把开关拨回去"时二次触发的信号，避免递归
         self._autostart_guard = False
+        # 自动检查更新的偏好（读不到时默认开启）
+        self._settings = QSettings("Yuhub", "Yuhub")
+        raw = self._settings.value("auto_check_update", None)
+        self._auto_check = True if raw is None else str(raw).lower() in ("true", "1")
         self._build_content(theme_setting, close_to_tray)
 
     # ------------------------------------------------------------------ 构建
@@ -196,12 +202,21 @@ class SettingsPage(BasePage):
 
         v.addSpacing(4)
 
-        # ---- 未实现项（保留占位，明确标注，避免用户以为已经生效） ----
-        self.sw_update = ToggleSwitch(False)
-        self.sw_update.setEnabled(False)
-        self.sw_update.setToolTip("尚未实现")
+        # ---- 自动检查更新（真开关）----
+        self.sw_update = ToggleSwitch(self._auto_check)
+        self.sw_update.toggled.connect(self._on_auto_update_toggled)
         v.addLayout(setting_row("自动检查更新", self.sw_update))
-        v.addWidget(small_note("自动检查更新暂未实现，开关为占位。"))
+        v.addWidget(small_note(
+            "启动后在后台静默检查新版本，发现更新时提示；"
+            "检查失败不会打扰你，也不会自动安装。"))
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self.btn_check_update = ghost_button("立即检查更新")
+        self.btn_check_update.clicked.connect(self._on_check_update_clicked)
+        row.addWidget(self.btn_check_update)
+        v.addLayout(row)
 
         self.add(card)
 
@@ -221,6 +236,29 @@ class SettingsPage(BasePage):
                 "单实例限制、开机自启。",
             )
         )
+
+    # ------------------------------------------------------------------ 更新
+    def _on_auto_update_toggled(self, checked):
+        """把「自动检查更新」写进 QSettings。
+
+        注意 Windows 上用原生格式写进去是字符串，读回来要按字符串判断，
+        不能 `value(..., type=bool)`——`bool("false")` 是 True。
+        """
+        self._settings.setValue("auto_check_update", "true" if checked else "false")
+        self._settings.sync()
+        self._auto_check = bool(checked)
+
+    def _on_check_update_clicked(self):
+        """「立即检查更新」：交给主窗口（那里有 UpdateChecker 的信号接线）。"""
+        win = self.window()
+        if hasattr(win, "check_update_now"):
+            self.btn_check_update.setEnabled(False)
+            win.check_update_now(interactive=True)
+            # 检查很快，给个短冷却避免连点
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(4000, lambda: self.btn_check_update.setEnabled(True))
+        else:
+            self.notify("当前环境不支持检查更新")
 
     # ------------------------------------------------------------------ 主题
     def _on_theme_changed_restyle(self, *_args):
