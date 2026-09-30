@@ -305,7 +305,7 @@ def main():
         except Exception:
             sys.exit(5)
 
-    # ---- lan-selftest 模式：无窗口自检"创建跨网房间"全流程 ----
+    # ---- lan-selftest 模式：无窗口自检"进入跨网房间"全流程 ----
     # 用法： Yuhub.exe --lan-selftest <结果json路径> [--room-code xxx] [--keep]
     # 跨网房间要弹 UAC + 拉起独立 watchdog 进程 + 等虚拟网卡，
     # 这些外部脚本都驱动不了，只能让 exe 自己跑真实流程。
