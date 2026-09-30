@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 import etier
 from .. import theme
-from ..widgets import SegmentedControl, ghost_button, info_card, primary_button
+from ..widgets import ghost_button, info_card, primary_button
 from .base_page import BasePage
 
 
@@ -72,13 +72,23 @@ class LanPage(BasePage):
     BADGE = "异地联机"
     BADGE_STYLE = ""
 
+    # 唯一的引导文案。以前这里有「你是房主 / 你是成员」两版动态文案，
+    # 但 EasyTier 是纯 P2P、无中心服务器——所谓"房主"只是先启动的那个人，
+    # 技术上与其他人完全等价。保留身份区分只会让人误以为房间有归属、
+    # 有人能踢人。统一成一句话：填同一组房间码+密码，就在同一个房间里。
+    _MODE_HINT = "填一组房间码 + 密码，点「进入房间」，你和队友就进了同一个虚拟局域网。"
+
+    # 没填昵称时顶替 _MODE_HINT 的提示。抽成常量是为了让
+    # `_refresh_start_gate` 能拿它当判据把文案换回来（见那里的注释）。
+    _NICK_HINT = "先给自己起个昵称——队友在「在线成员」里看到的就是它。"
+
     # 引擎回调发生在后台线程，必须经信号排队回主线程再碰控件
     _event = Signal(str, object)
 
     def __init__(self, notify=None, parent=None):
         super().__init__(
             "异地联机",
-            "内嵌 EasyTier，把异地电脑拉进同一个虚拟局域网：双方填同一组房间码+密码即可互通，游戏里直接联机。",
+            "内嵌 EasyTier，把异地电脑拉进同一个虚拟局域网：大家填同一组房间码+密码即可互通，游戏里直接联机。",
             icon="🌐",
             notify=notify,
             parent=parent,
@@ -89,10 +99,11 @@ class LanPage(BasePage):
         self._my_ip = ""              # 本机虚拟 IP（运行中）
         self._member_tick = 0         # 成员列表刷新计数（控制名称反查频率）
         self._member_names = {}       # ip -> 已解析到的名称（跨 tick 缓存）
+        self._members_row = []        # 当前渲染出来的成员 IP 顺序（用于增删行）
         self._verify_seq = 0          # 成员校验的轮次号（防止过期回调生效）
+        self._host_nick = ""          # 本次启动用的昵称（校验回调里要用）
         self._event.connect(self._on_event)
         self._build_content()
-        self._on_mode_changed("host")
 
         self._timer = QTimer(self)
         self._timer.setInterval(800)
@@ -113,7 +124,7 @@ class LanPage(BasePage):
         会看到"已有一个房间正在运行"、UI 还停不掉它。
 
         这里启动时静默清一次（写停止信号 + 普通权限 taskkill）。清不掉的
-        不在这里弹 UAC 打扰用户，留给点「创建跨网房间」时走完整清理
+        不在这里弹 UAC 打扰用户，留给点「进入房间」时走完整清理
         （那条路径有提权兜底）。
         """
         try:
@@ -132,7 +143,7 @@ class LanPage(BasePage):
             else:
                 self._event.emit(
                     "_etier_log",
-                    "残留房间需管理员权限才能清掉，点「创建跨网房间」时会自动处理",
+                    "残留房间需管理员权限才能清掉，点「进入房间」时会自动处理",
                 )
         except Exception:
             pass
@@ -175,18 +186,12 @@ class LanPage(BasePage):
         head.addWidget(self.status_label)
         v.addLayout(head)
 
-        # 身份切换：房主创建、成员加入。底层都是同一个 EasyTier（无中心），
-        # 只是文案与引导不同，让用户清楚自己是「开房」还是「进房」。
-        r0 = QHBoxLayout()
-        r0.setSpacing(8)
-        r0.addWidget(self._label("身份"))
-        self.mode = SegmentedControl(
-            [("host", "我是房主"), ("join", "我加入别人")], current="host"
-        )
-        self.mode.changed.connect(self._on_mode_changed)
-        r0.addWidget(self.mode)
-        r0.addStretch(1)
-        v.addLayout(r0)
+        # 不再区分「房主 / 成员」：EasyTier 是纯 P2P、无中心服务器，
+        # 所谓"房主"只是先启动的那个人，技术上和成员完全等价。
+        # 保留这个区分只会带来两个负面后果：
+        #   1. 用户以为"房主"是个特殊角色，进而以为房间归谁所有、谁能踢人；
+        #   2. 让"房间码"看起来像房主生成的凭据，其实是双方自己约定的一组字符串。
+        # 所以统一成一句话：**填同一组房间码 + 密码，就在同一个房间里**。
 
         # 昵称：队友在「在线成员」里看到的就是它（比 DESKTOP-XXXX 好认）
         rn = QHBoxLayout()
@@ -205,6 +210,8 @@ class LanPage(BasePage):
         rn.addWidget(btn_nick_reset)
         rn.addStretch(1)
         v.addLayout(rn)
+        # 昵称实时驱动启动按钮可用态（必须在 btn_start 建好之后再连，
+        # 所以放到卡片最后统一接一次信号）
 
         r1 = QHBoxLayout()
         r1.setSpacing(8)
@@ -221,15 +228,17 @@ class LanPage(BasePage):
         r1.addStretch(1)
         v.addLayout(r1)
 
-        # 成员视角的提示（身份切换后动态更新）
-        self.mode_note = self._note("")
+        # 唯一的引导文案（不再有身份之分，所以是静态的一句话）
+        self.mode_note = self._note(
+            "填一组房间码 + 密码，点「进入房间」，你和队友就进了同一个虚拟局域网。"
+        )
         v.addWidget(self.mode_note)
 
         r2 = QHBoxLayout()
         r2.setSpacing(8)
         r2.addWidget(self._label("房间密码"))
         self.pass_edit = QLineEdit("")
-        self.pass_edit.setPlaceholderText("房主和成员必须填同一个")
+        self.pass_edit.setPlaceholderText("所有人必须填同一个")
         self.pass_edit.setMaximumWidth(220)
         self.pass_edit.setEchoMode(QLineEdit.Password)
         r2.addWidget(self.pass_edit)
@@ -257,15 +266,22 @@ class LanPage(BasePage):
         v.addLayout(rip)
 
         v.addWidget(self._note(
-            "房主点「随机」生成房间码，把房间码和密码发给队友；队友选「我加入别人」、"
-            "填同一组码+密码点「加入跨网房间」。两台电脑就进了同一个虚拟局域网——"
-            "游戏里的「局域网」列表能直接看到对方的房间（无需再填地址）。"
-            "首次启动会弹一次 UAC 管理员确认（创建虚拟网卡需要），之后不再弹窗。"
+            "约定一组房间码 + 密码（谁定都行，点「随机」可自动生成一个），"
+            "发给大家，每个人填同一组、点「进入房间」，几台电脑就进了同一个"
+            "虚拟局域网——游戏里的「局域网」列表能直接看到彼此开的房间"
+            "（无需再填地址）。首次启动会弹一次 UAC 管理员确认"
+            "（创建虚拟网卡需要），之后不再弹窗。"
             "\n"
-            "成员会在 15 秒内自动校验房间是否存在：房间码或密码不对会明确提示"
-            "并自动断开，不会让你以为连上了。",
+            "昵称是必填项：队友在「在线成员」里看到的就是它，没填不能进入房间。"
+            "\n"
+            "虚拟 IP 由 EasyTier 自动分配（不固定），所以每次启动可能不一样；"
+            "「在线成员」里每个人都带独立的「复制」按钮，直接复制即可，不用记。"
+            "\n"
+            "进入后会在 15 秒内自动校验房间是否真的通了，房间码或密码不对会"
+            "明确提示并自动断开，不会让你以为连上了。",
             warn=False
         ))
+
 
 
         brow = QHBoxLayout()
@@ -274,12 +290,17 @@ class LanPage(BasePage):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._on_stop)
         brow.addWidget(self.btn_stop)
-        self.btn_start = primary_button("创建跨网房间")
+        self.btn_start = primary_button(self._start_button_text())
         self.btn_start.clicked.connect(self._on_start)
         brow.addWidget(self.btn_start)
         v.addLayout(brow)
 
+        # 昵称变化实时刷新启动按钮（btn_start 已建好，连接安全）
+        self.nick_edit.textChanged.connect(self._refresh_start_gate)
+        self._refresh_start_gate()
+
         return card
+
 
     def _build_members_card(self):
         card = QFrame()
@@ -289,6 +310,7 @@ class LanPage(BasePage):
         v.setSpacing(8)
 
         head = QHBoxLayout()
+        head.setSpacing(8)
         title = QLabel("在线成员")
         title.setObjectName("CardTitle")
         head.addWidget(title)
@@ -299,14 +321,87 @@ class LanPage(BasePage):
         head.addWidget(self.members_count)
         v.addLayout(head)
 
-        self.members_list = QLabel("启动后这里会显示同一房间的成员昵称与虚拟 IP")
-        self.members_list.setObjectName("Faint")
-        self.members_list.setWordWrap(True)
-        self.members_list.setStyleSheet(
-            "font-size: 12px; font-family: Consolas, 'Courier New', monospace;"
-        )
-        v.addWidget(self.members_list)
+        self.members_hint = QLabel("启动后这里会显示同一房间的成员昵称与虚拟 IP")
+        self.members_hint.setObjectName("Faint")
+        self.members_hint.setWordWrap(True)
+        self.members_hint.setStyleSheet("font-size: 11px;")
+        v.addWidget(self.members_hint)
+
+        # 成员行容器：每行是「色块 + 昵称 + IP + 复制」。用容器而不是
+        # QLabel 拼字符串，是因为**每个人的 IP 都要能单独复制**——
+        # 游戏里通常只需要某一台机器的地址，整段文本复制下来还得手删。
+        self.members_box = QWidget()
+        self.members_layout = QVBoxLayout(self.members_box)
+        self.members_layout.setContentsMargins(0, 0, 0, 0)
+        self.members_layout.setSpacing(4)
+        v.addWidget(self.members_box)
         return card
+
+    def _make_member_row(self, name, ip, is_self=False):
+        """构造一行成员：色块 + 昵称 + IP + 复制按钮。
+
+        is_self 为真时高亮并标注"（我）"，方便用户一眼分清
+        "哪个地址是我自己的"——填进游戏别填错了。
+        """
+        p = theme.current()
+        row = QFrame()
+        row.setObjectName("MemberRow")
+        row.setStyleSheet(
+            "QFrame#MemberRow { background: %s; border: 1px solid %s;"
+            " border-radius: 5px; }" % (p["surface_sunken"], p["border"])
+        )
+        h = QHBoxLayout(row)
+        h.setContentsMargins(8, 5, 6, 5)
+        h.setSpacing(8)
+
+        # 纯色小方块做视觉标识（极简色块风格），自己的用主色、别人的用灰
+        dot = QFrame()
+        dot.setFixedSize(9, 9)
+        dot.setStyleSheet(
+            "background: %s; border: none; border-radius: 2px;"
+            % (p["accent"] if is_self else p["text_faint"])
+        )
+        h.addWidget(dot)
+
+        who = QLabel("%s%s" % (name or "（未识别昵称）", "（我）" if is_self else ""))
+        who.setStyleSheet(
+            "font-size: 12px; font-weight: %s; color: %s; background: transparent;"
+            " border: none;" % ("700" if is_self else "400",
+                               p["text"] if is_self else p["text_dim"])
+        )
+        h.addWidget(who)
+
+        ip_lb = QLabel(ip)
+        ip_lb.setStyleSheet(
+            "font-size: 12px; font-family: Consolas, 'Courier New', monospace;"
+            " color: %s; background: transparent; border: none;" % p["text"]
+        )
+        h.addWidget(ip_lb)
+        h.addStretch(1)
+
+        btn = ghost_button("复制")
+        btn.setFixedWidth(52)
+        btn.clicked.connect(lambda _=False, v=ip: self._copy_text(v, "虚拟 IP"))
+        h.addWidget(btn)
+        return row
+
+    def _render_members(self, entries):
+        """按 entries 重建成员行。entries: [{"ip","name","self"}]。
+
+        每次都整体重建而不是做差量更新：成员数量是个位数，
+        重建 5 个小控件的开销可以忽略，换来的是"不会漏删/重影"。
+        """
+        while self.members_layout.count():
+            item = self.members_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for e in entries:
+            self.members_layout.addWidget(
+                self._make_member_row(e.get("name", ""), e["ip"],
+                                      is_self=bool(e.get("self")))
+            )
+        self.members_box.setVisible(bool(entries))
 
     def _build_log_card(self):
         card = QFrame()
@@ -336,15 +431,25 @@ class LanPage(BasePage):
     def _build_help_card(self):
         return info_card(
             "怎么用（以 Minecraft 为例）",
-            "1. 房主：先在游戏里点「对局域网开放」，回到这里选「我是房主」，\n"
-            "   点「随机」生成房间码，再点「创建跨网房间」（首次弹一次 UAC，点「是」）。\n"
-            "2. 把房间码和密码告诉队友（建议走语音/私聊，别公开）。\n"
-            "3. 队友：选「我加入别人」，填同一组房间码和密码，点「加入跨网房间」。\n"
-            "   成员会在 15 秒内自动校验：房间码或密码不对会明确报错并断开。\n"
-            "4. 队友打开游戏的「多人游戏」，列表里会出现房主的房间，点进去即可。\n"
+            "1. 先在游戏里点「对局域网开放」（谁开都行，开的那个人就是别人\n"
+            "   进游戏时看到的那个房间）。\n"
+            "2. 回到这里：点「随机」生成一组房间码，想一个密码，然后点\n"
+            "   「进入房间」（首次弹一次 UAC，点「是」）。\n"
+            "3. 把房间码和密码发给队友（建议走语音/私聊，别公开）。\n"
+            "4. 队友填**同一组**房间码和密码，也点「进入房间」。\n"
+            "   进入后会在 15 秒内自动校验：房间码或密码不对会明确报错并断开。\n"
+            "5. 大家打开游戏的「多人游戏」，列表里就能直接看到彼此开的房间。\n"
             "\n"
-            "昵称：填在「我的昵称」里，队友在「在线成员」里看到的就是它\n"
-            "（不填则用计算机名，形如 DESKTOP-XXXX）。\n"
+            "所有人都是同一个身份：大家都做同一件事——填同一组房间码+密码、\n"
+            "点「进入房间」。房间码不是谁「建」出来的，是一组约定好的暗号，\n"
+            "谁先进入都行。\n"
+            "\n"
+            "昵称：填在「我的昵称」里，**必填**——队友在「在线成员」里\n"
+            "看到的就是它。\n"
+            "\n"
+            "虚拟 IP：由 EasyTier 自动分配，不固定（换房间/重启都可能变）。\n"
+            "要某台机器的地址时，在「在线成员」里点那一行的「复制」即可，\n"
+            "每个人的 IP 都能单独复制。\n"
             "\n"
             "原理：内嵌 EasyTier（Apache 2.0 开源）创建一块二层虚拟网卡，\n"
             "把填了相同房间码+密码的电脑拉进同一个虚拟局域网。P2P 打洞优先，\n"
@@ -362,31 +467,21 @@ class LanPage(BasePage):
 
     # ------------------------------------------------------------------ 交互
     def _start_button_text(self):
-        """根据当前身份返回启动按钮文案。"""
-        return "创建跨网房间" if self.mode.current() == "host" else "加入跨网房间"
-
-    def _on_mode_changed(self, value):
-        """身份切换：更新按钮文案与成员引导，其余逻辑完全一致。"""
-        is_host = value == "host"
-        if not self._etier_busy and not self._running:
-            self.btn_start.setText(self._start_button_text())
-        if is_host:
-            self.mode_note.setText(
-                "你是房主：点「随机」生成房间码，把码和密码发给队友。"
-            )
-        else:
-            self.mode_note.setText(
-                "你是成员：把房主发给你的房间码和密码填进下面，点「加入跨网房间」。"
-            )
+        """启动按钮文案。**不再有身份之分**，创建和加入是同一个动作。"""
+        return "进入房间"
 
     def _on_reset_nick(self):
         """把昵称恢复为计算机名。"""
         self.nick_edit.setText(default_nickname())
 
     def _current_nickname(self):
-        """取当前昵称（已清洗），空则回落默认值。"""
-        nick = sanitize_nickname(self.nick_edit.text())
-        return nick or default_nickname()
+        """取当前昵称（已清洗）。**空就是空**，不再回落默认值。
+
+        昵称是进入房间的必需项：队友靠它在「在线成员」里认出你，
+        没有名字的节点在列表里就是一行裸 IP。所以这里不偷偷兜底，
+        由 _on_start() 明确拦下来并提示用户填。
+        """
+        return sanitize_nickname(self.nick_edit.text())
 
     def _save_nickname(self, nick):
         try:
@@ -394,48 +489,79 @@ class LanPage(BasePage):
         except Exception:
             pass
 
+    def _refresh_start_gate(self, *_args):
+        """昵称是否填写决定启动按钮可用态。
+
+        昵称是必填的：每个人都会出现在同一个「在线成员」列表里，
+        谁都得有名字，否则列表里就是一行裸 IP，认不出谁是谁。
+
+        只在"没在跑、也不忙"时改按钮：不能把「正在启动…」或「停止」
+        途中的按钮状态覆盖掉。
+        """
+        if self._etier_busy or self._running:
+            return
+        has_nick = bool(self._current_nickname())
+        self.btn_start.setEnabled(has_nick)
+        if has_nick:
+            self.btn_start.setText(self._start_button_text())
+            # 用门禁自己写进去的那段提示做判据。
+            # 曾经的 bug：这里判的是按钮文案「请先填昵称」，但门禁往
+            # mode_note 里写的是「先给自己起个昵称…」，两者永远不相等，
+            # 于是提示一旦被改写就再也回不到正常引导文案。
+            if self.mode_note.text() == self._NICK_HINT:
+                self.mode_note.setText(self._MODE_HINT)
+        else:
+            self.btn_start.setText("请先填昵称")
+            self.mode_note.setText(self._NICK_HINT)
 
     def _on_start(self):
         if self._etier_busy or self._running:
             return
         code = self.code_edit.text().strip()
         password = self.pass_edit.text()
+        # 昵称必填：每个人都要能被人认出来
+        nick = self._current_nickname()
+        if not nick:
+            self.toast("请先填写昵称，再进入房间")
+            self._refresh_start_gate()
+            return
         if len(code) < 4:
             self.toast("房间码至少 4 个字符（可点「随机」自动生成）")
             return
         if len(password) < 4:
-            self.toast("跨网房间必须设密码，至少 4 个字符")
+            self.toast("房间密码至少 4 个字符（所有人填同一个）")
             return
         self._etier_busy = True
         self.btn_start.setEnabled(False)
         self.btn_start.setText("正在启动…")
-        action = "创建" if self.mode.current() == "host" else "加入"
         self._set_status_note(
-            "正在%s：释放内置组件 → 等待 UAC 授权 → 拉起虚拟网卡。"
-            "首次启动可能要 10~20 秒，请在 UAC 弹窗里点「是」。" % action
+            "正在进入房间：释放内置组件 → 等待 UAC 授权 → 拉起虚拟网卡。"
+            "首次启动可能要 10~20 秒，请在 UAC 弹窗里点「是」。"
         )
-        self._append_log("跨网房间：正在%s（房间码 %s）…" % (action, code))
+        self._append_log("跨网房间：正在进入（房间码 %s）…" % code)
         # 昵称落盘，下次打开还是它
-        nick = self._current_nickname()
         self.nick_edit.setText(nick)          # 回填清洗后的结果，让用户看到实际值
         self._save_nickname(nick)
+        self._host_nick = nick                # 校验回调（后台线程）要用
         # EasyTier.start 会阻塞最长 45 秒（轮询虚拟网卡就绪），必须丢后台
         threading.Thread(target=self._do_start, args=(code, password, nick),
                          daemon=True).start()
 
     def _do_start(self, code, password, nick):
         tier = etier.EasyTier(on_log=lambda m: self._event.emit("_etier_log", m))
-        # 房主固定 10.126.126.1，成员固定 10.126.126.2，让 IP 可预期、方便游戏直连
-        ipv4 = "10.126.126.1" if self.mode.current() == "host" else "10.126.126.2"
+        # 虚拟 IP 交给 EasyTier 的 DHCP 动态分配（不传 ipv4，走 -d true）：
+        # 固定 IP 在"多个房间并存 / 一个房间多人"时会互相抢地址，而 DHCP
+        # 遇到冲突会自动改地址。代价是 IP 不再可预测，所以成员侧的准入校验
+        # 不能再 ping 固定的 10.126.126.1，改由 pick_host_ip() 动态发现。
         try:
             ok, msg = tier.start(
                 "yuhub-" + code.lower().replace(" ", ""), password,
-                timeout=20.0, ipv4=ipv4, hostname=nick,
+                timeout=20.0, hostname=nick,
             )
         except Exception as exc:
             ok, msg = False, str(exc)
         self._event.emit("_etier_done", {"ok": ok, "msg": msg, "tier": tier,
-                                          "ipv4": ipv4})
+                                          "ipv4": etier.virtual_adapter_ip()})
 
     def _on_done(self, payload):
         self._etier_busy = False
@@ -448,76 +574,85 @@ class LanPage(BasePage):
             self._refresh_status_style()
             self._update_ip()
 
-            # 成员侧必须做「房间是否存在」校验：
-            # EasyTier 是纯 P2P、无中心服务器，密码填错时它不会报错，
-            # 只会安静地建出一个"只有自己"的空房间。所以这里主动探测
-            # 房主固定 IP（10.126.126.1）——探不到就说明这个房间不存在，
-            # 直接回滚并明确报错，而不是骗用户说"已就绪"。
-            if self._is_member():
-                self._append_log("正在校验房间是否存在（探测房主 10.126.126.1）…")
-                self._set_status_note(
-                    "正在校验房间… 若房间码或密码不对，将自动断开并提示。"
-                )
-                self._verify_seq += 1
-                seq = self._verify_seq
-                threading.Thread(
-                    target=self._do_verify_room, args=(seq,), daemon=True
-                ).start()
-                return
-
-            self._append_log("跨网房间已就绪。游戏里的「局域网」列表现在能看到"
-                             "同一房间码队友开的房间了。")
+            # 每次进入房间都要做「房间是否真的通了」校验，
+            # **不再分身份**——以前只有"成员"才校验，是因为房主就是自己、
+            # 不需要证明房间存在。现在没有房主概念，每个人进来都要确认
+            # 房间里确实有别人。
+            #
+            # 为什么必须校验：EasyTier 是纯 P2P、无中心服务器，密码填错时
+            # 它不会报错，只会安静地建出一个"只有自己"的空房间。所以这里
+            # 主动在虚拟网里找对端（IP 是 DHCP 动态分配的，见 pick_host_ip）
+            # ——找不到就说明这个房间没通，直接回滚并明确报错，
+            # 而不是骗用户说"已就绪"。
+            self._append_log("正在校验房间是否真的通了（在虚拟网里寻找其他节点）…")
+            self._set_status_note(
+                "正在校验房间… 若房间码或密码不对，将自动断开并提示。"
+            )
+            self._verify_seq += 1
+            seq = self._verify_seq
+            threading.Thread(
+                target=self._do_verify_room, args=(seq,), daemon=True
+            ).start()
         else:
             self._running = False
             self._my_ip = ""
-            self.btn_start.setEnabled(True)
-            self.btn_start.setText(self._start_button_text())
+            self._refresh_start_gate()
             self._set_status_note("")
             msg = payload.get("msg") or "未知原因"
             self._append_log("跨网房间启动失败：%s" % msg)
             self.toast("启动失败：%s" % msg)
 
-    def _is_member(self):
-        """当前身份是否为「我加入别人」。"""
-        try:
-            return self.mode.current() == "join"
-        except Exception:
-            return False
-
     def _do_verify_room(self, seq):
-        """后台探测房主是否在房间里（成员侧准入校验）。"""
-        # 给 P2P 打洞留时间：EasyTier 建连通常几秒内完成，
-        # 公网中继兜底可能要更久，所以给 15 秒、每 1.5 秒探一次。
-        host_ip = "10.126.126.1"
+        """后台探测房间里是否有其他节点（准入校验）。
+
+        没有"房主"这个概念了，所以这里要找的是**任意一个对端**：
+        房间码和密码只要是对的，网段里就必然有别人；如果是错的，
+        EasyTier 会给你一个只有自己的空房间，网段里什么都没有。
+
+        IP 是 DHCP 动态分配、无法预测，判定逻辑见 `etier.pick_host_ip`：
+        先按已知昵称反查，再回落到"网段里谁能 ping 通"。
+
+        给 P2P 打洞留时间：EasyTier 建连通常几秒内完成，公网中继兜底
+        可能要更久，所以给 15 秒，期间反复尝试。
+        """
+        deadline = time.monotonic() + 15.0
         found = False
-        for _ in range(10):
-            time.sleep(1.5)
+        peer_ip = ""
+        while time.monotonic() < deadline:
             if seq != self._verify_seq:      # 期间用户已停止/重启，放弃本轮
                 return
-            if etier.probe_host(host_ip, timeout=1.5, attempts=1):
+            peer_ip = etier.pick_host_ip(
+                self._my_ip, hostname=self._host_nick, wait=0.0,
+            )
+            if peer_ip:
                 found = True
                 break
-        self._event.emit("_etier_verify", {"seq": seq, "found": found})
+            time.sleep(1.5)
+        self._event.emit("_etier_verify",
+                         {"seq": seq, "found": found, "host_ip": peer_ip})
 
     def _on_verify_result(self, payload):
         """校验结果：通过就正常用，不通过就回滚并报错。"""
         if payload.get("seq") != self._verify_seq:
             return                            # 过期结果，忽略
         if payload.get("found"):
-            self._append_log("房间校验通过：已连上房主。")
+            peer_ip = payload.get("host_ip") or ""
+            self._append_log(
+                "房间校验通过：已连上房间里的其他节点（%s）。" % (peer_ip or "?")
+            )
             self._set_status_note(
                 "虚拟网卡已就绪：本机虚拟 IP %s。游戏里的「局域网」列表"
-                "现在能看到房主的房间了。" % (self._my_ip or "?")
+                "现在能看到队友开的房间了。" % (self._my_ip or "?")
             )
-            self.toast("已加入房间")
+            self.toast("已进入房间")
             return
 
-        # 没探到房主 → 房间码或密码不对
+        # 网段里没有任何可达对端 → 房间码或密码不对
         self._append_log(
-            "房间校验失败：15 秒内没有探测到房主（10.126.126.1）。"
-            "常见原因：房间码拼错、密码不一致，或房主还没启动房间。"
+            "房间校验失败：15 秒内没有在虚拟网里发现任何其他节点。"
+            "常见原因：房间码拼错、密码不一致，或其他人还没进入这个房间。"
         )
-        self.toast("房间不存在或密码错误，已断开")
+        self.toast("房间码或密码不正确，已断开")
         self._rollback_failed_join()
 
     def _rollback_failed_join(self):
@@ -525,18 +660,15 @@ class LanPage(BasePage):
         tier, self._etier = self._etier, None
         self._running = False
         self._my_ip = ""
-        self.members_list.setText("暂未发现其他成员（等队友加入后会显示）")
-        self.members_count.setText("0 人")
+        self._host_nick = ""
+        self._clear_members()
         self.ip_label.setText("--")
         self.btn_copy_ip.setEnabled(False)
-        self.btn_start.setText(self._start_button_text())
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
         self._set_running(False)
         self._refresh_status_style()
         self._set_status_note(
-            "加入失败：房间码或密码不正确，或房主尚未创建该房间。"
-            "请与房主核对后重试。"
+            "进入房间失败：房间码或密码不正确，或其他人还没进入这个房间。"
+            "请与其他队友核对后重试。"
         )
         if tier is not None:
             threading.Thread(target=lambda: self._safe_stop(tier),
@@ -555,8 +687,9 @@ class LanPage(BasePage):
             return          # 已有启动/停止在进行，避免重复线程
         if self._etier is None and not self._running:
             # 没有可停的房间：把界面归位即可（别留下"正在停止"的死状态）
-            self.btn_start.setText(self._start_button_text())
-            self.btn_start.setEnabled(True)
+            # 注意别在这里无条件 setEnabled(True)——昵称为空时按钮该保持禁用，
+            # 交给 gate 统一决定。
+            self._refresh_start_gate()
             self._set_status_note("")
             return
         tier, self._etier = self._etier, None
@@ -580,6 +713,7 @@ class LanPage(BasePage):
         self._etier_busy = False
         self._running = False
         self._my_ip = ""
+        self._host_nick = ""
         self._set_running(False)
         self._set_status_note("")
         self._clear_members()
@@ -587,13 +721,21 @@ class LanPage(BasePage):
 
     def _set_running(self, flag):
         self.btn_stop.setEnabled(flag)
-        self.btn_start.setEnabled(not flag)
         # 无论启动成功还是失败，启动按钮文案都必须回到正常值。
         # 曾经的 bug：这里只在 `not flag` 时复位文案，于是**启动成功后**
-        # 按钮永远停在「正在启动…」——用户看到的就是"创建跨网房间后一直
-        # 显示正在启动"（房间其实已经建好了，只是按钮没恢复）。
-        self.btn_start.setText(self._start_button_text())
-        for w in (self.code_edit, self.pass_edit, self.btn_random, self.mode):
+        # 按钮永远停在「正在启动…」——用户看到的就是"进入房间后一直
+        # 显示正在启动"（房间其实已经连上了，只是按钮没恢复）。
+        #
+        # 运行中：禁用 + 文案复位（恢复文案由本函数负责，不能
+        # 交给 gate —— gate 会因为 _running 为真而早退，那样按钮就永远
+        # 停在「正在启动…」）。
+        # 未运行：整个交给 gate —— 它还要看昵称填没填。
+        if flag:
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText(self._start_button_text())
+        else:
+            self._refresh_start_gate()
+        for w in (self.code_edit, self.pass_edit, self.btn_random):
             w.setEnabled(not flag)
         # IP 显示与复制按钮
         self.btn_copy_ip.setEnabled(flag and bool(self._my_ip))
@@ -602,9 +744,12 @@ class LanPage(BasePage):
             self._clear_members()
 
     def _clear_members(self):
-        """清空成员列表显示。"""
-        self.members_list.setText("启动后这里会显示同一房间的成员虚拟 IP")
+        """清空成员列表显示（回到"未启动"的占位状态）。"""
+        self._render_members([])
+        self.members_hint.setText("启动后这里会显示同一房间的成员昵称与虚拟 IP")
+        self.members_hint.setVisible(True)
         self.members_count.setText("0 人")
+        self._members_row = []
 
     def _set_status_note(self, text):
         try:
@@ -612,15 +757,22 @@ class LanPage(BasePage):
         except RuntimeError:
             pass
 
+    def _copy_text(self, text, what="内容"):
+        """复制任意文本到剪贴板（成员行 / 本机 IP 共用）。"""
+        if not text:
+            self.toast("没有可复制的%s" % what)
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(text)
+        self.toast("已复制%s：%s" % (what, text))
+
     def _on_copy_ip(self):
         """复制本机虚拟 IP 到剪贴板。"""
         ip = self._my_ip or etier.virtual_adapter_ip()
         if not ip:
             self.toast("当前没有虚拟 IP 可复制")
             return
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setText(ip)
-        self.toast("已复制虚拟 IP：%s" % ip)
+        self._copy_text(ip, "本机虚拟 IP")
         self._append_log("已复制本机虚拟 IP %s" % ip)
 
     def _update_ip(self):
@@ -635,19 +787,38 @@ class LanPage(BasePage):
             self._member_tick += 1
             want_names = (self._member_tick % 4 == 1)
             members = etier.list_members_detailed(ip, resolve=want_names)
-            if members:
-                if want_names:
-                    self._member_names = {m["ip"]: m["name"] for m in members
-                                          if m.get("name")}
-                lines = []
-                for m in members:
-                    nm = m.get("name") or self._member_names.get(m["ip"], "")
-                    lines.append("%s  ·  %s" % (nm, m["ip"]) if nm else m["ip"])
-                self.members_list.setText("\n".join(lines))
-                self.members_count.setText("%d 人" % len(members))
+            if want_names:
+                got = {m["ip"]: m["name"] for m in members if m.get("name")}
+                if got:
+                    self._member_names.update(got)
+
+            # 自己永远排第一行——用户最常要复制的是自己的地址
+            entries = [{"ip": ip, "name": self._host_nick or self._current_nickname(),
+                        "self": True}]
+            for m in members:
+                entries.append({
+                    "ip": m["ip"],
+                    "name": m.get("name") or self._member_names.get(m["ip"], ""),
+                    "self": False,
+                })
+            all_ips = [e["ip"] for e in entries]
+            # 只在"行内容真的变了"时重建控件，否则每 800ms 重建一次会闪
+            if all_ips != [r["ip"] for r in self._members_row] or want_names:
+                self._render_members(entries)
+                self._members_row = entries
+
+            others = len(entries) - 1
+            self.members_count.setText("%d 人" % len(entries))
+            if others:
+                self.members_hint.setText(
+                    "点每行右侧「复制」即可单独复制那个人的 IP。"
+                )
             else:
-                self.members_list.setText("暂未发现其他成员（等队友加入后会显示）")
-                self.members_count.setText("0 人")
+                self.members_hint.setText(
+                    "目前只有你自己。把房间码和密码发给队友，"
+                    "他们加入后就会出现在这里。"
+                )
+            self.members_hint.setVisible(True)
             self._set_status_note(
                 "虚拟网卡已就绪：本机虚拟 IP %s。把房间码和密码发给队友，"
                 "让他们也启动跨网房间即可。" % ip

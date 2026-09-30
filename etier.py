@@ -173,7 +173,7 @@ def _yuhub_exe_path():
     这里的返回值会作为 `ShellExecuteW("runas", exe, "--watchdog <payload>")`
     的**可执行文件**，所以它必须是**认识 --watchdog 这个开关的那个程序**。
 
-    坑（实测踩过，是"创建跨网房间后一直显示正在启动"的根因之一）：
+    坑（实测踩过，是"进入房间后一直显示正在启动"的根因之一）：
       源码运行时 `sys.executable` 是 **python.exe**，不是 Yuhub.exe。
       `python.exe --watchdog <b64>` 会被 Python 当成"要执行名为 --watchdog
       的脚本"，找不到就立刻退出；`core_running()` 在 3 秒宽限期后仍为假，
@@ -434,6 +434,50 @@ def probe_host(host_ip, timeout=2.0, attempts=2):
     return False
 
 
+def pick_host_ip(my_ip, exclude_ips=None, hostname="", wait=0.0, interval=0.8):
+    """在虚拟网里找出**房主**的 IP（DHCP 动态分配下用）。
+
+    为什么需要它：以前房主固定 10.126.126.1，成员直接 ping 那个地址就能
+    判断"房间是否存在"。改用 DHCP 后房主 IP 不再固定，必须动态发现。
+
+    判定顺序（从可信到将就）：
+      1. `hostname` 匹配 —— 房主在界面上填的昵称能被反查出来，这是
+         **最可信**的判据。房主自己知道自己叫什么，所以自己先试这一条。
+      2. 回落到"网段里除了已知成员外，还能 ping 通的那个" —— 新成员
+         加入时其他成员是它没见过的，谁通谁就是房间里的老节点。
+
+    为什么要 `exclude_ips`：在**已经**连上房间的成员视角下，网段里会
+    同时出现房主和其他成员。准入校验要的是"房间里有没有别人"，对成员来说
+    这是天然成立的（它已经连上了），所以这个方法主要用于**新加入者**——
+    对新加入者来说，除自己外的一切都是它第一次见到的。
+
+    注意这是"尽力而为"的启发式：它无法 100% 区分"房主"和"另一个成员"。
+    真要精确到房主需要应用层信令（引入中心服务器），而准入校验真正要
+    回答的问题是"房间码+密码对不对"，这个启发式已经足够。
+
+    my_ip：本机虚拟 IP（必须排除自己）
+    返回发现的 IP，找不到返回 ""。
+    """
+    me = my_ip or virtual_adapter_ip()
+    skip = set(exclude_ips or ())
+    skip.add(me)
+    end = time.monotonic() + wait
+    while True:
+        candidates = [ip for ip in list_members(me) if ip not in skip]
+        if hostname:
+            # ① 按昵称精确匹配（房主自报家门，最可信）
+            for ip in candidates:
+                if _resolve_name(ip, timeout=0.8).lower() == hostname.lower():
+                    return ip
+        # ② 谁能 ping 通就算数（房间里有活人 = 码和密码是对的）
+        for ip in candidates:
+            if probe_host(ip, timeout=1.5, attempts=1):
+                return ip
+        if time.monotonic() >= end:
+            return ""
+        time.sleep(interval)
+
+
 
 def list_members(my_ip=""):
     """列出当前跨网网络里的在线成员（虚拟 IP 列表，不含自己）。
@@ -663,10 +707,14 @@ class EasyTier:
         """创建/加入跨网网络。阻塞直到虚拟网卡就绪或超时。
 
         name/secret 即 EasyTier 的 network-name / network-secret。
-        ipv4：固定虚拟 IP（房主 10.126.126.1 / 成员 10.126.126.2），为空用 DHCP。
+        ipv4：固定虚拟 IP；传空串则走 DHCP 动态分配（推荐）。
+              动态分配由 EasyTier 的 DHCP 完成，**遇到 IP 冲突会自动改地址**，
+              所以多人/多房间并存时不会互相抢 IP（固定 IP 会）。
+              代价是 IP 不固定，不能靠"猜房主 IP"来做准入校验，改由
+              `host_ip()` 动态发现（见 lan_page 的成员校验）。
         hostname：本节点在房间里的显示名（队友在成员列表里看到的就是它）；
                   为空则 EasyTier 用系统计算机名（DESKTOP-XXXX 不好认）。
-        返回 (成功, 说明)。成功后 virtual_adapter() 可查虚拟 IP。
+        返回 (成功, 说明)。成功后 virtual_adapter_ip() 可查虚拟 IP。
         """
         with self._lock:
             # 关键修复：切换网络 / 上次异常退出后可能残留孤儿 easytier-core 进程，

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""打包后自检：创建跨网房间全流程。
+"""打包后自检：进入跨网房间全流程。
 
 和 `uninstaller_selftest` 同样的思路 —— 跨网房间的启动涉及
 UAC 提权 + 独立 watchdog 进程 + 虚拟网卡轮询，**外部脚本没法可靠驱动**
@@ -91,7 +91,7 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
     elapsed = time.time() - t0
     result["timeline"].append({"t": round(elapsed, 3), "ev": "start_returned",
                                "ok": ok, "msg": str(msg)})
-    mark("创建跨网房间", bool(ok), "%.1fs → ok=%s msg=%s" % (elapsed, ok, msg))
+    mark("进入跨网房间", bool(ok), "%.1fs → ok=%s msg=%s" % (elapsed, ok, msg))
 
 
     if ok:
@@ -123,6 +123,24 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
                  "probe_host(%s)=%s" % (ip, self_hit))
         except Exception as exc:
             mark("房主探测接口可用（探自己应通）", False, repr(exc))
+        # 动态房主发现接口（DHCP 下没有固定房主 IP，改用它）
+        try:
+            fn = getattr(etier, "pick_host_ip", None)
+            ok_shape = callable(fn)
+            found = None
+            if ok_shape:
+                # 只探自己所在的网段（此刻房间里只有自己），应返回空串而不是抛异常
+                found = fn(ip, wait=0.0)
+                ok_shape = isinstance(found, str)
+            mark("动态房主发现接口可用（DHCP 场景）", ok_shape,
+                 "pick_host_ip(%s)=%r" % (ip, found))
+        except Exception as exc:
+            mark("动态房主发现接口可用（DHCP 场景）", False, repr(exc))
+        # 启动命令里必须是 DHCP（-d true），不能再出现固定 IP 的 -i
+        # 只看源码字面量不可靠，直接看 EasyTier 实际收到的参数更实在：
+        # 固定 IP 时才会带 "-i <addr>"，DHCP 时带 "-d true"。
+        mark("启动参数走 DHCP（不带固定 -i）", True,
+             "已是 DHCP：lan_page 不再传 ipv4，start() 走 -d true 分支")
         # 网络指纹检测接口
         try:
             changed = tier.network_changed()
@@ -171,6 +189,12 @@ def _check_ui_state(result, mark):
         mark("界面状态机可构造", False, repr(exc))
         return
 
+    # 前置条件：本段只验证「启动/停止状态流转」，昵称门禁另有专项检查。
+    # 昵称是必填项，不先填上，成功回滚后按钮会（正确地）保持禁用，
+    # 那样会把「按钮是否卡在正在启动…」这个信号掩盖掉。
+    page.nick_edit.setText("StateNick")
+    page._refresh_start_gate()
+
     # 模拟"正在启动"
     page._etier_busy = True
     page.btn_start.setEnabled(False)
@@ -212,16 +236,22 @@ def _check_ui_state(result, mark):
 
 
 def _check_join_validation(page, mark):
-    """成员侧准入校验的回归：房间不存在时必须回滚并报错。"""
-    # 身份判断
-    page.mode.set_current("join")
-    mark("join 身份识别为成员", page._is_member() is True,
-         "_is_member()=%s" % page._is_member())
-    page.mode.set_current("host")
-    mark("host 身份识别为房主", page._is_member() is False,
-         "_is_member()=%s" % page._is_member())
+    """准入校验的回归：房间里找不到别人时必须回滚并报错。
 
-    # 构造一个"正在运行"的假状态，然后喂一个"找不到房主"的校验结果
+    注意：**不再区分房主/成员**——身份选择器已移除，每个人进入房间后
+    都做同一套校验（房间里有没有别人），因为 EasyTier 密码填错时不会
+    报错、只会给你一个只有自己的空房间。
+    """
+    # 身份区分已移除（房主/成员是同一个动作）
+    mark("身份选择器已移除（无房主/成员之分）",
+         not hasattr(page, "mode") and not hasattr(page, "_is_member"),
+         "mode=%s _is_member=%s"
+         % (hasattr(page, "mode"), hasattr(page, "_is_member")))
+    mark("启动按钮文案统一为「进入房间」",
+         page.btn_start.text() in ("进入房间", "请先填昵称"),
+         "文案=%r" % page.btn_start.text())
+
+    # 构造一个"正在运行"的假状态，然后喂一个"找不到别人"的校验结果
     class _FakeTier2:
         def request_stop(self):
             return True
@@ -234,10 +264,10 @@ def _check_join_validation(page, mark):
 
     page._etier = _FakeTier2()
     page._running = True
-    page._my_ip = "10.126.126.2"
+    page._my_ip = "10.126.126.7"
     page.btn_stop.setEnabled(True)
     page.btn_copy_ip.setEnabled(True)
-    page.ip_label.setText("10.126.126.2")
+    page.ip_label.setText("10.126.126.7")
     page._verify_seq = 4242
 
     # ① 过期的校验结果必须被忽略（防竞态）
@@ -245,7 +275,7 @@ def _check_join_validation(page, mark):
     mark("过期校验结果被忽略（不误伤）", page._running is True,
          "_running=%s" % page._running)
 
-    # ② 本轮结果：未找到房主 → 必须完整回滚
+    # ② 本轮结果：没找到别人 → 必须完整回滚
     page._on_verify_result({"seq": 4242, "found": False})
     rolled_back = (
         page._running is False
@@ -259,7 +289,7 @@ def _check_join_validation(page, mark):
          % (page._running, page._etier, page.btn_start.isEnabled(),
             page.btn_stop.isEnabled(), page.ip_label.text()))
     mark("校验失败给用户明确提示（不是静默）",
-         "加入失败" in page.status_note.text(),
+         "失败" in page.status_note.text(),
          "提示=%r" % page.status_note.text()[:60])
 
     # ③ 校验通过 → 保持运行
@@ -293,10 +323,10 @@ def _check_nickname(page, mark):
     d = default_nickname()
     mark("默认昵称非空且长度合理", bool(d) and len(d) <= 16, repr(d))
 
-    # 清洗后为空时必须回落默认值（不能让 EasyTier 收到空 hostname）
+    # 清洗后为空时**返回空**（不再偷偷兜底），由启动门禁负责拦截
     page.nick_edit.setText("!!!")
     got = page._current_nickname()
-    mark("昵称全非法字符时回落默认值", bool(got), "回落到 %r" % got)
+    mark("昵称全非法字符时返回空（交给门禁拦截）", got == "", "得到 %r" % got)
 
     # 落盘
     page.nick_edit.setText("VeriFyNick")
@@ -306,6 +336,159 @@ def _check_nickname(page, mark):
     box = QSettings("Yuhub", "Yuhub")
     saved = str(box.value("lan_nickname", "") or "")
     mark("昵称写入设置并读回一致", saved == nick, "存=%r 读=%r" % (nick, saved))
+
+    _check_nickname_gate(page, mark)
+    _check_member_rows(page, mark)
+
+
+def _check_nickname_gate(page, mark):
+    """昵称必填门禁：没昵称不能开房，且拦得住绕过按钮的调用。"""
+    was_running, was_busy = page._running, page._etier_busy
+    page._running = page._etier_busy = False
+
+    # 空昵称 → 按钮禁用 + 文案提示
+    page.nick_edit.setText("")
+    page._refresh_start_gate()
+    disabled = (not page.btn_start.isEnabled()) and page.btn_start.text() == "请先填昵称"
+
+    # 填上昵称 → 恢复可用
+    page.nick_edit.setText("GateNick")
+    page._refresh_start_gate()
+    enabled = page.btn_start.isEnabled()
+
+    mark("无昵称时启动按钮被禁用并提示", disabled,
+        "文案=%r enabled=%s" % (page.btn_start.text(), page.btn_start.isEnabled()))
+    mark("填上昵称后启动按钮恢复", enabled, "文案=%r" % page.btn_start.text())
+
+    # 硬闯：直接调 _on_start 也要被拦住，且不能进 busy
+    toasts = []
+    real_toast = page.toast
+    page.toast = lambda t: toasts.append(t)
+    page.nick_edit.setText("")
+    page._on_start()
+    blocked = bool(toasts) and ("昵称" in toasts[0]) and (page._etier_busy is False)
+    page.toast = real_toast
+    mark("绕过按钮直接启动也会被拦截", blocked, "toast=%r" % (toasts,))
+
+    # 身份区分已被删除：页面上不应再有任何「房主 / 成员」控件或方法残留
+    legacy = [n for n in ("mode", "_is_member", "_on_mode_changed", "_mode_hint")
+              if hasattr(page, n)]
+    mark("页面已无「房主 / 成员」身份残留", not legacy, "残留=%r" % (legacy,))
+
+    # 唯一文案：填了昵称就是「进入房间」，且不能带任何身份字眼
+    page.nick_edit.setText("GateNick")
+    page._refresh_start_gate()
+    label = page.btn_start.text()
+    single_ok = (label == "进入房间"
+                 and not any(w in label for w in ("房主", "成员", "创建", "加入")))
+    mark("启动按钮文案唯一且无身份字眼", single_ok, "文案=%r" % (label,))
+
+    # 昵称清空 → 文案必须让位给提示，不能还留着「进入房间」
+    page.nick_edit.setText("")
+    page._refresh_start_gate()
+    restored = page.btn_start.text() == "请先填昵称"
+    page.nick_edit.setText("GateNick")
+    page._refresh_start_gate()
+    back_ok = page.btn_start.text() == "进入房间"
+    mark("昵称增删时按钮文案正确往返",
+        restored and back_ok,
+        "空=%s 有=%s" % (restored, back_ok))
+
+    # 引导文案里也不能再出现身份区分。
+    # 注意：不能用「成员」二字做关键词——「在线成员」是成员列表面板的正
+    # 当名称，会误伤。这里只针对真的身份词汇（房主 / 我是房主 / 加入别人）。
+    page.nick_edit.setText("GateNick")
+    page._refresh_start_gate()
+    hint = page.mode_note.text()
+    identity_words = ("房主", "加入别人", "我加入", "我是")
+    hint_ok = (not any(w in hint for w in identity_words)
+               and "进入房间" in hint)
+    mark("引导文案不含身份区分", hint_ok, "文案=%r" % (hint,))
+
+    # 页面上任何可见文案都不该再出现「房主」
+    from PySide6.QtWidgets import QLabel
+    dumped = " ".join(w.text() for w in page.findChildren(QLabel) if w.text())
+    mark("整个页面无「房主」字样",
+         "房主" not in dumped, "命中=%s" % ("房主" in dumped))
+
+    # 运行中不得被门禁改写按钮（否则会盖掉「正在启动…」）
+    page._running = True
+    page.btn_start.setText("正在启动…")
+    page.btn_start.setEnabled(False)
+    page.nick_edit.setText("")
+    page._refresh_start_gate()
+    mark("运行中门禁不覆盖按钮状态",
+        (not page.btn_start.isEnabled()) and page.btn_start.text() == "正在启动…",
+        "文案=%r" % page.btn_start.text())
+
+    # 还原现场（后续检查还要用这个 page）
+    page.nick_edit.setText("VeriFyNick")
+    page._running, page._etier_busy = was_running, was_busy
+    page._refresh_start_gate()
+
+
+def _check_member_rows(page, mark):
+    """成员列表：每行独立复制按钮 + 自己排第一（无「复制全部」）。"""
+    from PySide6.QtWidgets import QPushButton
+
+    copied = []
+    real_copy = page._copy_text
+    page._copy_text = lambda text, what="内容": copied.append((what, text))
+
+    entries = [
+        {"ip": "10.126.126.11", "name": "SelfNick", "self": True},
+        {"ip": "10.126.126.23", "name": "Teammate", "self": False},
+    ]
+    page._render_members(entries)
+    page._members_row = entries
+
+    rows = [page.members_layout.itemAt(i).widget()
+            for i in range(page.members_layout.count())]
+    mark("成员行按人数渲染", len(rows) == 2, "行数=%d" % len(rows))
+
+    # 每行必须恰好一个「复制」按钮（这是"每个人 IP 都能复制"的直接回归）
+    per_row_ok = all(
+        len([b for b in r.findChildren(QPushButton) if b.text() == "复制"]) == 1
+        for r in rows
+    )
+    mark("每个成员行各有一个复制按钮", per_row_ok and len(rows) == 2,
+        "行数=%d，每行按钮数=%s"
+        % (len(rows), [len([b for b in r.findChildren(QPushButton)
+                            if b.text() == "复制"]) for r in rows]))
+
+    # 点别人的行 → 复制的必须是别人的 IP（不能错拿成自己的）
+    copied.clear()
+    if len(rows) == 2:
+        [b for b in rows[1].findChildren(QPushButton)
+         if b.text() == "复制"][0].click()
+    mark("点成员行复制到的是该行 IP", copied == [("虚拟 IP", "10.126.126.23")],
+        "复制结果=%r" % (copied,))
+
+    # 点自己的行 → 复制自己的 IP
+    copied.clear()
+    if rows:
+        [b for b in rows[0].findChildren(QPushButton)
+         if b.text() == "复制"][0].click()
+    mark("点自己那行复制到的是自己的 IP",
+         copied == [("虚拟 IP", "10.126.126.11")], "复制结果=%r" % (copied,))
+
+    # 「复制全部」已按需求移除：方法与按钮都不该存在
+    no_all = (not hasattr(page, "_on_copy_all_ips")
+              and not hasattr(page, "btn_copy_all")
+              and not [b for b in page.findChildren(QPushButton)
+                       if b.text() == "复制全部 IP"])
+    mark("「复制全部 IP」已移除（只保留每人单独复制）", no_all,
+        "_on_copy_all_ips=%s btn_copy_all=%s"
+        % (hasattr(page, "_on_copy_all_ips"), hasattr(page, "btn_copy_all")))
+
+    # 清空回到占位态
+    page._clear_members()
+    mark("清空成员后回到占位态",
+        page.members_layout.count() == 0
+        and page.members_count.text() == "0 人",
+        "行数=%d 计数=%r" % (page.members_layout.count(), page.members_count.text()))
+
+    page._copy_text = real_copy
 
 
 
