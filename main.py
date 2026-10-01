@@ -25,6 +25,7 @@ from PySide6.QtWidgets import QApplication
 from autostart import MINIMIZED_FLAG
 from single_instance import SingleInstance
 from ui import VERSION
+from ui import wheel_guard
 from ui.main_window import MainWindow, resource_path, init_theme_from_settings
 from ui.splash import SplashScreen
 
@@ -394,6 +395,10 @@ def main():
     app.setFont(QFont("Microsoft YaHei UI", 9))
 
     install_translations(app)
+
+    # 禁用「选择类控件」上的滚轮改值（下拉框/数字框/滑块）。
+    # 必须持有引用：守卫是 QObject，被 GC 掉过滤器就失效了。
+    _wheel_guard = wheel_guard.install(app)
 
     # 应用图标（源码运行时从 resources 加载，打包后从临时目录加载）
     icon_path = resource_path(os.path.join("resources", "app.ico"))
