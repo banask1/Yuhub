@@ -162,6 +162,7 @@ DEFAULT_DARK = {
     "tile_4": "#a78bfa",
     "tile_5": "#38bdf8",
     "tile_6": "#fb7185",
+    "tile_7": "#6366f1",
 }
 
 DEFAULT_LIGHT = {
@@ -204,6 +205,7 @@ DEFAULT_LIGHT = {
     "tile_4": "#7c3aed",
     "tile_5": "#0284c7",
     "tile_6": "#e11d48",
+    "tile_7": "#4f46e5",
 }
 
 
@@ -261,6 +263,7 @@ SKY_DARK = {
     "tile_4": "#c0a6ff",
     "tile_5": "#6fd8ff",
     "tile_6": "#ff8fa8",
+    "tile_7": "#8b93ff",
     # ---- sky glass 专属键 ----
     # 玻璃边缘高光（描边色）
     "glass_highlight": "rgba(255,255,255,105)",
@@ -312,6 +315,7 @@ SKY_LIGHT = {
     "tile_4": "#8b5cf6",
     "tile_5": "#0ea5e9",
     "tile_6": "#f43f6e",
+    "tile_7": "#6366f1",
     "glass_highlight": "rgba(255,255,255,235)",
     "icon_tile_style": "glass",
     "menu_bg": "rgba(252,253,255,248)",

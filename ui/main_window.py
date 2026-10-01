@@ -25,6 +25,7 @@ from .widgets import show_toast
 from .update_ui import UpdateChecker, UpdateAvailableDialog, UpdateProgressDialog
 from .pages.home_page import HomePage
 from .pages.cleaner_page import CleanerPage
+from .pages.memory_page import MemoryPage
 from .pages.download_page import DownloadPage
 from .pages.lan_page import LanPage
 from .pages.uninstall_page import UninstallPage
@@ -38,6 +39,7 @@ SIDEBAR_COLLAPSED = 76
 NAV_ITEMS = [
     ("home", "🏠", "首页"),
     ("cleaner", "🧹", "C盘清理"),
+    ("memory", "🧠", "内存优化"),
     ("uninstall", "🗑️", "软件卸载"),
     ("download", "⬇️", "多线程下载"),
     ("lan", "🌐", "异地联机"),
@@ -48,6 +50,7 @@ NAV_ITEMS = [
 NAV_TINTS = {
     "home": "tile_1",
     "cleaner": "tile_3",
+    "memory": "tile_7",
     "uninstall": "tile_6",
     "download": "tile_5",
     "lan": "tile_2",
@@ -549,6 +552,7 @@ class MainWindow(QWidget):
         self._pages = {
             "home": make(HomePage),
             "cleaner": make(CleanerPage),
+            "memory": make(MemoryPage),
             "uninstall": make(UninstallPage),
             "download": make(DownloadPage),
             "lan": make(LanPage),

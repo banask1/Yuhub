@@ -18,7 +18,8 @@
 2. **测速不扰民**。全程在后台线程，失败静默降级成「超时」，不弹窗、
    不阻塞进房；单个节点最坏几秒，几个节点并发跑。
 3. **测法要贴近真实链路**。
-     - tcp:// 节点 → 直接 TCP 握手计时（EasyTier 走的就是这条路径，最准）；
+     - tcp:// / ws:// / wss:// 节点 → 直接 TCP 握手计时（EasyTier 走的就是
+       这条路径，最准；ws/wss 也是跑在 TCP 上的）；
      - udp:// 节点 → TCP 端口多半不接，回退系统 ICMP ping 计时（主机往返
        的近似值），并把"TCP 端口不通"如实标出来；
      - 都不通 → 至少给出域名解析结论（解析不出就别指望能连）。
@@ -54,6 +55,17 @@ MAX_WORKERS = 6
 
 PROTO_TCP = "tcp"
 PROTO_UDP = "udp"
+# ws / wss 是 EasyTier 支持的隧道协议（`-p ws://host:11011`），跑在 TCP 之上。
+# 内置节点里就有两条是 WebSocket 的：它们的用途是**穿只放行 HTTP(S) 的受限网络**
+# （公司网、校园网常把非 80/443 的 TCP 直接掐掉）。既然走 TCP，测延迟就照 TCP 测。
+PROTO_WS = "ws"
+PROTO_WSS = "wss"
+
+# 走 TCP 握手的协议。测速方法一模一样，只有 udp 才需要另走 ICMP 兜底。
+TCP_LIKE_PROTOS = (PROTO_TCP, PROTO_WS, PROTO_WSS)
+
+# split_address 认得的全部协议。http:// 之类不在其中——那不是在描述中继节点。
+KNOWN_PROTOS = (PROTO_TCP, PROTO_UDP, PROTO_WS, PROTO_WSS)
 
 # Windows 上不要把控制台窗口弹出来（Yuhub 的既有纪律，见 etier.py 同名常量）
 _CREATE_NO_WINDOW = 0x08000000
@@ -73,15 +85,16 @@ _RE_REPLY = re.compile(r"(的回复)|(reply\s+from)|(bytes=|字节=)", re.I)
 def split_address(addr):
     """把 `tcp://host:11010` 拆成 ("tcp", "host", 11010)。
 
-    解析不出来（空串、只有 auto 占位、缺 host）就返回 None——`auto` 那条
-    不是节点，本来就不该测。
+    认 tcp / udp / ws / wss 四种（就是 EasyTier 的 `-p` 认的那几种隧道协议）。
+    解析不出来（空串、只有 auto 占位、缺 host、不在上述协议里）就返回 None
+    ——`auto` 那条不是节点，`http://` 也不是在描述中继节点，都不该测。
     """
     text = str(addr or "").strip()
     if not text or "://" not in text:
         return None
     scheme, rest = text.split("://", 1)
     proto = scheme.strip().lower()
-    if proto not in (PROTO_TCP, PROTO_UDP):
+    if proto not in KNOWN_PROTOS:
         return None
     rest = rest.strip().strip("/")
     if not rest:
@@ -241,18 +254,19 @@ def probe(key, label, addr, timeout=PROBE_TIMEOUT, now=None,
         return info
     proto, host, port = parsed
 
-    # 1) TCP 握手。tcp:// 节点走的就是这条路径，最贴近 EasyTier 的实际体验。
+    # 1) TCP 握手。tcp:// / ws:// / wss:// 节点走的就是这条路径（后两者也是
+    #    TCP 上的协议），最贴近 EasyTier 的实际体验。
     #    udp:// 节点只试一次：它的同号 TCP 端口开不开纯属巧合，握不上就交给
     #    下面的 ICMP，别为一个"顺便试试"的路径白等两轮超时。
     ms = tcp_rtt_ms(host, port, timeout=timeout,
-                    attempts=2 if proto == PROTO_TCP else 1)
+                    attempts=2 if proto in TCP_LIKE_PROTOS else 1)
     if ms is not None:
         info.update(ms=ms, ok=True, via="tcp")
         return info
 
     # 2) ICMP 兜底。udp:// 节点的同号 TCP 端口通常没开，这时 ping 是唯一
     #    能测到东西的手段；主机往返延迟虽不等于 UDP 中继质量，但足以区分
-    #    "我在美国的 200ms" 和 "国内直连的 20ms"。
+    #    "我在美国的 200ms" 和"国内直连的 20ms"。
     ms = icmp_rtt_ms(host, timeout=timeout, count=ping_count)
     if ms is not None:
         info["ms"] = ms
@@ -260,7 +274,7 @@ def probe(key, label, addr, timeout=PROBE_TIMEOUT, now=None,
         if proto == PROTO_UDP:
             info["ok"] = True
         else:
-            # tcp:// 节点能 ping 通却握不上手 = 中继端口关了/被墙，别让用户
+            # TCP 类节点能 ping 通却握不上手 = 中继端口关了/被墙，别让用户
             # 以为"能 ping 通就能用"，如实标出来（这种情况该换节点）。
             info["error"] = "端口不通"
         return info

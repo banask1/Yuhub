@@ -275,6 +275,22 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- mem-optimize-elevated 模式：提权做一次完整内存优化（同样早返回） ----
+    # memopt.run_elevated_optimize() 会启动
+    # `Yuhub.exe --mem-optimize-elevated <base64-json>`，在管理员权限下清空
+    # 系统备用列表 / 收缩文件缓存，把结果 JSON 原子写回文件。
+    # 必须早返回：提权进程不该抢单例锁，也不该建任何 Qt 界面。
+    if "--mem-optimize-elevated" in sys.argv:
+        idx = sys.argv.index("--mem-optimize-elevated")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import memopt
+            sys.exit(memopt.elevated_optimize_main(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # ---- uninstall-elevated 模式：提权删除受保护位置的软件残留（同样早返回） ----
     # uninstaller.py 的 run_elevated_clean() 会启动
     # `Yuhub.exe --uninstall-elevated <base64-json>`，在管理员权限下删掉
@@ -420,6 +436,38 @@ def main():
         try:
             import node_selftest
             sys.exit(node_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- memory-selftest 模式：无窗口自检「内存优化」----
+    # 用法： Yuhub.exe --memory-selftest <结果json路径>
+    # 这个功能的两条硬承诺（绝不结束任何进程、定时间隔有下限）都不会抛
+    # 异常，坏掉时界面看着完全正常 —— 只能靠断言守住。自检会真的跑一次
+    # 优化并比对前后进程集合，确认前台程序与自身都还活着。
+    if "--memory-selftest" in sys.argv:
+        idx = sys.argv.index("--memory-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import memopt_selftest
+            sys.exit(memopt_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- toast-selftest 模式：无窗口自检「底部提示的堆叠行为」----
+    # 用法： Yuhub.exe --toast-selftest <结果json路径>
+    # 提示叠在同一个坐标上时界面照样"有提示"，只是用户永远只看到最后
+    # 一句 —— 不抛异常、不影响数据，只能靠断言守住。自检会真的弹一批
+    # 提示，比对它们的几何位置、动画是否发生、以及同屏条数上限。
+    if "--toast-selftest" in sys.argv:
+        idx = sys.argv.index("--toast-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import toast_selftest
+            sys.exit(toast_selftest.run(rest[0]))
         except Exception:
             sys.exit(5)
 

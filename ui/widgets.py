@@ -1,6 +1,14 @@
 """Yuhub 通用 UI 组件：开关、卡片、分段选择器、Toast、按钮等。"""
 
-from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QVariantAnimation
+from PySide6.QtCore import (
+    Qt,
+    Signal,
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    QTimer,
+    QVariantAnimation,
+)
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -230,9 +238,112 @@ def info_card(title, desc):
     return card
 
 
+TOAST_MAX = 3            # 同屏最多 3 条，再多就把最旧的一条直接挤掉
+TOAST_GAP = 8            # 相邻两条的间距
+TOAST_BOTTOM = 40        # 最下面那条距窗口底边的高度
+TOAST_SLIDE_MS = 180     # 被顶上来的动画时长
+
+# id(父窗口) -> Toast 列表。下标 0 是最新出现、位置最低的那条
+_TOAST_STACKS = {}
+
+
+def _toast_stack(parent):
+    """取某个父窗口的 Toast 栈，并顺手剔除已经被销毁的条目。
+
+    不直接连 destroyed 信号是因为 Toast 的销毁路径有三条（淡出结束、
+    被挤掉、父窗口关闭），逐个连容易漏；这里用「访问时校验」兜底。
+    """
+    key = id(parent)
+    stack = _TOAST_STACKS.get(key)
+    if stack is None:
+        stack = []
+        _TOAST_STACKS[key] = stack
+        try:
+            parent.destroyed.connect(lambda *_: _TOAST_STACKS.pop(key, None))
+        except Exception:                                 # noqa: BLE001
+            pass
+        return stack
+
+    alive = []
+    for t in stack:
+        try:
+            t.height()          # C++ 对象已销毁时会抛 RuntimeError
+        except RuntimeError:
+            continue
+        alive.append(t)
+    if len(alive) != len(stack):
+        stack[:] = alive
+    return stack
+
+
+def _slide_to(toast, target):
+    """把一条 Toast 平滑移到新位置（被新提示顶上去时用）。"""
+    anim = getattr(toast, "_slide_anim", None)
+    if anim is not None:
+        anim.stop()
+    anim = QPropertyAnimation(toast, b"pos", toast)
+    anim.setDuration(TOAST_SLIDE_MS)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.setStartValue(toast.pos())
+    anim.setEndValue(target)
+    anim.start()
+    toast._slide_anim = anim          # 保住引用，别让动画被回收
+
+
+def _restack(parent, instant=None):
+    """按栈顺序重新摆放所有 Toast 的位置。
+
+    `instant` 指定的那条直接落位 —— 新弹出的提示应该出现在底部，
+    而不是从某个角落滑过来；其余的做平滑上移动画。
+    """
+    stack = _toast_stack(parent)
+    y = parent.height() - TOAST_BOTTOM
+    for t in stack:
+        target_y = y - t.height()
+        pos = QPoint((parent.width() - t.width()) // 2, target_y)
+        if t is instant:
+            t.move(pos)
+        else:
+            _slide_to(t, pos)
+        y = target_y - TOAST_GAP
+
+
+def _drop_toast(parent, toast):
+    """立刻撤掉一条 Toast（被挤掉的），不走淡出。"""
+    stack = _toast_stack(parent)
+    if toast in stack:
+        stack.remove(toast)
+    anim = getattr(toast, "_slide_anim", None)
+    if anim is not None:
+        anim.stop()
+    toast.hide()
+    toast.deleteLater()
+
+
+def _dismiss_toast(parent, toast):
+    """淡出结束后真正移除，并让剩下的补位。"""
+    stack = _toast_stack(parent)
+    if toast in stack:
+        stack.remove(toast)
+        _restack(parent)
+    toast.deleteLater()
+
+
 def show_toast(parent, text, duration=2200):
-    """在父窗口底部中央弹出 Toast 提示并自动淡出。"""
+    """在父窗口底部中央弹出 Toast 提示并自动淡出。
+
+    多条提示**自下而上堆叠**：新的一条从底部出现，把已有的往上顶（带动画），
+    所以连着开关几个选项时每条都能看清。同屏最多 `TOAST_MAX` 条，
+    再多的最旧一条直接消失，避免堆满半个窗口。
+    """
     p = theme.current()
+    stack = _toast_stack(parent)
+
+    # 先腾位置：把多出来的最旧一条（栈顶，也就是最靠上的那条）挤掉，
+    # 保证「加上新的之后」总数不超过上限。
+    while len(stack) >= TOAST_MAX:
+        _drop_toast(parent, stack[-1])
+
     toast = QFrame(parent)
     toast.setObjectName("ToastFrame")
     toast.setStyleSheet(
@@ -250,11 +361,12 @@ def show_toast(parent, text, duration=2200):
     lay.addWidget(lbl)
 
     toast.adjustSize()
-    x = (parent.width() - toast.width()) // 2
-    y = parent.height() - toast.height() - 40
-    toast.move(x, y)
-    toast.raise_()
     toast.show()
+    toast.raise_()
+
+    # 就位：新的这条直接落在底部，已有的整体上移一条
+    stack.insert(0, toast)
+    _restack(parent, instant=toast)
 
     effect = QGraphicsOpacityEffect(toast)
     toast.setGraphicsEffect(effect)
@@ -265,12 +377,16 @@ def show_toast(parent, text, duration=2200):
     fade_in.start()
 
     def _fade_out():
+        anim = getattr(toast, "_slide_anim", None)
+        if anim is not None:
+            anim.stop()
         out = QPropertyAnimation(effect, b"opacity", toast)
         out.setDuration(240)
         out.setStartValue(1.0)
         out.setEndValue(0.0)
-        out.finished.connect(toast.deleteLater)
+        out.finished.connect(lambda: _dismiss_toast(parent, toast))
         out.start()
+        toast._fade_anim = out        # 保住引用
 
     QTimer.singleShot(duration, _fade_out)
 

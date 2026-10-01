@@ -93,6 +93,16 @@ def run(out_file, timeout_sec=120):
             np.split_address("udp://us01.225284.xyz:11010")
             == ("udp", "us01.225284.xyz", 11010),
             np.split_address("udp://us01.225284.xyz:11010"))
+        chk("解析 ws:// 地址（内置节点里有 WebSocket 中继）",
+            np.split_address("ws://et-hk.clickor.click:11011")
+            == ("ws", "et-hk.clickor.click", 11011),
+            np.split_address("ws://et-hk.clickor.click:11011"))
+        chk("解析 wss:// 地址（能穿只放行 443 的网络）",
+            np.split_address("wss://sh.vomiku.com:7912")
+            == ("wss", "sh.vomiku.com", 7912),
+            np.split_address("wss://sh.vomiku.com:7912"))
+        chk("ws/wss 按 TCP 类协议对待（走 TCP 握手，不退回 ICMP）",
+            np.TCP_LIKE_PROTOS == ("tcp", "ws", "wss"), np.TCP_LIKE_PROTOS)
         chk("空地址（auto）不是节点", np.split_address("") is None)
         chk("缺端口的地址不合法", np.split_address("tcp://host") is None)
         chk("未知协议不合法", np.split_address("http://host:80") is None)
@@ -109,6 +119,21 @@ def run(out_file, timeout_sec=120):
             rtt is not None and 0 <= rtt < 3000, rtt)
         chk("TCP 连不上的端口返回 None",
             np.tcp_rtt_ms("127.0.0.1", 1, timeout=0.5, attempts=1) is None)
+
+        # ws:// 节点也是 TCP 上的协议：本地 TCP 服务上应该照样测出延迟，
+        # 而不是因为"不是 tcp:// 开头"就被当成待测/超时。
+        ws_rec = np.probe("wstest", "本地 ws 节点", "ws://127.0.0.1:%d" % port,
+                          timeout=1.0, ping_count=1)
+        chk("★ ws:// 节点能测出延迟（不会因为协议名不同就漏测）",
+            ws_rec.get("ok") and ws_rec.get("via") == "tcp", ws_rec)
+        wss_rec = np.probe("wsstest", "本地 wss 节点",
+                           "wss://127.0.0.1:%d" % port, timeout=1.0, ping_count=1)
+        chk("★ wss:// 节点同理会测（走 TCP 握手）",
+            wss_rec.get("ok") and wss_rec.get("via") == "tcp", wss_rec)
+        ws_bad = np.probe("wsbad", "本地 ws 死端口", "ws://127.0.0.1:1",
+                          timeout=0.5, ping_count=1)
+        chk("ws:// 死端口如实报不可用（不冒充可用）",
+            not ws_bad.get("ok"), ws_bad)
         before = socket.getdefaulttimeout()
         np.resolve_ok("us01.225284.xyz")
         chk("resolve_ok 不改动进程级默认超时（测速在后台线程，全局开关不能碰）",
@@ -330,6 +355,26 @@ def run(out_file, timeout_sec=120):
                 keys[0] == "auto" and not etier.NODE_CHOICES[0][2], keys[0])
             chk("NODE_CHOICES 没有重复 key",
                 len(keys) == len(set(keys)), keys)
+
+            # 自动模式那一池子（PUBLIC_SERVERS）是没被单选的兜底池：
+            # 里面的每条地址也必须解析得出来，否则 EasyTier 会带着一条
+            # 死地址启动，日志里多一堆无意义的连接失败。
+            servers = list(etier.PUBLIC_SERVERS)
+            chk("PUBLIC_SERVERS 每条地址都能解析",
+                all(np.split_address(a) is not None for a in servers), servers)
+            chk("PUBLIC_SERVERS 没有重复",
+                len(servers) == len(set(servers)), servers)
+            chk("★ 自动模式池子够厚（≥8 个，坏一个不影响进房）",
+                len(servers) >= 8, len(servers))
+            # 能进下拉的节点，也必须参与"自动"择优——否则用户手选的那个
+            # 节点在自动模式下反而连不上，行为前后矛盾。
+            pickable = [a for k, _l, a in etier.NODE_CHOICES if a]
+            chk("★ 下拉里的每个节点也都在自动模式的池子里",
+                all(a in servers for a in pickable),
+                [a for a in pickable if a not in servers])
+            chk("★ 至少留一条 WebSocket 中继（受限网络只放行 HTTP(S) 时的唯一出路）",
+                any(a.startswith(("ws://", "wss://")) for a in servers),
+                [a for a in servers if a.startswith(("ws://", "wss://"))])
         except Exception as exc:
             chk("真实节点表可用", False, repr(exc))
     finally:
