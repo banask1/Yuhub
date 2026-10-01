@@ -413,16 +413,38 @@ def _parent_process_name():
 def watchdog_capable(exe_path=None):
     """判断给定程序能否充当 watchdog（即它是不是带 --watchdog 的 Yuhub.exe）。
 
-    源码开发态没有构建产物时，提权启动必然失败，与其让用户看到
-    "进程意外退出"这种误导信息，不如提前识别、给出可操作的提示。
+    ⚠️ 这里**绝对不能**靠"文件名正好等于 Yuhub.exe"来判断。用户从
+    GitHub Release / 浏览器下载后，文件经常被存成 `Yuhub (1).exe`、
+    `Yuhub-v0.8.9beta.exe`，或者自己顺手改了个名。旧逻辑遇到这种情况
+    会把**打包好的正式版**误判成"没有构建"，异地联机一进房间就失败，
+    还给出"请先运行 build.bat 构建"这种把锅甩给用户的提示——他明明是
+    从 Release 下的安装包，看到这句话只会一脸问号。
+
+    真正的判据只有一条：**当前进程是不是打包后的 Yuhub 自己**
+    （`sys.frozen`）。是 → 它必然认识 --watchdog，无条件放行，名字随便叫。
+    否 → 源码开发态，才需要去目录里找构建产物并按名字挡掉 python.exe。
     """
     path = (exe_path or _yuhub_exe_path()) or ""
     if not path or not os.path.isfile(path):
-        return False, "找不到 Yuhub.exe（请先构建，或直接运行打包后的 exe）"
+        return False, "找不到可执行文件（请先构建，或直接运行打包后的 exe）"
+
+    # ---- 打包态：自己就是认识 --watchdog 的那个程序，文件名无关 ----
+    if getattr(sys, "frozen", False):
+        try:
+            same = os.path.samefile(path, sys.executable)
+        except OSError:
+            same = (os.path.abspath(path).lower()
+                    == os.path.abspath(sys.executable or "").lower())
+        if same:
+            return True, path
+
+    # ---- 源码开发态：按名字挑构建产物 ----
+    # （`_yuhub_exe_path()` 在源码态只会返回 Yuhub.exe / dist\Yuhub.exe /
+    #   python.exe 三者之一，所以这里不会误放行无关程序；用 endswith 而非
+    #   等号，是为了兼容用户给构建产物改过名的情况。）
     base = os.path.basename(path).lower()
-    if base == "yuhub.exe":
+    if base.endswith(".exe") and not base.startswith("python"):
         return True, path
-    # 源码态且没有构建产物 —— 明确拒绝，不把 python.exe 当 watchdog 用
     if base.startswith("python"):
         return False, ("当前是源码运行且未找到构建好的 Yuhub.exe，"
                        "无法创建虚拟网卡（提权看门狗需要 Yuhub.exe）。"

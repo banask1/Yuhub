@@ -67,9 +67,11 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
         return 1
 
     # ② watchdog 必须**不是** python.exe（源码态误用会让提权启动静默失败）
+    #    注意：不能要求文件名正好是 Yuhub.exe —— 用户从 Release 下载后
+    #    常被存成 "Yuhub (1).exe" 之类，那依旧是合法的打包产物。
     base = os.path.basename(exe).lower()
-    mark("watchdog 指向 Yuhub.exe 而非 python.exe",
-         base == "yuhub.exe", "实际为 %s" % base)
+    mark("watchdog 指向打包的 exe 而非 python.exe",
+         not base.startswith("python"), "实际为 %s" % base)
 
     # ③ 二进制齐全
     ok_bin, bin_msg = etier.release_binaries()
