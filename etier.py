@@ -704,18 +704,20 @@ class MemberTracker:
     def snapshot(self):
         """当前在线成员，按 IP 排序。UI 线程调用，零阻塞。
 
-        返回 [{"ip", "name", "game", "port", "share"}]。game / port 是对端在
+        返回 [{"ip", "name", "game", "port", "share", "srev"}]。game / port 是对端在
         「游戏快连」里选的那款游戏（由昵称信标一起广播过来），队友的
         成员行据此显示"他在玩什么"，复制按钮也用**他的**端口拼地址。
         share 是对端「临时云盘」的服务端口（0 = 没开 / 旧版本），拉文件
-        清单时直接拿它拼地址，不用先猜再试。
+        清单时直接拿它拼地址，不用先猜再试；srev 是对端云盘清单的版本号，
+        一变就说明对方增删了分享文件（见 NickBeacon.live_shares）。
         """
         with self._lock:
             return [{"ip": ip,
                      "name": (p.get("name") or ""),
                      "game": (p.get("game") or ""),
                      "port": int(p.get("port") or 0),
-                     "share": int(p.get("share") or 0)}
+                     "share": int(p.get("share") or 0),
+                     "srev": int(p.get("srev") or 0)}
                     for ip, p in sorted(self._peers.items())]
 
     # ------------------------------------------------ 后台线程主体
@@ -741,7 +743,8 @@ class MemberTracker:
             for ip in arp:
                 p = self._peers.setdefault(
                     ip, {"confirmed": now, "ping_fail": 0,
-                         "name": "", "game": "", "port": 0, "share": 0})
+                         "name": "", "game": "", "port": 0, "share": 0,
+                         "srev": 0})
                 p["confirmed"] = now
                 p["ping_fail"] = 0
         # ② 逐个 ping：保活 ARP + 主动确认活性
@@ -832,10 +835,18 @@ class MemberTracker:
                     share = int(info.get("share") or 0)
                 except (TypeError, ValueError):
                     share = 0
+                try:
+                    srev = int(info.get("srev") or 0)
+                except (TypeError, ValueError):
+                    srev = 0
                 # 信标里带 share 键才更新：旧版客户端不广播这个键，
                 # 此时保持原值（0），不会把"已知道对方开着云盘"给冲掉。
                 if "share" in info:
                     cur["share"] = share
+                    # 版本号同理：老对端可能只发 share 不发 srev，那就保持原值，
+                    # 免得把已知的版本号冲成 0 造成一次假的重拉。
+                    if "srev" in info:
+                        cur["srev"] = srev
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +878,11 @@ _NICK_PORT = "port"
 # 「临时云盘」的服务端口。0 / 缺省 = 这个人没开云盘（或用了旧版本），
 # 对端就不用白试一次连接。同样不升协议版本——多一个键对旧版透明。
 _NICK_SHARE = "share"
+# 云盘清单的**版本号**：分享者对「我分享的文件」每做一次增删就 +1。
+# 为什么要它：HTTP 接口是只读的，对端没法被"推"一把，只能轮询；有了
+# 版本号，对端一看数字变了就知道"对方刚动了文件"，立刻重拉一次清单，
+# 而不是傻等下一个 3 秒周期——"谁上传/取消分享，所有人都刷新一次"。
+_NICK_SHARE_REV = "srev"
 
 
 class NickBeacon:
@@ -877,12 +893,14 @@ class NickBeacon:
     TCP_QUERY_TIMEOUT = 1.0      # TCP 查询超时
     TCP_FAIL_BACKOFF = 30.0      # TCP 查询失败后的重试间隔（秒）
 
-    def __init__(self, my_ip, nick, on_log=None, game="", port=0, share=0):
+    def __init__(self, my_ip, nick, on_log=None, game="", port=0, share=0,
+                 share_rev=0):
         self._my_ip = my_ip
         self._nick = (nick or "").strip()[:32]
         self._game = (game or "").strip()[:24]
         self._port = int(port or 0)
         self._share = int(share or 0)
+        self._share_rev = int(share_rev or 0)
         self._on_log = on_log or (lambda msg: None)
         self._stop_evt = threading.Event()
         self._wake = threading.Event()      # 打断广播间隔（切换游戏后立刻广播）
@@ -922,11 +940,67 @@ class NickBeacon:
             self._port = int(port or 0)
         self._wake.set()
 
-    def set_share(self, port):
-        """更新本机广播的「临时云盘」端口（0 = 关闭）。同样立刻踢一次广播。"""
+    def set_share(self, port, rev=None):
+        """更新本机广播的「临时云盘」端口（0 = 关闭）与清单版本号。
+
+        立刻踢一次广播，队友最多 1 秒就看到变化。rev 就是"我动过分享清单"
+        的信号——绑定新端口、每加一个文件、每取消一个文件都会 +1。
+        """
         with self._lock:
             self._share = int(port or 0)
+            if rev is not None:
+                self._share_rev = int(rev)
         self._wake.set()
+
+    def announce_now(self, times=2):
+        """**同步**把当前报文广播出去（不等后台线程的下一个周期）。
+
+        用途是"临别通知"：退出房间前先把 share 置 0 再调它，队友那边立刻
+        知道"这个人的云盘关了"，把他分享的文件从列表里撤下来。不这么做就
+        只能等对端 HTTP 轮询超时——那要好几秒，用户会以为"人都走了文件还挂着"。
+        """
+        with self._lock:
+            if not self._nick:
+                return
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            return
+        try:
+            payload = self._payload()
+            for _ in range(max(1, int(times))):
+                try:
+                    sock.sendto(payload, (VIRTUAL_NET_PREFIX + "255", NICK_PORT))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def live_shares(self):
+        """{ip: (云盘端口, 清单版本号)}：信标缓存里各成员此刻的云盘状态。
+
+        只认**新鲜期内**的记录——信标缓存是 UDP 收到就写，比对端的成员跟踪
+        快一拍（跟踪器每 3 秒才回收一次），所以界面拿它判"对方刚动了文件"
+        最灵敏。端口为 0 表示"对方没开云盘 / 刚关掉"。
+        """
+        now = time.monotonic()
+        out = {}
+        with self._lock:
+            for ip, hit in self._peers.items():
+                if float(hit.get("until") or 0.0) <= now:
+                    continue
+                info = hit.get("info") or {}
+                out[ip] = (int(info.get("share") or 0),
+                           int(info.get("srev") or 0))
+        return out
 
     def get_info(self, ip, timeout=None):
         """查某虚拟 IP 的 {"name","game","port"}。
@@ -962,6 +1036,7 @@ class NickBeacon:
         """当前要广播的报文（每次现取，所以切换游戏/开关云盘后立刻生效）。"""
         with self._lock:
             nick, game, port, share = self._nick, self._game, self._port, self._share
+            srev = self._share_rev
         d = {_NICK_MAGIC: nick}
         if game:
             d[_NICK_GAME] = game
@@ -969,6 +1044,9 @@ class NickBeacon:
             d[_NICK_PORT] = int(port)
         if share:
             d[_NICK_SHARE] = int(share)
+            # 版本号只在开着云盘时有意义：关了就是"没有清单"，对端看键消失
+            # 一样会当成"他关云盘了"，不必再传一个 0 去占字节。
+            d[_NICK_SHARE_REV] = int(srev)
         return json.dumps(d, ensure_ascii=False).encode("utf-8")
 
     # ------------------------------------------------ 内部：三个小线程
@@ -1075,7 +1153,8 @@ class NickBeacon:
 
     @staticmethod
     def _parse_info(data):
-        """解析信标报文 → {"name","game","port"}；不是本协议的报文返回 None。"""
+        """解析信标报文 → {"name","game","port","share","srev"}；
+        不是本协议的报文返回 None。"""
         try:
             d = json.loads((data or b"").decode("utf-8"))
         except Exception:
@@ -1090,11 +1169,16 @@ class NickBeacon:
             share = int(d.get(_NICK_SHARE) or 0)
         except (TypeError, ValueError):
             share = 0
+        try:
+            srev = int(d.get(_NICK_SHARE_REV) or 0)
+        except (TypeError, ValueError):
+            srev = 0
         return {
             "name": str(d.get(_NICK_MAGIC) or "").strip()[:32],
             "game": str(d.get(_NICK_GAME) or "").strip()[:24],
             "port": port,
             "share": share,
+            "srev": srev,
         }
 
 

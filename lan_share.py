@@ -444,15 +444,28 @@ class ShareClient:
                     pass
 
     def download(self, fid, dest_dir=None, progress=None, is_cancelled=None,
-                 timeout=15.0):
+                 timeout=15.0, dest_path=None):
         """下载一个文件。返回 (成功, 落盘路径 或 错误说明)。
 
         progress(done, total) 会被频繁调用（每个分块一次），调用方自己节流。
         is_cancelled() 返回真时中断并删掉半成品（.part）。
+
+        dest_path 给了就**严格存到那个路径**（用户在保存对话框里选的，
+        重名他已经在系统对话框里确认过覆盖了，这里不能再自作主张改名）；
+        没给才退回 dest_dir + 去重命名的老行为（自检等无人值守场景用）。
         """
         if not self.ip or not self.port:
             return False, "对方未开启云盘"
-        dest_dir = dest_dir or download_dir()
+        if dest_path:
+            dest = os.path.abspath(str(dest_path))
+            parent = os.path.dirname(dest)
+            if parent:
+                try:
+                    os.makedirs(parent, exist_ok=True)
+                except OSError as exc:
+                    return False, "保存位置不可用：%s" % exc
+        else:
+            dest = ""
         conn = None
         tmp = None
         try:
@@ -464,7 +477,8 @@ class ShareClient:
                 return False, "对方返回 HTTP %d" % resp.status
             name = _name_from_disposition(resp.getheader("Content-Disposition"))
             total = int(resp.getheader("Content-Length") or 0)
-            dest = unique_path(dest_dir, name)
+            if not dest:
+                dest = unique_path(dest_dir or download_dir(), name)
             tmp = dest + ".part"
             done = 0
             with open(tmp, "wb") as f:
@@ -605,7 +619,7 @@ class ShareHub:
         return out
 
     def download(self, ip, port, fid, dest_dir=None, progress=None,
-                 is_cancelled=None, timeout=15.0):
+                 is_cancelled=None, timeout=15.0, dest_path=None):
         return ShareClient(ip, int(port or 0), self._token, timeout=timeout).download(
             fid, dest_dir=dest_dir, progress=progress,
-            is_cancelled=is_cancelled, timeout=timeout)
+            is_cancelled=is_cancelled, timeout=timeout, dest_path=dest_path)

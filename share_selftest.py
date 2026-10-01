@@ -137,6 +137,20 @@ def run(out_file, timeout_sec=60):
             not [f for f in os.listdir(dst) if f.endswith(".part")],
             os.listdir(dst))
 
+        # 用户自选保存位置（v0.8.14beta）：界面上每次下载都会先弹保存对话框，
+        # 这里验证"对话框选了什么就存到哪"——**连重名都不许改名**，因为
+        # 覆盖确认是系统对话框自己问过的，我们再自作主张加 (1) 就是骗人。
+        chosen = os.path.join(dst, "自定义名字.bin")
+        okd, pathd = cli.download(target["id"], dest_path=chosen)
+        chk("★ 下载能落到用户指定的路径（每次下载自选位置）",
+            okd and pathd == os.path.abspath(chosen), (okd, pathd))
+        chk("指定路径重名也不改名（覆盖已在系统对话框确认过）",
+            os.path.isfile(chosen)
+            and not os.path.exists(os.path.join(dst, "自定义名字 (1).bin")),
+            os.listdir(dst))
+        chk("指定路径下载内容一致",
+            open(chosen, "rb").read() == payload, chosen)
+
         # 取消：第 3 个分块后中断
         state = {"n": 0}
 
@@ -179,26 +193,52 @@ def run(out_file, timeout_sec=60):
         try:
             import etier
             b = etier.NickBeacon("10.126.126.9", "Bob", game="泰拉瑞亚",
-                                 port=7777, share=41777)
+                                 port=7777, share=41777, share_rev=5)
             info = etier.NickBeacon._parse_info(b._payload())
             chk("信标报文带上云盘端口",
                 info.get("share") == 41777, info)
+            chk("★ 信标报文带上清单版本号（对端据此知道对方刚动过文件）",
+                info.get("srev") == 5, info)
             b.set_share(0)
             info2 = etier.NickBeacon._parse_info(b._payload())
             chk("关闭云盘后不再广播该键（对端不必白试连接）",
                 not info2.get("share") and info2.get("name") == "Bob", info2)
+            chk("关闭云盘后版本号也一并收起", not info2.get("srev"), info2)
+
+            # 实时状态表：只看新鲜期内的记录，过期的不参与判断
+            b._peers.clear()
+            b._peers["10.126.126.7"] = {
+                "info": {"share": 41800, "srev": 12},
+                "until": time.monotonic() + 10}
+            b._peers["10.126.126.6"] = {
+                "info": {"share": 41801, "srev": 1},
+                "until": time.monotonic() - 1}
+            live = b.live_shares()
+            chk("★ 实时状态表只给新鲜记录（过期的不能拿来判断）",
+                list(live) == ["10.126.126.7"], live)
+            chk("实时状态表同时给出端口与版本号",
+                live.get("10.126.126.7") == (41800, 12), live)
+            # 临别广播：没启动线程时也不能炸（退出房间路径上会调）
+            b.set_share(0)
+            b.announce_now()
+            chk("★ 临别广播（退出房间前同步发一次）不依赖后台线程",
+                True, "已调用")
+
             old = json.dumps({"yuhub-nick-v1": "OldBob", "game": "饥荒联机版",
                               "port": 10999}).encode("utf-8")
             info3 = etier.NickBeacon._parse_info(old)
             chk("旧版报文仍能解析（新旧客户端可同房）",
-                info3.get("name") == "OldBob" and info3.get("share") == 0, info3)
+                info3.get("name") == "OldBob" and info3.get("share") == 0
+                and info3.get("srev") == 0, info3)
             tr = etier.MemberTracker("10.126.126.9")
             tr._peers["10.126.126.8"] = {"confirmed": time.monotonic(),
                                          "ping_fail": 0, "name": "", "game": "",
-                                         "port": 0, "share": 0}
+                                         "port": 0, "share": 0, "srev": 0}
             snap = tr.snapshot()
             chk("成员快照带上 share 字段（UI 直接拿它拼地址）",
                 bool(snap) and "share" in snap[0], snap)
+            chk("成员快照带上 srev 字段（UI 据此判断要不要立刻重拉）",
+                bool(snap) and "srev" in snap[0], snap)
         except Exception as exc:
             chk("信标协议扩展可用", False, repr(exc))
     finally:

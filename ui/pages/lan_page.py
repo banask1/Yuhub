@@ -19,8 +19,7 @@ import subprocess
 import threading
 import time
 
-from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt, QSettings, QStandardPaths, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -106,11 +105,16 @@ MAX_DROP_FILES = 50
 
 
 class _DropZone(QFrame):
-    """临时云盘的文件投放区：拖文件（或文件夹）进来即分享。
+    """临时云盘的文件投放区：拖文件（或文件夹）进来即分享，点一下选文件。
 
     做成独立控件而不是给卡片挂拖拽事件：拖拽事件要落在"一块明确的区域"
     上，而且得能自己高亮——悬停时把边框换成主色，用户才知道松手会落到
     这里。用 QFrame 是因为要同时控制边框样式和子标签文字。
+
+    点击：两个子标签都设了 WA_TransparentForMouseEvents。它们本来是
+    "点上去什么都不发生"的装饰，但鼠标事件会先落到标签上——尽管 Qt 默认
+    会把没被处理的按下事件冒泡给父控件，这条路径在带文本选择的标签上并
+    不总是成立。让标签对鼠标彻底透明，点在哪块区域都一定落到本控件上。
     """
 
     dropped = Signal(list)      # 本地绝对路径列表
@@ -121,7 +125,9 @@ class _DropZone(QFrame):
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumHeight(70)
+        self.setToolTip("把文件 / 文件夹拖到这里分享；也可以直接点一下选文件")
         self._active = False
+        self._armed = False      # 房间已开启（拖拽/点击才真的能用）
 
         v = QVBoxLayout(self)
         v.setContentsMargins(12, 10, 12, 10)
@@ -131,23 +137,39 @@ class _DropZone(QFrame):
         self.sub = QLabel("也可以点这里选文件")
         self.sub.setAlignment(Qt.AlignCenter)
         self.sub.setWordWrap(True)
+        for lb in (self.title, self.sub):
+            lb.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         v.addWidget(self.title)
         v.addWidget(self.sub)
         self.restyle()
 
     def restyle(self, *_):
-        """跟随主题重画（拖拽高亮也走这里）。"""
+        """跟随主题重画（拖拽高亮/未进房间的灰态也走这里）。"""
         p = theme.current()
-        line = p["accent"] if self._active else p["border_strong"]
-        bg = p["accent_soft"] if self._active else p["surface_sunken"]
+        if self._active:
+            line, bg = p["accent"], p["accent_soft"]
+        elif self._armed:
+            line, bg = p["border_strong"], p["surface_sunken"]
+        else:
+            line, bg = p["border"], p["surface_sunken"]
         self.setStyleSheet(
             "QFrame { background: %s; border: 1px dashed %s;"
             " border-radius: 6px; }"
             "QLabel { background: transparent; border: none; }" % (bg, line))
+        if self._active:
+            title_color = p["accent"]
+        else:
+            title_color = p["text"] if self._armed else p["text_faint"]
         self.title.setStyleSheet(
-            "font-size: 12px; font-weight: 700; color: %s;"
-            % (p["accent"] if self._active else p["text"]))
+            "font-size: 12px; font-weight: 700; color: %s;" % title_color)
         self.sub.setStyleSheet("font-size: 11px; color: %s;" % p["text_faint"])
+
+    def set_armed(self, flag):
+        """房间开启状态。没进房间时画成灰的，但**照样能点**——点了会给出
+        "先点进入房间"的提示。比一个点不动的灰块有用：用户至少知道该干嘛。"""
+        if bool(flag) != self._armed:
+            self._armed = bool(flag)
+            self.restyle()
 
     # ------------------------------------------------------------ 拖拽
     def _set_active(self, flag):
@@ -233,6 +255,9 @@ class LanPage(BasePage):
         self._share_peer_ports = {}   # ip -> 对方云盘端口
         self._share_polling = False   # 上一轮清单还没拉完，别叠加
         self._share_peers = {}        # ip -> 昵称（渲染来源用）
+        self._share_rev = 0           # 我这份清单的版本号（增删文件就 +1）
+        self._share_seen = {}         # ip -> (端口, 版本号)：上一拍看到的状态
+        self._refresh_paused = False  # 模态框开着时挂起自动刷新
         self._download = None         # {"key","name"} 正在下载的那一项
         self._cancel_dl = False       # 下载取消标志（后台线程读）
         # 节点测速（方案 A）：结果带时间戳存这里，过期就重测、绝不复用旧数字
@@ -427,8 +452,8 @@ class LanPage(BasePage):
         self.btn_node_speed.setFixedHeight(26)
         self.btn_node_speed.setToolTip(
             "并发测一遍所有内置节点的延迟，按快的排前面。\n"
-            "打开本页会自带一次，之后每 90 秒自动重测——\n"
-            "下拉里的数字永远是刚测的，不会拿旧的糊弄你。")
+            "每次打开本页会自动测一次；页面开着的时候想更新，\n"
+            "点这里就好（不会偷偷定时重测占带宽）。")
         self.btn_node_speed.clicked.connect(lambda: self._start_node_probe(force=True))
         r3.addWidget(self.btn_node_speed)
 
@@ -694,20 +719,11 @@ class LanPage(BasePage):
         self.share_count.setObjectName("Muted")
         self.share_count.setStyleSheet("font-size: 11px;")
         head.addWidget(self.share_count)
-        self.btn_share_dir = QPushButton("打开文件夹")
-        self.btn_share_dir.setObjectName("MiniButton")
-        self.btn_share_dir.setCursor(Qt.PointingHandCursor)
-        self.btn_share_dir.setFixedHeight(26)
-        self.btn_share_dir.setToolTip(
-            "打开下载文件的保存位置：\n" + lan_share.download_dir())
-        self.btn_share_dir.clicked.connect(self._on_open_share_dir)
-        head.addWidget(self.btn_share_dir)
         v.addLayout(head)
 
         self.drop_zone = _DropZone()
         self.drop_zone.dropped.connect(self._on_share_paths)
         self.drop_zone.clicked.connect(self._on_share_pick)
-        self.drop_zone.setEnabled(False)
         v.addWidget(self.drop_zone)
 
         self.share_hint = QLabel(
@@ -832,8 +848,11 @@ class LanPage(BasePage):
         if self._running and self._hub is not None and self._hub.running:
             others = sum(len(f) for f in (self._share_remote or {}).values())
             self.share_hint.setText(
-                "云盘已开启：拖文件进来，队友就能下载。已看到队友分享的 %d 个文件。\n"
-                "退出房间后服务立即关闭，之后谁都下不到。" % others)
+                "云盘已开启：拖文件进来（或点一下这里选文件），队友就能下载；"
+                "已看到队友分享的 %d 个文件。\n"
+                "下载时每次都会让你选保存位置。队友退出房间或取消分享，"
+                "他那些文件会立刻从这里消失。\n"
+                "你退出房间后服务立即关闭，之后谁都下不到。" % others)
 
     def _render_share(self, entries):
         while self.share_layout.count():
@@ -851,23 +870,84 @@ class LanPage(BasePage):
         self.share_box.setVisible(bool(entries))
 
     # ------------------------------------------------------------ 云盘：交互
-    def _on_open_share_dir(self):
-        """打开下载目录（没下载过也要能打开，方便用户自己放文件进去看）。"""
-        path = lan_share.download_dir()
+    def _pause_refresh(self):
+        """打开模态框期间停掉 3 秒一轮的云盘轮询。
+
+        为什么必须停：轮询回来会重建整个文件列表，把用户**此刻正点的那个
+        按钮** deleteLater 掉，而模态对话框自己转事件循环，那条"延迟删除"
+        会在对话框还开着的时候就真被执行——按钮在信号处理过程中被销毁。
+        停表是最省心的规避（列表本来就没人看得到，它在模态框底下）。
+        """
+        self._refresh_paused = True
         try:
-            os.makedirs(path, exist_ok=True)
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-        except Exception as exc:
-            self.toast("打不开文件夹：%s" % exc)
+            self._share_timer.stop()
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _resume_refresh(self):
+        """恢复自动轮询，并**立刻补一次**——停表期间对方可能已经动了文件。"""
+        self._refresh_paused = False
+        try:
+            self._share_timer.start()
+        except (AttributeError, RuntimeError):
+            pass
+        self._poll_shares()
+
+    def _last_dir(self, key, fallback):
+        """从设置里取上次用过的目录（不存在就退回 fallback）。"""
+        try:
+            saved = str(self._settings.value(key, "") or "")
+        except Exception:
+            saved = ""
+        if saved and os.path.isdir(saved):
+            return saved
+        return fallback
+
+    def _ask_save_path(self, name):
+        """弹保存对话框，返回用户选的绝对路径；取消返回 ""。
+
+        **每次下载都问一遍**：临时云盘下的是别人电脑上的文件，落地到哪
+        只有用户自己清楚（有人要扔桌面、有人要塞 D 盘、有人只想先看一眼）。
+        默认目录记住上次选的那个，省得每次都从"文档"翻起。
+        """
+        default_dir = QStandardPaths.writableLocation(
+            QStandardPaths.DownloadLocation) or os.path.expanduser("~")
+        start_dir = self._last_dir("share_save_dir", default_dir)
+        suggested = os.path.join(start_dir, lan_share.safe_name(name))
+        self._pause_refresh()
+        try:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "选择保存位置", suggested, "所有文件 (*)")
+        finally:
+            self._resume_refresh()
+        path = str(path or "")
+        if path:
+            try:
+                self._settings.setValue("share_save_dir", os.path.dirname(path))
+            except Exception:
+                pass
+        return path
 
     def _on_share_pick(self):
-        """点击拖拽区 = 打开文件选择框。"""
+        """点击拖拽区 = 打开文件选择框（可多选）。"""
         if not (self._running and self._hub is not None):
             self.toast("先点「进入房间」，云盘才会开启")
             return
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择要分享给房间成员的文件", "", "所有文件 (*)")
+        start_dir = self._last_dir(
+            "share_pick_dir", os.path.expanduser("~"))
+        self._pause_refresh()
+        try:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "选择要分享给房间成员的文件", start_dir, "所有文件 (*)")
+        finally:
+            self._resume_refresh()
+        paths = list(paths or [])
         if paths:
+            try:
+                self._settings.setValue(
+                    "share_pick_dir", os.path.dirname(paths[0]))
+            except Exception:
+                pass
             self._on_share_paths(paths)
 
     def _on_share_paths(self, paths):
@@ -900,7 +980,12 @@ class LanPage(BasePage):
             self._append_log("已分享 %d 个文件：%s%s" % (len(added), names, more))
         elif skipped:
             self.toast("没有新增文件：%s" % skipped[0])
-        self._publish_share_port()
+        if added:
+            # 分享清单变了：版本号 +1 并立刻广播，再自己重拉一次。
+            # 队友的信标缓存是"收到就写"，所以它们大约 1 秒内就会看到版本号
+            # 变化并立刻重拉清单——这就是"每次上传文件，所有人都刷新一次"。
+            self._bump_share_rev()
+            self._poll_shares()
         self._refresh_share_view()
 
     def _on_share_action(self, entry):
@@ -913,7 +998,9 @@ class LanPage(BasePage):
                 return
             self._hub.remove(entry["fid"])
             self._append_log("已取消分享：%s" % entry["name"])
-            self._publish_share_port()
+            # 取消分享同样要让所有人立刻刷新（队友那边这一行要马上消失）
+            self._bump_share_rev()
+            self._poll_shares()
             self._refresh_share_view()
             return
 
@@ -934,10 +1021,17 @@ class LanPage(BasePage):
         hub = self._hub
         if hub is None:
             return
+        # 先让用户挑保存位置（取消就什么都不做，连请求都不发）
+        dest = self._ask_save_path(entry["name"])
+        if not dest:
+            self._append_log("已取消下载：%s" % entry["name"])
+            self.toast("已取消下载")
+            return
         key = entry["key"]
         self._download = {"key": key, "name": entry["name"]}
         self._cancel_dl = False
-        self._append_log("开始下载 %s（来自 %s）…" % (entry["name"], entry["owner"]))
+        self._append_log("开始下载 %s（来自 %s）→ %s"
+                         % (entry["name"], entry["owner"], dest))
         last = [0.0]
         ip, port, fid = entry["ip"], entry["port"], entry["fid"]
 
@@ -951,7 +1045,7 @@ class LanPage(BasePage):
         def work():
             ok, res = hub.download(ip, port, fid, progress=prog,
                                    is_cancelled=lambda: self._cancel_dl,
-                                   timeout=20.0)
+                                   timeout=20.0, dest_path=dest)
             self._event.emit("share_done",
                              {"key": key, "ok": ok, "result": res,
                               "name": entry["name"]})
@@ -960,14 +1054,23 @@ class LanPage(BasePage):
         self._refresh_share_view()
 
     def _publish_share_port(self):
-        """把云盘端口写进昵称信标，队友的成员列表下一轮就知道我开着云盘。"""
+        """把云盘端口 + 清单版本号写进昵称信标。
+
+        队友的成员列表下一轮就知道我开着云盘；版本号则是"我动过分享清单"
+        的信号，对端据此立刻重拉一次（见 etier._NICK_SHARE_REV）。
+        """
         if self._beacon is None:
             return
         port = self._hub.port if (self._hub is not None and self._hub.running) else 0
         try:
-            self._beacon.set_share(port)
+            self._beacon.set_share(port, self._share_rev)
         except Exception:
             pass
+
+    def _bump_share_rev(self):
+        """分享清单变了（上传/取消）：版本号 +1 并立刻广播出去。"""
+        self._share_rev = int(self._share_rev) + 1
+        self._publish_share_port()
 
     def _ensure_share_hub(self, ip):
         """按当前虚拟 IP 起（或重绑）云盘服务。
@@ -1010,10 +1113,16 @@ class LanPage(BasePage):
                 pass
         if self._beacon is not None:
             try:
+                # 先把"我关了云盘"写进报文，再**同步**广播一次——别指望后台
+                # 广播线程：它马上就会被 _stop_room_threads 停掉，很可能一个
+                # 包都没发出去。队友收到这条就知道该把我分享的文件撤下来，
+                # 不用等它们的 HTTP 轮询超时（那要好几秒）。
                 self._beacon.set_share(0)
+                self._beacon.announce_now()
             except Exception:
                 pass
         self._share_rows = []
+        self._share_seen = {}
         try:
             # 关闭路径（退出程序）上控件可能已在销毁中，刷新失败不该再抛
             self._refresh_share_view()
@@ -1022,18 +1131,29 @@ class LanPage(BasePage):
 
     def _poll_shares(self):
         """每 3 秒拉一次各成员的云盘清单（网络操作，必须丢后台线程）。"""
+        if self._refresh_paused:
+            return                     # 模态框开着，先别重建列表
         if not self._running or self._hub is None or not self._hub.running:
             return
         if self._share_polling:
             return                     # 上一轮还没回来，别叠加请求
         hub = self._hub
+        # 端口优先用信标缓存里的：它比成员跟踪器早一拍拿到（跟踪器 3 秒
+        # 才回收一次），对方刚开的云盘不用等下一轮跟踪才被发现。
+        try:
+            live = self._beacon.live_shares() if self._beacon is not None else {}
+        except Exception:
+            live = {}
         peers, ports, names = [], {}, {}
         for m in (self._tracker.snapshot() if self._tracker else []):
             ip = m.get("ip") or ""
             if not ip or ip == self._my_ip:
                 continue
             names[ip] = m.get("name") or ip
-            port = int(m.get("share") or 0)
+            if ip in live:
+                port = int(live[ip][0] or 0)     # 信标说关了就是关了，别拿旧值
+            else:
+                port = int(m.get("share") or 0)
             if port:
                 ports[ip] = port
                 peers.append({"ip": ip, "port": port})
@@ -1048,6 +1168,60 @@ class LanPage(BasePage):
                              {"res": res, "ports": ports, "names": names})
 
         threading.Thread(target=work, daemon=True, name="SharePoll").start()
+
+    def _share_watch(self):
+        """云盘"现在就该刷新"的判定（每一拍跑一次，不发任何网络请求）。
+
+        两件事，都是为了让列表**当场**跟上现实，而不是等 3 秒的轮询周期：
+
+          1. 对方信标里的版本号变了 → 他刚上传或取消了一个分享文件，
+             马上重拉一次他的清单。（"谁传文件/取消分享，所有人都刷新一次"）
+          2. 对方的云盘端口变成 0（他关了云盘）、或者他人已经不在成员列表
+             里了（退出房间 / 掉线）→ 当场把他分享的文件行撤下来。
+             （"分享的人退出房间，文件直接从分享列表里消失"）
+        """
+        if not (self._running and self._hub is not None and self._hub.running):
+            self._share_seen = {}
+            return
+        try:
+            members = self._tracker.snapshot() if self._tracker else []
+        except Exception:
+            members = []
+        marks, online = {}, set()
+        for m in members:
+            ip = m.get("ip") or ""
+            if not ip or ip == self._my_ip:
+                continue
+            online.add(ip)
+            marks[ip] = int(m.get("share") or 0)
+        try:
+            live = self._beacon.live_shares() if self._beacon is not None else {}
+        except Exception:
+            live = {}
+
+        # ⑵ 掉线 / 关了云盘 → 立刻撤行
+        changed = False
+        for ip in list(self._share_remote):
+            port = live[ip][0] if ip in live else marks.get(ip, 0)
+            if ip not in online or not port:
+                self._share_remote.pop(ip, None)
+                self._share_peer_ports.pop(ip, None)
+                self._share_seen.pop(ip, None)
+                changed = True
+        # ⑴ 版本号变了 → 立刻重拉
+        need_poll = False
+        for ip in sorted(online):
+            state = live.get(ip) or (marks.get(ip, 0), 0)
+            if self._share_seen.get(ip) != state:
+                need_poll = True
+            self._share_seen[ip] = state
+        for ip in list(self._share_seen):
+            if ip not in online:
+                self._share_seen.pop(ip, None)
+        if changed:
+            self._refresh_share_view()
+        if need_poll:
+            self._poll_shares()
 
     def _on_share_poll(self, payload):
         payload = payload or {}
@@ -1147,9 +1321,10 @@ class LanPage(BasePage):
             "Windows 防火墙若弹窗，允许即可，否则隧道建不起来。\n"
             "房间码 + 密码双重校验，密码不落盘、不明文传输，停止后即从内存清除。\n"
             "\n"
-            "临时云盘：进房后把文件拖进「临时云盘」的框里，同房间的人就能下载。\n"
-            "文件只在你自己的电脑上，不经任何服务器；退出房间服务即关闭，\n"
-            "之后谁都下不到（已下载到本地的不受影响）。\n"
+            "临时云盘：进房后把文件拖进「临时云盘」的框里（或点一下那个框选文件），\n"
+            "同房间的人就能下载，下载时各自选自己要存的位置。\n"
+            "文件只在你自己的电脑上，不经任何服务器；谁退出房间、谁取消分享，\n"
+            "他那份文件都会立刻从所有人的列表里消失。\n"
             "\n"
             "备注：神力科莎用 acServer 开服后走游戏内 LAN 列表，或直接填 IP:9600；\n"
             "以撒的结合不支持局域网联机（只能同屏或走 Steam 在线），列表里只是提醒。",
@@ -1202,9 +1377,12 @@ class LanPage(BasePage):
         addr_of = {k: a for k, _l, a in etier.NODE_CHOICES}
         # 首屏还没测过：保持裸标签，别一开页就是一列「（待测）」
         missing = "待测" if self._probe.has_data() else None
+        # keep_stale + TTL_NEVER：数字一直显示，过期与否只由旁边的
+        # 「延迟数据：x 分钟前」说明。现在没有定时重测了，若还按 TTL 过滤，
+        # 用户在这一页停留 90 秒后整列会突然变回「待测」——像是数据丢了。
         decorated = node_probe.decorate_choices(
-            etier.NODE_CHOICES, self._probe.results(now=now),
-            missing_text=missing)
+            etier.NODE_CHOICES, self._probe.results(now=now, keep_stale=True),
+            missing_text=missing, ttl=node_probe.TTL_NEVER)
         self.node_combo.blockSignals(True)
         try:
             self.node_combo.clear()
@@ -1262,9 +1440,9 @@ class LanPage(BasePage):
     def _start_node_probe(self, force=False):
         """起一轮节点测速（后台线程）。
 
-        force=False 时只在数据过期 / 从没测过时才真跑——所以它可以被
-        800ms 的 _tick 反复调用而不产生任何开销，也就不会出现"忘了刷新"
-        这种状态：只要数字变旧，下一拍就会自己去测。
+        现在的触发点只有两个：**点进这一页**（on_shown）和**手点「测速」**，
+        两处都走 force=True。force=False 的分支留给"将来想按需补测"的
+        调用方（比如数据从未测过时），保留是为了不把这个开关写死。
         """
         if self._probing:
             return
@@ -1323,14 +1501,15 @@ class LanPage(BasePage):
 
         刻意不做成"测完就完事"：延迟会变（切网、节点拥塞、自己从国内
         飞到国外），用户有权知道眼前的数字是几秒前的还是半小时前的。
+        v0.8.14beta 起不再自动重测，所以数据放旧时要把"怎么更新"一起说出来。
         """
         age = self._probe.age()
         if age is None:
             text = "还没测过，点「测速」"
         elif self._probing:
-            text = "正在重测…（上次 %s）" % node_probe.age_text(age)
-        elif self._probe.is_stale():
-            text = "延迟数据已过期（%s），马上重测…" % node_probe.age_text(age)
+            text = "正在测速…"
+        elif age > node_probe.TTL_SECONDS:
+            text = "延迟数据：%s（点「测速」更新）" % node_probe.age_text(age)
         else:
             text = "延迟数据：%s" % node_probe.age_text(age)
         if text == self._node_age_text:
@@ -1626,8 +1805,9 @@ class LanPage(BasePage):
             w.setEnabled(not flag)
         self.game_combo.setEnabled(True)
         # 云盘只在房间运行期间可用：没进房间时没有虚拟网卡可绑，
-        # 拖进去也无处可分享。
-        self.drop_zone.setEnabled(flag)
+        # 拖进去也无处可分享。这里只换外观（set_armed），**不禁用**——
+        # 没进房间点上去会给一句"先点进入房间"，比一个点不动的灰块有用。
+        self.drop_zone.set_armed(flag)
         # IP 显示与复制按钮
         self.btn_copy_ip.setEnabled(flag and bool(self._my_ip))
         self.btn_copy_addr.setEnabled(flag and bool(self._my_ip))
@@ -1845,14 +2025,16 @@ class LanPage(BasePage):
 
     # ------------------------------------------------------------------ 刷新
     def _tick(self):
-        # 节点延迟的自愈在这里：数据一过期就被安排重测，不需要谁记得点按钮。
-        # 只在页面可见时跑——用户没在看这一页就别占他的带宽。
-        try:
-            if self.isVisible():
-                self._start_node_probe()
-        except RuntimeError:
-            pass
+        # 节点延迟**不再定时重测**（v0.8.14beta）：以前数据一过期就自动重测，
+        # 用户明明只是把这一页开着挂机，也会周期性地占带宽。现在只在
+        # 「点进这一页」（on_shown）和「手点测速」时刷新。
+        #
+        # 云盘的状态看门狗在这里：只做字典比较，不发网络请求（见 _share_watch）。
         self._update_node_age()
+        try:
+            self._share_watch()
+        except (RuntimeError, AttributeError):
+            pass
         if self._etier is not None and self._running:
             # 检测网络切换（WiFi→热点 / 换 WiFi）：物理网络指纹变了说明
             # 虚拟局域网大概率已失效，自动关闭，避免一直卡在「房间开着」。
@@ -1872,7 +2054,18 @@ class LanPage(BasePage):
             pass
 
     def on_shown(self):
+        """页面被切到前台。
+
+        中继节点延迟**每次进这一页都自动测一次**：延迟取决于你现在在哪、
+        网络好不好，隔一会儿就变；进门顺手量一次，用户看到的永远是"现在
+        的"数字。之后这一页开着就不再自动重测了（想更新点「测速」），
+        免得挂机时白白占带宽。
+        """
         self._tick()
+        try:
+            self._start_node_probe(force=True)
+        except (RuntimeError, AttributeError):
+            pass
 
     def shutdown(self):
         """窗口关闭 / 退出 Yuhub 时停掉跨网房间。
