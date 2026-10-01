@@ -553,15 +553,25 @@ def _ip_addresses():
     return rows
 
 
+def virtual_adapter_ips():
+    """本机**所有**落在虚拟网段的地址（正常只有 1 个）。
+
+    为什么要返回列表而不是直接挑一个：程序被强杀/卡死后重启，偶尔会残留
+    一块旧的 wintun 网卡没来得及拆除，于是同时存在两个 10.126.126.x。
+    这时"哪个才是在用的"从地址表本身判断不出来——默默挑一个显示给用户，
+    他会拿着一个连不通的地址去填游戏，而界面上毫无异常。
+    所以这里把全部返回，由联机页如实提示，把判断权交还给人。
+    """
+    return [ip for ip in _ip_addresses() if ip.startswith(VIRTUAL_NET_PREFIX)]
+
+
 def virtual_adapter_ip():
     """虚拟网卡就绪时返回虚拟 IP，否则空串。
 
     判据：IPv4 落在 10.126.126.0/24（EasyTier DHCP 默认段）。
     """
-    for ip in _ip_addresses():
-        if ip.startswith(VIRTUAL_NET_PREFIX):
-            return ip
-    return ""
+    ips = virtual_adapter_ips()
+    return ips[0] if ips else ""
 
 
 def _resolve_name(ip, timeout=0.6):
@@ -653,13 +663,18 @@ class MemberTracker:
     def __init__(self, my_ip, on_log=None, name_lookup=None):
         self._my_ip = my_ip
         self._on_log = on_log or (lambda msg: None)
-        # 可选的昵称查询回调（NickBeacon.get_name）：信标查得到就不用走
-        # gethostbyaddr——后者在 EasyTier 虚拟网里基本解析不出 --hostname。
+        # 可选的「成员信息」查询回调（NickBeacon.get_info）：一次拿到
+        # 昵称 + 游戏快连。信标查得到就不用走 gethostbyaddr——后者在
+        # EasyTier 虚拟网里基本解析不出 --hostname。回调允许只返回昵称
+        # 字符串（旧写法），本类会兼容。
         self._name_lookup = name_lookup
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
+        # refresh_now() 用它打断 PING_INTERVAL 的等待，立刻再跑一轮
+        self._wake = threading.Event()
         self._thread = None
-        # ip -> {"confirmed": monotonic, "ping_fail": int, "name": str}
+        # ip -> {"confirmed": monotonic, "ping_fail": int,
+        #        "name": str, "game": str, "port": int}
         self._peers = {}
 
     # ------------------------------------------------ 对外接口（UI 用）
@@ -668,6 +683,7 @@ class MemberTracker:
         if self._thread and self._thread.is_alive():
             return
         self._stop_evt.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._loop, name="MemberTracker", daemon=True)
         self._thread.start()
@@ -675,21 +691,41 @@ class MemberTracker:
     def stop(self):
         """停止后台线程（停止房间 / 回滚时调用）。瞬时返回。"""
         self._stop_evt.set()
+        self._wake.set()             # 让 wait 立刻返回，线程尽快退出
+
+    def refresh_now(self):
+        """请求后台线程**立刻**再跑一轮，不等 PING_INTERVAL（点「刷新」时用）。
+
+        用户点刷新说明"现在列表不对"，再用最多 3 秒的间隔等下一轮
+        在体感上就是"点了没反应"。这里直接把等待打断。
+        """
+        self._wake.set()
 
     def snapshot(self):
-        """当前在线成员 [{"ip", "name"}]，按 IP 排序。UI 线程调用，零阻塞。"""
+        """当前在线成员，按 IP 排序。UI 线程调用，零阻塞。
+
+        返回 [{"ip", "name", "game", "port"}]。game / port 是对端在
+        「游戏快连」里选的那款游戏（由昵称信标一起广播过来），队友的
+        成员行据此显示"他在玩什么"，复制按钮也用**他的**端口拼地址。
+        """
         with self._lock:
-            return [{"ip": ip, "name": (p.get("name") or "")}
+            return [{"ip": ip,
+                     "name": (p.get("name") or ""),
+                     "game": (p.get("game") or ""),
+                     "port": int(p.get("port") or 0)}
                     for ip, p in sorted(self._peers.items())]
 
     # ------------------------------------------------ 后台线程主体
     def _loop(self):
         while not self._stop_evt.is_set():
+            # 先清唤醒标记再干活：这样"干活期间"进来的 refresh_now()
+            # 会留到下面的 wait 上，immediate 生效，不会被吞掉。
+            self._wake.clear()
             try:
                 self._round()
             except Exception:
                 pass                    # 单轮失败不影响下一轮
-            self._stop_evt.wait(self.PING_INTERVAL)
+            self._wake.wait(self.PING_INTERVAL)
 
     def _round(self):
         now = time.monotonic()
@@ -701,7 +737,8 @@ class MemberTracker:
         with self._lock:
             for ip in arp:
                 p = self._peers.setdefault(
-                    ip, {"confirmed": now, "ping_fail": 0, "name": ""})
+                    ip, {"confirmed": now, "ping_fail": 0,
+                         "name": "", "game": "", "port": 0})
                 p["confirmed"] = now
                 p["ping_fail"] = 0
         # ② 逐个 ping：保活 ARP + 主动确认活性
@@ -714,8 +751,8 @@ class MemberTracker:
             self._on_ping_result(ip, alive, now)
         # ③ 离线判定（双信号失效才移除）
         self._sweep(now)
-        # ④ 名称解析：只解析还没名字的，解析一次就缓存
-        self._resolve_names()
+        # ④ 昵称 + 游戏快连：信标里随名字一起广播过来
+        self._resolve_info()
 
     def _on_ping_result(self, ip, alive, now=None):
         """记录一次 ping 结果（抽出来是为了可测）。"""
@@ -742,26 +779,52 @@ class MemberTracker:
         for ip in gone:
             self._on_log("成员 %s 已离线" % ip)
 
-    def _resolve_names(self):
+    def _resolve_info(self):
+        """补齐每个成员的昵称与「游戏快连」。
+
+        信标查得到就一次拿全（昵称 + 游戏名 + 端口）。信标里没有昵称时
+        才走 gethostbyaddr 兜底——**且只在确实还没名字时**才查，因为
+        反查有 0.8 秒超时，每轮都查会把后台线程拖住。
+
+        与旧版的区别：以前只在 name 为空时查一次就永久缓存；现在每轮都
+        问一次信标（命中缓存时是一次字典读，几乎零成本），这样运行中
+        队友切换了「游戏快连」，我们这边最多 3 秒就跟着变。
+        """
         with self._lock:
-            need = [ip for ip, p in self._peers.items() if not p.get("name")]
-        for ip in need:
+            peers = list(self._peers.items())
+        for ip, p in peers:
             if self._stop_evt.is_set():
                 return
-            # ① 信标优先（应用层，可靠）；② gethostbyaddr 兜底
-            name = ""
+            info = {}
             if self._name_lookup:
                 try:
-                    name = self._name_lookup(ip) or ""
+                    got = self._name_lookup(ip)
                 except Exception:
-                    name = ""
+                    got = None
+                if isinstance(got, dict):
+                    info = got
+                elif got:                       # 兼容只回昵称字符串的回调
+                    info = {"name": str(got)}
+            name = (info.get("name") or "").strip()
+            if not name:
+                name = p.get("name") or ""
             if not name:
                 name = _resolve_name(ip, timeout=0.8)
-            if name:
-                with self._lock:
-                    p = self._peers.get(ip)
-                    if p is not None:
-                        p["name"] = name
+            with self._lock:
+                cur = self._peers.get(ip)
+                if cur is None:
+                    continue
+                if name:
+                    cur["name"] = name
+                game = (info.get("game") or "").strip()
+                if game:
+                    cur["game"] = game
+                try:
+                    port = int(info.get("port") or 0)
+                except (TypeError, ValueError):
+                    port = 0
+                if port:
+                    cur["port"] = port
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +847,12 @@ class MemberTracker:
 # 传播，不往物理局域网泄漏一个字节。
 NICK_PORT = 41234
 _NICK_MAGIC = "yuhub-nick-v1"
+# 「游戏快连」跟昵称搭同一班车广播：队友的「在线成员」里就能直接看到
+# 每个人选的是哪款游戏，点「复制」也用**对方**的端口拼地址。
+# 报文是 JSON 字典，多带两个键对旧版是透明的（旧版只读 _NICK_MAGIC），
+# 所以不用升协议版本——新旧客户端可以混在同一个房间里。
+_NICK_GAME = "game"
+_NICK_PORT = "port"
 
 
 class NickBeacon:
@@ -794,14 +863,17 @@ class NickBeacon:
     TCP_QUERY_TIMEOUT = 1.0      # TCP 查询超时
     TCP_FAIL_BACKOFF = 30.0      # TCP 查询失败后的重试间隔（秒）
 
-    def __init__(self, my_ip, nick, on_log=None):
+    def __init__(self, my_ip, nick, on_log=None, game="", port=0):
         self._my_ip = my_ip
         self._nick = (nick or "").strip()[:32]
+        self._game = (game or "").strip()[:24]
+        self._port = int(port or 0)
         self._on_log = on_log or (lambda msg: None)
         self._stop_evt = threading.Event()
+        self._wake = threading.Event()      # 打断广播间隔（切换游戏后立刻广播）
         self._lock = threading.Lock()
         self._threads = []
-        # ip -> [nick, fresh_until]
+        # ip -> {"info": {"name","game","port"}, "until": monotonic}
         self._peers = {}
         # ip -> 上次 TCP 查询失败的 monotonic（失败节流）
         self._tcp_fail = {}
@@ -811,6 +883,7 @@ class NickBeacon:
         if self._threads:
             return
         self._stop_evt.clear()
+        self._wake.clear()
         for target, name in (
             (self._announce_loop, "NickBeaconTx"),
             (self._udp_listen_loop, "NickBeaconRx"),
@@ -822,44 +895,75 @@ class NickBeacon:
 
     def stop(self):
         self._stop_evt.set()
+        self._wake.set()
 
-    def get_name(self, ip, timeout=None):
-        """查某虚拟 IP 的昵称。信标缓存 → TCP 查询 → 都没有返回 ""。"""
+    def set_game(self, game, port=0):
+        """更新本机广播的「游戏快连」（运行中切换游戏时调用）。
+
+        立刻踢一次广播，队友最多 1 秒就看到变化，不用等下一个 3 秒周期。
+        """
+        with self._lock:
+            self._game = (game or "").strip()[:24]
+            self._port = int(port or 0)
+        self._wake.set()
+
+    def get_info(self, ip, timeout=None):
+        """查某虚拟 IP 的 {"name","game","port"}。
+
+        信标缓存 → TCP 查询 → 都没有返回 {}（不是 None，调用方直接 .get）。
+        """
         if not ip or ip == self._my_ip:
-            return ""
+            return {}
         now = time.monotonic()
         with self._lock:
             hit = self._peers.get(ip)
-            if hit and hit[1] > now:
-                return hit[0]
+            if hit and hit.get("until", 0) > now:
+                return dict(hit.get("info") or {})
             last_fail = self._tcp_fail.get(ip, 0.0)
         if now - last_fail < self.TCP_FAIL_BACKOFF:
-            return ""                       # 刚 TCP 查过失败，别反复试探
-        nick = self._tcp_query(ip, timeout or self.TCP_QUERY_TIMEOUT)
-        if nick:
+            return {}                       # 刚 TCP 查过失败，别反复试探
+        info = self._tcp_query(ip, timeout or self.TCP_QUERY_TIMEOUT)
+        if info:
             with self._lock:
-                self._peers[ip] = [nick, time.monotonic() + self.PEER_FRESH]
-            return nick
+                self._peers[ip] = {"info": info,
+                                   "until": time.monotonic() + self.PEER_FRESH}
+                self._tcp_fail.pop(ip, None)
+            return dict(info)
         with self._lock:
             self._tcp_fail[ip] = time.monotonic()
-        return ""
+        return {}
+
+    def get_name(self, ip, timeout=None):
+        """兼容接口：只要昵称（旧调用方与自检在用）。"""
+        return self.get_info(ip, timeout).get("name", "")
+
+    def _payload(self):
+        """当前要广播的报文（每次现取，所以切换游戏后立刻生效）。"""
+        with self._lock:
+            nick, game, port = self._nick, self._game, self._port
+        d = {_NICK_MAGIC: nick}
+        if game:
+            d[_NICK_GAME] = game
+        if port:
+            d[_NICK_PORT] = int(port)
+        return json.dumps(d, ensure_ascii=False).encode("utf-8")
 
     # ------------------------------------------------ 内部：三个小线程
     def _announce_loop(self):
-        """定时向虚拟网广播自己的昵称。"""
-        payload = json.dumps({_NICK_MAGIC: self._nick}).encode("utf-8")
+        """定时向虚拟网广播自己的昵称 + 游戏快连。"""
         baddr = VIRTUAL_NET_PREFIX + "255"
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             while not self._stop_evt.is_set():
+                self._wake.clear()
                 if self._nick:
                     try:
-                        sock.sendto(payload, (baddr, NICK_PORT))
+                        sock.sendto(self._payload(), (baddr, NICK_PORT))
                     except Exception:
                         pass
-                self._stop_evt.wait(self.ANNOUNCE_INTERVAL)
+                self._wake.wait(self.ANNOUNCE_INTERVAL)
         except Exception:
             pass
         finally:
@@ -870,7 +974,7 @@ class NickBeacon:
                     pass
 
     def _udp_listen_loop(self):
-        """收别人的广播，维护 ip → 昵称 新鲜表。"""
+        """收别人的广播，维护 ip → 成员信息 新鲜表。"""
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -884,11 +988,13 @@ class NickBeacon:
                     continue
                 except OSError:
                     break
-                nick = self._parse(data)
-                if nick and addr[0] != self._my_ip:
+                info = self._parse_info(data)
+                if info and addr[0] != self._my_ip:
                     with self._lock:
-                        self._peers[addr[0]] = [nick,
-                                                time.monotonic() + self.PEER_FRESH]
+                        self._peers[addr[0]] = {
+                            "info": info,
+                            "until": time.monotonic() + self.PEER_FRESH,
+                        }
         except Exception:
             pass
         finally:
@@ -899,7 +1005,7 @@ class NickBeacon:
                     pass
 
     def _tcp_serve_loop(self):
-        """TCP 查询兜底：连上就回一行昵称，立即关闭。"""
+        """TCP 查询兜底：连上就把本机报文写过去，立即关闭。"""
         srv = None
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -916,8 +1022,7 @@ class NickBeacon:
                     break
                 try:
                     conn.settimeout(2.0)
-                    conn.sendall(json.dumps(
-                        {_NICK_MAGIC: self._nick}).encode("utf-8"))
+                    conn.sendall(self._payload())
                 except Exception:
                     pass
                 finally:
@@ -935,25 +1040,34 @@ class NickBeacon:
                     pass
 
     def _tcp_query(self, ip, timeout):
-        """主动向对方查昵称（出站连接，无防火墙问题）。"""
-        if not self._nick and not self._threads:
-            return ""
+        """主动向对方查成员信息（出站连接，无防火墙问题）。"""
+        if not self._threads:
+            return {}
         try:
             with socket.create_connection((ip, NICK_PORT), timeout=timeout) as c:
                 c.settimeout(timeout)
-                return self._parse(c.recv(256))
+                return self._parse_info(c.recv(1024)) or {}
         except Exception:
-            return ""
+            return {}
 
     @staticmethod
-    def _parse(data):
+    def _parse_info(data):
+        """解析信标报文 → {"name","game","port"}；不是本协议的报文返回 None。"""
         try:
             d = json.loads((data or b"").decode("utf-8"))
-            if _NICK_MAGIC in d:
-                return str(d[_NICK_MAGIC]).strip()[:32]
         except Exception:
-            pass
-        return ""
+            return None
+        if not isinstance(d, dict) or _NICK_MAGIC not in d:
+            return None
+        try:
+            port = int(d.get(_NICK_PORT) or 0)
+        except (TypeError, ValueError):
+            port = 0
+        return {
+            "name": str(d.get(_NICK_MAGIC) or "").strip()[:32],
+            "game": str(d.get(_NICK_GAME) or "").strip()[:24],
+            "port": port,
+        }
 
 
 # ---------------------------------------------------------------------------

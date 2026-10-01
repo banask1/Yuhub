@@ -235,31 +235,67 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
 def _check_nick_beacon(etier_mod, ip, mark):
     """昵称信标的实测：真实 bind / serve / 查询 / 解析全链路。
 
-    get_name() 会拦下"查自己"（自己昵称本来就已知），所以 TCP 查询
+    get_info() 会拦下"查自己"（自己昵称本来就已知），所以 TCP 查询
     走 _tcp_query 直查本机监听；新鲜表与 tracker 联动用注入的假成员。
+    报文里除了昵称还带「游戏快连」（游戏名 + 端口），成员列表靠它显示
+    "每个人在玩什么"，复制按钮也用它拼地址。
     """
     try:
-        beacon = etier_mod.NickBeacon(ip, "SelfTestNick")
+        beacon = etier_mod.NickBeacon(ip, "SelfTestNick",
+                                      game="泰拉瑞亚", port=7777)
         beacon.start()
         time.sleep(0.6)               # 给 TCP serve 线程一点 bind 时间
         got = beacon._tcp_query(ip, 2.0)
         mark("昵称信标 TCP 查询（本机回环实测）",
-             got == "SelfTestNick", "tcp_query(%s)=%r" % (ip, got))
+             got.get("name") == "SelfTestNick", "tcp_query(%s)=%r" % (ip, got))
+        mark("信标 TCP 查询带回游戏快连",
+             got.get("game") == "泰拉瑞亚" and got.get("port") == 7777,
+             "got=%r" % (got,))
 
-        # 注入"收到 Bob 的广播"：get_name 应命中新鲜表
-        beacon._peers["10.126.126.200"] = ["Bob",
-                                           time.monotonic() + 15.0]
-        hit = beacon.get_name("10.126.126.200")
-        mark("信标新鲜表命中", hit == "Bob", "get_name=%r" % hit)
+        # 旧版本客户端只发昵称：新版本必须照常解析（混房间不炸）
+        legacy = etier_mod.NickBeacon._parse_info(
+            b'{"yuhub-nick-v1":"OldPeer"}')
+        mark("兼容旧版仅昵称报文",
+             legacy == {"name": "OldPeer", "game": "", "port": 0},
+             "legacy=%r" % (legacy,))
 
-        # Tracker 的 name_lookup 回调应能借信标填上昵称
-        tr = etier_mod.MemberTracker(ip, name_lookup=beacon.get_name)
+        # 注入"收到 Bob 的广播"：get_info 应命中新鲜表
+        beacon._peers["10.126.126.200"] = {
+            "info": {"name": "Bob", "game": "幻兽帕鲁", "port": 8211},
+            "until": time.monotonic() + 15.0}
+        hit = beacon.get_info("10.126.126.200")
+        mark("信标新鲜表命中", hit.get("name") == "Bob", "get_info=%r" % (hit,))
+        mark("信标新鲜表带回游戏快连",
+             hit.get("game") == "幻兽帕鲁" and hit.get("port") == 8211,
+             "get_info=%r" % (hit,))
+        # 兼容接口 get_name 仍只回昵称
+        mark("get_name 兼容接口仍可用",
+             beacon.get_name("10.126.126.200") == "Bob",
+             "get_name=%r" % (beacon.get_name("10.126.126.200"),))
+
+        # Tracker 的信息回调应能借信标填上昵称 + 游戏快连
+        tr = etier_mod.MemberTracker(ip, name_lookup=beacon.get_info)
         tr._peers["10.126.126.200"] = {
-            "confirmed": time.monotonic(), "ping_fail": 0, "name": ""}
-        tr._resolve_names()
-        filled = tr._peers["10.126.126.200"]["name"]
-        mark("跟踪器经信标解析出昵称", filled == "Bob",
-             "name=%r" % filled)
+            "confirmed": time.monotonic(), "ping_fail": 0,
+            "name": "", "game": "", "port": 0}
+        tr._resolve_info()
+        cur = tr._peers["10.126.126.200"]
+        mark("跟踪器经信标解析出昵称", cur["name"] == "Bob",
+             "name=%r" % cur["name"])
+        mark("跟踪器经信标解析出游戏快连",
+             cur["game"] == "幻兽帕鲁" and cur["port"] == 8211,
+             "game=%r port=%r" % (cur["game"], cur["port"]))
+        snap = [m for m in tr.snapshot() if m["ip"] == "10.126.126.200"]
+        mark("跟踪器快照带出游戏快连",
+             bool(snap) and snap[0]["game"] == "幻兽帕鲁"
+             and snap[0]["port"] == 8211, "snapshot=%r" % (snap,))
+
+        # 运行中切换游戏：报文要立刻变成新值
+        beacon.set_game("神力科莎", 9600)
+        sw = etier_mod.NickBeacon._parse_info(beacon._payload())
+        mark("运行中切换游戏快连立即生效",
+             sw.get("game") == "神力科莎" and sw.get("port") == 9600,
+             "payload=%r" % (sw,))
         beacon.stop()
     except Exception as exc:
         mark("昵称信标 TCP 查询（本机回环实测）", False, repr(exc))
@@ -329,6 +365,65 @@ def _check_ui_state(result, mark):
 
     _check_join_validation(page, mark)
     _check_nickname(page, mark)
+    _check_member_row_ui(page, mark)
+
+
+def _check_member_row_ui(page, mark):
+    """成员行的可见性与信息回归。
+
+    对应用户报的三件事：复制按钮看不清、看不到队友在玩什么、
+    中途卡退重进后 IP 变了却不知道（因此加了刷新与变化告知）。
+    """
+    from PySide6.QtWidgets import QPushButton, QLabel
+
+    # ① 「在线成员」卡片右上角的「刷新」按钮
+    rbtn = getattr(page, "btn_members_refresh", None)
+    mark("在线成员卡片带「刷新」按钮",
+         rbtn is not None and rbtn.text() == "刷新"
+         and rbtn.objectName() == "MiniButton",
+         "btn=%r obj=%r" % (rbtn.text() if rbtn else None,
+                            getattr(rbtn, "objectName", lambda: None)()))
+
+    # ② 每行显示那个人自己选的「游戏快连」
+    row = page._make_member_row("Bob", "10.126.126.9",
+                                game="泰拉瑞亚", port=7777)
+    texts = [lb.text() for lb in row.findChildren(QLabel)]
+    mark("成员行显示对方所选游戏", "泰拉瑞亚" in texts, "labels=%r" % (texts,))
+
+    # ③ 「复制」两个字必须放得下
+    #    旧版是 ghost_button + setFixedWidth(52)，而 ghost 样式自带 18px
+    #    左右内边距，52 里留给文字的只有十几像素 → 两个字被挤得看不清。
+    cbtn = row.findChildren(QPushButton)[0]
+    fm = cbtn.fontMetrics()
+    need = fm.horizontalAdvance("复制") + 24
+    mark("「复制」按钮文字不被挤压",
+         cbtn.text() == "复制" and cbtn.minimumWidth() >= need,
+         "min=%d need=%d 文字宽=%d"
+         % (cbtn.minimumWidth(), need, fm.horizontalAdvance("复制")))
+
+    # ④ 复制出来的是**对方**的「IP:端口」
+    mark("复制按钮用对方的游戏端口",
+         "10.126.126.9:7777" in cbtn.toolTip(), cbtn.toolTip())
+
+    # ⑤ 对方还没广播游戏时，退回用我自己选的端口（不能干脆不给地址）
+    row2 = page._make_member_row("NoGame", "10.126.126.8")
+    tip2 = row2.findChildren(QPushButton)[0].toolTip()
+    my_port = page._selected_game()[1]
+    mark("对方无游戏信息时回退本机端口",
+         ("10.126.126.8:%d" % my_port) in tip2, tip2)
+
+    # ⑥ 运行中 IP 变化：必须按新地址整对重建信标与成员跟踪
+    #    （不重建就是"人在房间、列表永远空、别人也看不到我"）
+    page._on_ip_changed("10.126.126.2", "10.126.126.99")
+    mark("IP 变化后信标重建到新地址",
+         page._beacon is not None
+         and getattr(page._beacon, "_my_ip", "") == "10.126.126.99",
+         "beacon_ip=%r" % (getattr(page._beacon, "_my_ip", None),))
+    mark("IP 变化后跟踪器重建到新地址",
+         page._tracker is not None
+         and getattr(page._tracker, "_my_ip", "") == "10.126.126.99",
+         "tracker_ip=%r" % (getattr(page._tracker, "_my_ip", None),))
+    page._stop_room_threads()
 
 
 def _check_join_validation(page, mark):
