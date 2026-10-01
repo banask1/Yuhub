@@ -407,6 +407,22 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- node-selftest 模式：无窗口自检「中继节点测速」----
+    # 用法： Yuhub.exe --node-selftest <结果json路径>
+    # 这个功能的两条承诺（延迟是本机实测的、数字是新鲜的）都不会抛异常，
+    # 坏掉时界面看着完全正常——只能靠断言守住。自检在本地监听/保留地址上
+    # 构造可用、端口不通、超时、域名没了四种链路状态（不依赖外网）。
+    if "--node-selftest" in sys.argv:
+        idx = sys.argv.index("--node-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import node_selftest
+            sys.exit(node_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # ---- 错误日志钩子（隐藏功能，无 UI）：出错/崩溃时静默写
     #      文档\Yuhub\error\crash_*.log。必须在建 QApplication 之前装好，
     #      否则 Qt 初始化阶段的崩溃就抓不到了。所有 --*-selftest 模式
