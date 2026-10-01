@@ -258,6 +258,12 @@ class SettingsPage(BasePage):
         下载走与自动更新完全相同的线路矩阵（官方直连 → 国内镜像），
         sha256 校验通过后才替换；替换失败自动回滚，不会把程序弄坏。
         """
+        # 下载中要能取消：同一个按钮从「一键修复软件」切到「取消」。
+        # 旧版点下去就把按钮 setEnabled(False) 撒手不管，用户既没取消
+        # 入口、也不知道进度——"更新的时候取消不了"就是这么来的。
+        self._repair_busy = False
+        self._repair_cancel = False
+
         card = QFrame()
         card.setObjectName("Card")
         v = QVBoxLayout(card)
@@ -286,19 +292,46 @@ class SettingsPage(BasePage):
         self.add(card)
 
     def _on_repair_app_clicked(self):
+        # 同一个按钮承担两件事：空闲时是「一键修复软件」，下载中变「取消」。
+        if self._repair_busy:
+            self._request_repair_cancel()
+            return
         win = self.window()
         if not hasattr(win, "apply_repair_package"):
             self.notify("当前环境不支持在线修复（源码运行时请直接重跑源码）")
             return
-        self.btn_repair_app.setEnabled(False)
+        self._repair_busy = True
+        self._repair_cancel = False
+        self.btn_repair_app.setText("取消")
+        self.btn_repair_app.setEnabled(True)
         self.repair_status.setText("正在查询 Release 信息…")
         threading.Thread(
             target=self._do_repair_app, name="AppRepair", daemon=True).start()
 
+    def _request_repair_cancel(self):
+        """把取消请求交给下载线程（它每 0.2 秒看一次标志）。"""
+        if self._repair_cancel:
+            return
+        self._repair_cancel = True
+        self.btn_repair_app.setText("正在取消…")
+        self.btn_repair_app.setEnabled(False)
+        self.repair_status.setText("正在取消…（等当前连接收尾）")
+
+    def _reset_repair_button(self):
+        self._repair_busy = False
+        self._repair_cancel = False
+        self.btn_repair_app.setText("一键修复软件")
+        self.btn_repair_app.setEnabled(True)
+
     def _do_repair_app(self):
         """后台线程：定位当前版本的 Release → 下载 → 回主线程执行替换。"""
-        def progress(text):
-            self._etier_event.emit("repair_prog", str(text or ""))
+        def progress(payload):
+            # ⚠️ 别直接 str(payload)：下载中的回调载荷是 downloader 的
+            # snapshot 字典，直接字符串化就是往界面上糊一坨 JSON
+            #（用户截图反馈的那串 {"status": "done", ...} 正是这么来的）。
+            phase, text = updater.format_progress(payload)
+            if text:
+                self._etier_event.emit("repair_prog", text)
 
         # ① 定位与当前版本一致的 Release（先 v 前缀 tag，再裸版本 tag）
         info, err = updater.fetch_release_by_tag("v" + VERSION)
@@ -315,21 +348,30 @@ class SettingsPage(BasePage):
                     % (VERSION_LABEL, info.tag))
         if info is None:
             self._etier_event.emit(
-                "repair_done",
+                "app_repair_done",
                 {"ok": False, "msg": err or "GitHub 上找不到当前版本的发布记录"})
             return
         if not info.asset_url:
             self._etier_event.emit(
-                "repair_done", {"ok": False, "msg": "该版本没有可下载的文件"})
+                "app_repair_done", {"ok": False, "msg": "该版本没有可下载的文件"})
+            return
+        if self._repair_cancel:
+            self._etier_event.emit("app_repair_done", {"ok": False, "msg": "已取消"})
             return
 
         # ② 下载（线路矩阵 + sha256 校验，与自动更新同一条链路）
         self._etier_event.emit(
             "repair_prog", "正在下载 %s（约 %.0f MB）…"
             % (info.tag, info.asset_size / 1048576.0))
-        ok, msg, path = updater.download_update(info, on_progress=progress)
+        ok, msg, path = updater.download_update(
+            info,
+            on_progress=progress,
+            # 没有这个 cancel 回调，用户在下载中就没法中止——
+            # 只能眼睁睁等到 59MB 下完或自己放弃
+            cancel=lambda: self._repair_cancel,
+        )
         if not ok:
-            self._etier_event.emit("repair_done", {"ok": False, "msg": msg})
+            self._etier_event.emit("app_repair_done", {"ok": False, "msg": msg})
             return
 
         # ③ 回主线程执行替换（替换器会拉起新 exe，本进程退出）
@@ -410,17 +452,29 @@ class SettingsPage(BasePage):
         elif kind == "repair_prog":
             # 软件修复进度（区分于上面的组件修复进度）
             self.repair_status.setText(str(payload or ""))
+        elif kind == "app_repair_done":
+            # 软件修复失败/取消。**必须与组件修复的 repair_done 分开**：
+            # 两者共用一个 kind 时，软件修复失败会把「一键修复」（组件）
+            # 的按钮启用，而「一键修复软件」还灰着——状态全乱。
+            msg = str(payload.get("msg") or "")
+            self._reset_repair_button()
+            if msg == "已取消":
+                self.repair_status.setText("已取消修复，未做任何改动。")
+                self.toast("已取消修复")
+            else:
+                self.repair_status.setText("修复失败：%s" % msg)
+                self.toast("修复失败：%s" % msg)
         elif kind == "repair_ready":
             # 下载完成 → 主线程里启动替换器（它会等本进程退出后替换）
             info = updater.ReleaseInfo.from_dict(payload.get("info") or {})
             path = str(payload.get("path") or "")
-            if info.tag and path:
+            win = self.window()
+            if info.tag and path and hasattr(win, "apply_repair_package"):
                 self.repair_status.setText("下载完成，正在替换程序…")
-                win = self.window()
-                if hasattr(win, "apply_repair_package"):
-                    win.apply_repair_package(info, path)
+                self._reset_repair_button()
+                win.apply_repair_package(info, path)
             else:
-                self.btn_repair_app.setEnabled(True)
+                self._reset_repair_button()
                 self.repair_status.setText("修复失败：下载结果无效")
         else:
             return

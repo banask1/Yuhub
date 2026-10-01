@@ -32,10 +32,15 @@ def _finish(out_file, result):
     result["ok"] = bool(checks) and all(c["pass"] for c in checks)
     result["info"]["passed"] = sum(1 for c in checks if c["pass"])
     result["info"]["total"] = len(checks)
+    # 先 dumps 再落盘 + default=str：detail 里混进 bytes / 自定义对象时，
+    # json.dump 会抛 TypeError，而它是**边序列化边写**的——文件已被写了
+    # 半截，最后拿到的是一份读不出来的残档，前面的检查结果全丢
+    #（v0.8.14beta 的 lan 自检就这么坏过一次）。
     try:
         with open(out_file, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, ensure_ascii=False, indent=2)
-    except OSError:
+            fh.write(json.dumps(result, ensure_ascii=False, indent=2,
+                                default=str))
+    except (OSError, TypeError, ValueError):
         return 4
     return 0 if result["ok"] else 1
 
