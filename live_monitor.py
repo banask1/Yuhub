@@ -6,12 +6,18 @@ r"""Yuhub 实时硬件监控（完全离线，性能优先）。
     - ctypes 直调 GetSystemTimes 差分求 CPU 占用 → ~0.03 ms
     - ctypes 直调 GlobalMemoryStatusEx 求内存占用 → ~0.03 ms
     - nvidia-smi 子进程求 GPU 占用/温度/功耗     → ~240 ms
+    - nvml.dll 直调求 GPU 温度/功耗/显存         → ~1 ms
   因此：CPU / 内存 / 磁盘容量走 ctypes（微秒级，可在主线程直接调）；
-  GPU 走 nvidia-smi，且必须放到后台线程，避免阻塞 UI。
+  GPU 走「厂商接口 + PDH 计数器」，且必须放到后台线程，避免阻塞 UI。
+
+显卡数据分两层（见 read_gpu）：
+  厂商层  gpu_sensors：温度 / 功耗 / 频率 / 风扇
+          NVIDIA → NVML；AMD → ADL；两者都读不到时退回 nvidia-smi 子进程
+  通用层  PdhGpuReader：利用率 + 显存（WDDM 上报，AMD / Intel / NVIDIA 通用）
 
 线程模型：
   LiveMonitor 内部维护一个守护线程，按 interval 采样并发出 sample 信号。
-  nvidia-smi 与主线程的 CPU/内存采样分离——前者慢、后者快，不能互相拖累。
+  慢速来源（PDH / 子进程）与主线程的 CPU/内存采样分离——不能互相拖累。
 """
 
 import ctypes
@@ -23,6 +29,11 @@ from ctypes import wintypes
 from threading import Event, Lock, Thread
 
 from PySide6.QtCore import QObject, Signal
+
+try:                                    # 厂商传感器（NVIDIA NVML / AMD ADL）
+    import gpu_sensors
+except Exception:                       # pragma: no cover - 极端情况下降级
+    gpu_sensors = None
 
 IS_WIN = sys.platform == "win32"
 
@@ -142,7 +153,7 @@ def read_disk_space(drive="C:\\"):
 
 
 # ---------------------------------------------------------------------------
-# GPU：nvidia-smi
+# GPU：nvidia-smi（厂商层的最后兜底，见 gpu_sensors / read_gpu）
 # ---------------------------------------------------------------------------
 _NVSMI_QUERY = (
     "utilization.gpu,memory.used,memory.total,temperature.gpu,"
@@ -188,11 +199,12 @@ def _nvidia_smi_path():
     return None
 
 
-def read_gpu():
-    """读取 NVIDIA GPU 实时数据。
+def read_gpu_nvsmi():
+    """用 nvidia-smi 子进程读 NVIDIA GPU（约 240ms）。
 
+    只在 NVML 不可用（老驱动没带 nvml.dll / 组件缺失）时才走这条路——
+    它是"最后兜底"，不是主路径。
     返回 dict 或 None（无 NVIDIA 显卡 / 驱动未装 / 调用失败）。
-    非 NVIDIA 显卡（AMD/Intel）此函数返回 None，UI 需自行降级显示。
     """
     path = _nvidia_smi_path()
     if not path:
@@ -530,6 +542,62 @@ def read_gpu_pdh():
         return _PDH_READER.read()
 
 
+# 所有厂商都读不到的项一律 None —— UI 据此显示"—"而不是编一个 0
+_GPU_FIELDS = ("temp", "power_w", "power_limit_w", "clock_sm_mhz",
+               "clock_max_mhz", "fan_percent", "mem_used_mb", "mem_total_mb")
+
+
+def read_gpu():
+    """显卡实时数据的统一入口：厂商层（NVML / ADL）+ 通用层（PDH）。
+
+    字段优先级：
+      温度 / 功耗 / 频率 / 风扇   gpu_sensors（NVML → ADL）→ nvidia-smi
+      利用率                     PDH → 厂商值
+      显存用量 / 总量            NVML → PDH；总量还读不到就用注册表
+
+    全部读不到返回 None。注意"厂商层读不到"不等于"没显卡"——A 卡机器上
+    ADL 可用时温度功耗照样能读，这正是以前只有 N 卡才有温度的原因。
+    """
+    vend = {}
+    if gpu_sensors is not None:
+        try:
+            vend = gpu_sensors.read_sensors() or {}
+        except Exception:
+            vend = {}
+    smi = None
+    if vend.get("source") != "nvml":
+        # NVML 没拿到（非 N 卡，或老驱动没带 nvml.dll）→ 老路兜一层
+        smi = read_gpu_nvsmi()
+    pdh = read_gpu_pdh()
+    if not vend and not smi and not pdh:
+        return None
+
+    def pick(key):
+        for src in (vend, smi, pdh):
+            if src and src.get(key) is not None:
+                return src[key]
+        return None
+
+    out = {key: pick(key) for key in _GPU_FIELDS}
+    if out["mem_total_mb"] is None:
+        out["mem_total_mb"] = _reg_dedicated_vram_mb()
+
+    # 占用率统一用 PDH 口径（与任务管理器一致）。NVML / nvidia-smi 报的是
+    # "忙碌时间占比"，桌面待机时能到 20~30%、任务管理器只有个位数，
+    # 拿它当主值会让用户以为读错了。只有 PDH 完全读不到时才退回厂商值，
+    # 并如实标注来源，便于排查。
+    if pdh and pdh.get("util") is not None:
+        out["util"], out["util_source"] = pdh["util"], "pdh"
+    else:
+        out["util"] = pick("util")
+        out["util_source"] = ((vend.get("source") or "nvidia-smi")
+                              if out["util"] is not None else "")
+
+    out["sensor_source"] = vend.get("source") or ("nvidia-smi" if smi else "")
+    out["gpu_name"] = vend.get("name") or ""
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 采样线程
 # ---------------------------------------------------------------------------
@@ -593,21 +661,9 @@ class LiveMonitor(QObject):
                 payload["mem"] = mem
 
             if self._enable_gpu and self._tick % gpu_backoff == 0:
+                # read_gpu 内部已按「厂商层 → 通用层」组合好，并统一了
+                # 利用率口径，这里只负责失败退避。
                 g = read_gpu()
-                if g is None:
-                    # NVIDIA 不可用（无卡 / 驱动缺失 / AMD / Intel）→ PDH 兜底
-                    g = read_gpu_pdh()
-                else:
-                    # nvidia-smi 的 utilization 是"过去一秒内有任务在执行的时间
-                    # 占比"，而任务管理器（以及 PDH）报的是"引擎吞吐占用"。
-                    # 桌面待机时前者常报 20~30%、后者只有个位数，用户拿任务
-                    # 管理器对照会以为是我们读错了。所以占用率统一换成 PDH 的
-                    # 口径；温度 / 功耗 / 频率仍用 nvidia-smi 的（PDH 拿不到）。
-                    # PDH 读失败就保留 nvidia-smi 的值，不倒退。
-                    alt = read_gpu_pdh()
-                    if alt and alt.get("util") is not None:
-                        g["util"] = alt["util"]
-                        g["util_source"] = "pdh"
                 if g is None:
                     gpu_fails += 1
                     gpu_backoff = min(120, gpu_period * (2 ** min(gpu_fails, 6)))
