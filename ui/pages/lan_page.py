@@ -12,14 +12,18 @@
 列表能直接互相看到，无需填地址、无需自建服务器。
 """
 
+import os
 import secrets
 import socket
+import subprocess
 import threading
 import time
 
-from PySide6.QtCore import Qt, QSettings, QTimer, Signal
+from PySide6.QtCore import Qt, QSettings, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -31,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 import etier
+import lan_share
 from .. import theme
 from ..widgets import ghost_button, info_card, primary_button
 from .base_page import BasePage
@@ -88,6 +93,92 @@ def sanitize_nickname(text):
     return out
 
 
+# 单次拖拽/选择允许的文件数上限：只是防手滑拖进一整个下载目录，
+# 不是技术限制（HTTP 服务对文件数没意见）。
+MAX_DROP_FILES = 50
+
+
+class _DropZone(QFrame):
+    """临时云盘的文件投放区：拖文件（或文件夹）进来即分享。
+
+    做成独立控件而不是给卡片挂拖拽事件：拖拽事件要落在"一块明确的区域"
+    上，而且得能自己高亮——悬停时把边框换成主色，用户才知道松手会落到
+    这里。用 QFrame 是因为要同时控制边框样式和子标签文字。
+    """
+
+    dropped = Signal(list)      # 本地绝对路径列表
+    clicked = Signal()          # 点击 = 打开文件选择框
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(70)
+        self._active = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(3)
+        self.title = QLabel("拖文件 / 文件夹到这里分享")
+        self.title.setAlignment(Qt.AlignCenter)
+        self.sub = QLabel("也可以点这里选文件")
+        self.sub.setAlignment(Qt.AlignCenter)
+        self.sub.setWordWrap(True)
+        v.addWidget(self.title)
+        v.addWidget(self.sub)
+        self.restyle()
+
+    def restyle(self, *_):
+        """跟随主题重画（拖拽高亮也走这里）。"""
+        p = theme.current()
+        line = p["accent"] if self._active else p["border_strong"]
+        bg = p["accent_soft"] if self._active else p["surface_sunken"]
+        self.setStyleSheet(
+            "QFrame { background: %s; border: 1px dashed %s;"
+            " border-radius: 6px; }"
+            "QLabel { background: transparent; border: none; }" % (bg, line))
+        self.title.setStyleSheet(
+            "font-size: 12px; font-weight: 700; color: %s;"
+            % (p["accent"] if self._active else p["text"]))
+        self.sub.setStyleSheet("font-size: 11px; color: %s;" % p["text_faint"])
+
+    # ------------------------------------------------------------ 拖拽
+    def _set_active(self, flag):
+        if flag != self._active:
+            self._active = flag
+            self.restyle()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._set_active(True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        # dragMoveEvent 也必须 accept，否则部分平台上 drop 不会触发
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._set_active(False)
+
+    def dropEvent(self, event):
+        self._set_active(False)
+        paths = []
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if local:
+                paths.append(local)
+        if paths:
+            self.dropped.emit(paths)
+        event.acceptProposedAction()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
 
 class LanPage(BasePage):
     TINT_KEY = "tile_2"
@@ -126,6 +217,17 @@ class LanPage(BasePage):
         self._started_wall = 0.0      # 本次进房的时间戳（time.time，给温和提示用）
         self._alone_hinted = False    # "房间里只有你"的温和提示只给一次
         self._multi_ip_hinted = False # "检测到多个虚拟网卡地址"只提示一次
+        # 临时云盘（lan_share.ShareHub）：进房才创建，退房即销毁
+        self._hub = None
+        self._share_rows = []         # 当前渲染出来的文件行签名（避免每轮重建）
+        self._share_entries = []      # 当前渲染的条目（与 _share_rows 一一对应）
+        self._share_widgets = {}      # key -> {"prog","btn"}：进度只改这两个控件
+        self._share_remote = {}       # ip -> [文件]（上一次轮询拉回来的）
+        self._share_peer_ports = {}   # ip -> 对方云盘端口
+        self._share_polling = False   # 上一轮清单还没拉完，别叠加
+        self._share_peers = {}        # ip -> 昵称（渲染来源用）
+        self._download = None         # {"key","name"} 正在下载的那一项
+        self._cancel_dl = False       # 下载取消标志（后台线程读）
         self._event.connect(self._on_event)
         self._build_content()
 
@@ -134,7 +236,15 @@ class LanPage(BasePage):
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
+        # 临时云盘：清单轮询比成员列表慢得多（每轮要对每个成员发一次
+        # HTTP），单独用 3 秒的定时器，别塞进 800ms 的 _tick 里。
+        self._share_timer = QTimer(self)
+        self._share_timer.setInterval(3000)
+        self._share_timer.timeout.connect(self._poll_shares)
+        self._share_timer.start()
+
         theme.bus.changed.connect(self._refresh_status_style)
+        theme.bus.changed.connect(self._restyle_share)
 
         # 启动即清理上次残留（后台线程，不打扰用户、不弹 UAC）
         threading.Thread(target=self._cleanup_orphans_on_launch,
@@ -176,6 +286,7 @@ class LanPage(BasePage):
     def _build_content(self):
         self.add(self._build_mode_card())
         self.add(self._build_members_card())
+        self.add(self._build_share_card())
         self.add(self._build_log_card())
         self.add(self._build_help_card())
         self.add_stretch()
@@ -521,6 +632,434 @@ class LanPage(BasePage):
             )
         self.members_box.setVisible(bool(entries))
 
+    # ------------------------------------------------------------------ 云盘
+    def _build_share_card(self):
+        """临时云盘：拖文件进来，同房间的人都能下载；退出房间立即失效。
+
+        实现思路抄 MCTier 的「文件夹共享」——每个客户端在自己那块虚拟
+        网卡上起 HTTP 服务，成员之间互相拉清单、拉文件。没有中心服务器，
+        谁是分享者文件就在谁那儿；退出房间时虚拟网卡一断、服务一停，
+        谁也就下不到了。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("临时云盘")
+        title.setObjectName("CardTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.share_count = QLabel("0 个文件")
+        self.share_count.setObjectName("Muted")
+        self.share_count.setStyleSheet("font-size: 11px;")
+        head.addWidget(self.share_count)
+        self.btn_share_dir = QPushButton("打开文件夹")
+        self.btn_share_dir.setObjectName("MiniButton")
+        self.btn_share_dir.setCursor(Qt.PointingHandCursor)
+        self.btn_share_dir.setFixedHeight(26)
+        self.btn_share_dir.setToolTip(
+            "打开下载文件的保存位置：\n" + lan_share.download_dir())
+        self.btn_share_dir.clicked.connect(self._on_open_share_dir)
+        head.addWidget(self.btn_share_dir)
+        v.addLayout(head)
+
+        self.drop_zone = _DropZone()
+        self.drop_zone.dropped.connect(self._on_share_paths)
+        self.drop_zone.clicked.connect(self._on_share_pick)
+        self.drop_zone.setEnabled(False)
+        v.addWidget(self.drop_zone)
+
+        self.share_hint = QLabel(
+            "进入房间后可用：拖进来的文件，队友在「在线成员」里就能看到并下载。\n"
+            "文件不会上传到任何服务器——它在你的电脑上，队友直接从你这里取。\n"
+            "退出房间（或点「停止」）服务立即关闭，之后谁都下不到。"
+        )
+        self.share_hint.setObjectName("Faint")
+        self.share_hint.setWordWrap(True)
+        self.share_hint.setStyleSheet("font-size: 11px;")
+        v.addWidget(self.share_hint)
+
+        self.share_box = QWidget()
+        self.share_layout = QVBoxLayout(self.share_box)
+        self.share_layout.setContentsMargins(0, 0, 0, 0)
+        self.share_layout.setSpacing(4)
+        self.share_box.setVisible(False)
+        v.addWidget(self.share_box)
+        return card
+
+    def _make_share_row(self, entry):
+        """一行文件：色块 + 文件名 + 大小 + 来源 + 动作按钮。
+
+        自己的行给「移除」，别人的行给「下载」。下载中那一行的按钮变成
+        「取消」，旁边多一个进度文本——同一个按钮承担两件事，省得为了
+        取消再挤一个控件进去。
+        """
+        p = theme.current()
+        row = QFrame()
+        row.setObjectName("MemberRow")
+        row.setStyleSheet(
+            "QFrame#MemberRow { background: %s; border: 1px solid %s;"
+            " border-radius: 5px; }" % (p["surface_sunken"], p["border"])
+        )
+        h = QHBoxLayout(row)
+        h.setContentsMargins(8, 5, 6, 5)
+        h.setSpacing(8)
+
+        dot = QFrame()
+        dot.setFixedSize(9, 9)
+        dot.setStyleSheet(
+            "background: %s; border: none; border-radius: 2px;"
+            % (p["accent"] if entry["mine"] else p["text_faint"]))
+        h.addWidget(dot)
+
+        name = QLabel(entry["name"])
+        name.setToolTip(entry["name"])
+        name.setStyleSheet(
+            "font-size: 12px; font-weight: %s; color: %s; background: transparent;"
+            " border: none;" % ("700" if entry["mine"] else "400",
+                               p["text"] if entry["mine"] else p["text_dim"]))
+        h.addWidget(name, 1)
+
+        prog = QLabel("")
+        prog.setStyleSheet(
+            "font-size: 11px; color: %s; background: transparent; border: none;"
+            % p["accent"])
+        prog.setVisible(False)
+        h.addWidget(prog)
+
+        tag = QLabel(entry["owner"])
+        tag.setStyleSheet(
+            "font-size: 11px; color: %s; background: transparent;"
+            " border: 1px solid %s; border-radius: 4px; padding: 1px 6px;"
+            % (p["text_dim"], p["border_strong"]))
+        h.addWidget(tag)
+
+        size = QLabel(lan_share.human_size(entry["size"]))
+        size.setStyleSheet(
+            "font-size: 11px; color: %s; background: transparent; border: none;"
+            % p["text_faint"])
+        h.addWidget(size)
+
+        busy = bool(self._download and self._download.get("key") == entry["key"])
+        btn = QPushButton("取消" if busy else ("移除" if entry["mine"] else "下载"))
+        btn.setObjectName("MiniButton")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(26)
+        btn.setMinimumWidth(56)
+        btn.clicked.connect(lambda _=False, e=entry: self._on_share_action(e))
+        h.addWidget(btn)
+
+        self._share_widgets[entry["key"]] = {"prog": prog, "btn": btn}
+        return row
+
+    def _refresh_share_view(self):
+        """把「我分享的」和「各成员分享的」合成一份列表画出来。
+
+        自己的排前面：拖进来立刻要能看到，否则用户不知道有没有生效。
+        """
+        entries = []
+        if self._hub is not None and self._hub.running:
+            for f in self._hub.own_files():
+                entries.append({"key": "me:" + f["id"], "fid": f["id"],
+                                "name": f["name"], "size": f["size"],
+                                "owner": "我", "mine": True, "ip": "", "port": 0})
+        for ip, files in (self._share_remote or {}).items():
+            owner = (self._share_peers or {}).get(ip) or ip
+            port = (self._share_peer_ports or {}).get(ip, 0)
+            for f in files:
+                entries.append({"key": "%s:%s" % (ip, f["id"]), "fid": f["id"],
+                                "name": f["name"], "size": f["size"],
+                                "owner": owner, "mine": False,
+                                "ip": ip, "port": port})
+        sig = [(e["key"], e["name"], e["size"], e["owner"]) for e in entries]
+        self._share_entries = entries
+        if sig != self._share_rows:
+            self._render_share(entries)
+            self._share_rows = sig
+        else:
+            # 结构没变也要把按钮文案拉回正确状态（下载结束/取消后）
+            for e in entries:
+                w = self._share_widgets.get(e["key"])
+                if w:
+                    busy = bool(self._download
+                                and self._download.get("key") == e["key"])
+                    w["btn"].setText(
+                        "取消" if busy else ("移除" if e["mine"] else "下载"))
+                    if not busy:
+                        w["prog"].setVisible(False)
+        self.share_count.setText("%d 个文件" % len(entries))
+        if self._running and self._hub is not None and self._hub.running:
+            others = sum(len(f) for f in (self._share_remote or {}).values())
+            self.share_hint.setText(
+                "云盘已开启：拖文件进来，队友就能下载。已看到队友分享的 %d 个文件。\n"
+                "退出房间后服务立即关闭，之后谁都下不到。" % others)
+
+    def _render_share(self, entries):
+        while self.share_layout.count():
+            item = self.share_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                # 先 hide 再 deleteLater：takeAt 只把控件移出布局，它仍然
+                # 可见，要等下一轮事件循环才真正销毁——中间那一帧新旧行
+                # 会叠成"重影"（和成员列表同一个坑）。
+                w.hide()
+                w.deleteLater()
+        self._share_widgets = {}
+        for e in entries:
+            self.share_layout.addWidget(self._make_share_row(e))
+        self.share_box.setVisible(bool(entries))
+
+    # ------------------------------------------------------------ 云盘：交互
+    def _on_open_share_dir(self):
+        """打开下载目录（没下载过也要能打开，方便用户自己放文件进去看）。"""
+        path = lan_share.download_dir()
+        try:
+            os.makedirs(path, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        except Exception as exc:
+            self.toast("打不开文件夹：%s" % exc)
+
+    def _on_share_pick(self):
+        """点击拖拽区 = 打开文件选择框。"""
+        if not (self._running and self._hub is not None):
+            self.toast("先点「进入房间」，云盘才会开启")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要分享给房间成员的文件", "", "所有文件 (*)")
+        if paths:
+            self._on_share_paths(paths)
+
+    def _on_share_paths(self, paths):
+        """拖入/选中的路径：文件直接收，文件夹展开一层。"""
+        if not self._running or self._hub is None:
+            self.toast("先点「进入房间」，云盘才会开启")
+            return
+        files = []
+        for raw in list(paths)[:MAX_DROP_FILES]:
+            if os.path.isdir(raw):
+                try:
+                    for nm in sorted(os.listdir(raw)):
+                        sub = os.path.join(raw, nm)
+                        if os.path.isfile(sub):
+                            files.append(sub)
+                except OSError as exc:
+                    self._append_log("读取文件夹失败：%s（%s）" % (raw, exc))
+            else:
+                files.append(raw)
+        if not files:
+            self.toast("没有可分享的文件")
+            return
+        added, skipped = self._hub.add_paths(files[:MAX_DROP_FILES])
+        for s in skipped:
+            self._append_log("未分享：%s" % s)
+        if added:
+            names = "、".join(e["name"] for e in added[:3])
+            more = "" if len(added) <= 3 else " 等 %d 个" % len(added)
+            self.toast("已分享 %d 个文件" % len(added))
+            self._append_log("已分享 %d 个文件：%s%s" % (len(added), names, more))
+        elif skipped:
+            self.toast("没有新增文件：%s" % skipped[0])
+        self._publish_share_port()
+        self._refresh_share_view()
+
+    def _on_share_action(self, entry):
+        """行内按钮：自己的「移除」，别人的「下载」/下载中的「取消」。"""
+        if self._hub is None or not self._hub.running:
+            return
+        if entry["mine"]:
+            if self._download and self._download.get("key") == entry["key"]:
+                self._cancel_dl = True          # 正在下自己的文件？先取消
+                return
+            self._hub.remove(entry["fid"])
+            self._append_log("已取消分享：%s" % entry["name"])
+            self._publish_share_port()
+            self._refresh_share_view()
+            return
+
+        if self._download is not None:
+            if self._download.get("key") == entry["key"]:
+                self._cancel_dl = True
+                self.toast("正在取消…")
+            else:
+                self.toast("已有一个下载在进行，先等它结束或点它那行的「取消」")
+            return
+
+        if not entry["port"]:
+            self.toast("对方未开启云盘（可能是旧版本）")
+            return
+        self._start_download(entry)
+
+    def _start_download(self, entry):
+        hub = self._hub
+        if hub is None:
+            return
+        key = entry["key"]
+        self._download = {"key": key, "name": entry["name"]}
+        self._cancel_dl = False
+        self._append_log("开始下载 %s（来自 %s）…" % (entry["name"], entry["owner"]))
+        last = [0.0]
+        ip, port, fid = entry["ip"], entry["port"], entry["fid"]
+
+        def prog(done, total):
+            now = time.monotonic()
+            if done != total and now - last[0] < 0.25:
+                return          # 节流：每个 64KB 分块都发信号会把事件队列灌满
+            last[0] = now
+            self._event.emit("share_prog", {"key": key, "done": done, "total": total})
+
+        def work():
+            ok, res = hub.download(ip, port, fid, progress=prog,
+                                   is_cancelled=lambda: self._cancel_dl,
+                                   timeout=20.0)
+            self._event.emit("share_done",
+                             {"key": key, "ok": ok, "result": res,
+                              "name": entry["name"]})
+
+        threading.Thread(target=work, daemon=True, name="ShareDownload").start()
+        self._refresh_share_view()
+
+    def _publish_share_port(self):
+        """把云盘端口写进昵称信标，队友的成员列表下一轮就知道我开着云盘。"""
+        if self._beacon is None:
+            return
+        port = self._hub.port if (self._hub is not None and self._hub.running) else 0
+        try:
+            self._beacon.set_share(port)
+        except Exception:
+            pass
+
+    def _ensure_share_hub(self, ip):
+        """按当前虚拟 IP 起（或重绑）云盘服务。
+
+        和「信标 + 成员跟踪」同一生命周期：进房起、退房停、IP 变了重绑。
+        token 用房间码 + 密码派生——只有同房间的人算得出同一个值。
+        """
+        token = lan_share.make_token(self.code_edit.text().strip(),
+                                     self.pass_edit.text())
+        nick = self._host_nick or self._current_nickname()
+        if self._hub is None:
+            self._hub = lan_share.ShareHub(
+                token, nick=nick,
+                on_log=lambda m: self._event.emit("_etier_log", m))
+            ok, msg = self._hub.start(ip)
+        else:
+            self._hub.set_nick(nick)
+            ok, msg = self._hub.rebind(ip)
+        if not ok:
+            self._append_log("临时云盘开启失败：%s" % msg)
+        self._publish_share_port()
+        self._refresh_share_view()
+
+    def _stop_share_hub(self):
+        """关掉云盘服务并清空清单。
+
+        「退出房间后无法下载」就落在这里：服务一停，队友的连接直接被拒。
+        下载到本地的文件**不删**——用户已经拿到手的东西没有理由替他清掉。
+        """
+        hub, self._hub = self._hub, None
+        self._cancel_dl = True          # 正在跑的下载线程据此尽快收尾
+        self._download = None
+        self._share_remote = {}
+        self._share_peer_ports = {}
+        self._share_peers = {}
+        if hub is not None:
+            try:
+                hub.stop()
+            except Exception:
+                pass
+        if self._beacon is not None:
+            try:
+                self._beacon.set_share(0)
+            except Exception:
+                pass
+        self._share_rows = []
+        try:
+            # 关闭路径（退出程序）上控件可能已在销毁中，刷新失败不该再抛
+            self._refresh_share_view()
+        except RuntimeError:
+            pass
+
+    def _poll_shares(self):
+        """每 3 秒拉一次各成员的云盘清单（网络操作，必须丢后台线程）。"""
+        if not self._running or self._hub is None or not self._hub.running:
+            return
+        if self._share_polling:
+            return                     # 上一轮还没回来，别叠加请求
+        hub = self._hub
+        peers, ports, names = [], {}, {}
+        for m in (self._tracker.snapshot() if self._tracker else []):
+            ip = m.get("ip") or ""
+            if not ip or ip == self._my_ip:
+                continue
+            names[ip] = m.get("name") or ip
+            port = int(m.get("share") or 0)
+            if port:
+                ports[ip] = port
+                peers.append({"ip": ip, "port": port})
+        self._share_polling = True
+
+        def work():
+            try:
+                res = hub.collect(peers, timeout=2.5) if peers else []
+            except Exception:
+                res = []
+            self._event.emit("share_poll",
+                             {"res": res, "ports": ports, "names": names})
+
+        threading.Thread(target=work, daemon=True, name="SharePoll").start()
+
+    def _on_share_poll(self, payload):
+        payload = payload or {}
+        self._share_polling = False
+        self._share_peers = payload.get("names") or {}
+        self._share_peer_ports = payload.get("ports") or {}
+        remote = {}
+        for r in payload.get("res") or []:
+            if r.get("ok") and r.get("files"):
+                remote[r.get("ip") or ""] = r["files"]
+        self._share_remote = remote
+        self._refresh_share_view()
+
+    def _on_share_prog(self, payload):
+        """进度回主线程：只改那一行的进度文本，不重建整行（会闪）。"""
+        payload = payload or {}
+        w = (self._share_widgets or {}).get(payload.get("key"))
+        if not w:
+            return
+        done = int(payload.get("done") or 0)
+        total = int(payload.get("total") or 0)
+        pct = int(done * 100 / total) if total else 0
+        w["prog"].setText("%d%% · %s / %s"
+                          % (pct, lan_share.human_size(done),
+                             lan_share.human_size(total)))
+        w["prog"].setVisible(True)
+
+    def _on_share_done(self, payload):
+        payload = payload or {}
+        name = payload.get("name") or "文件"
+        self._download = None
+        self._cancel_dl = False
+        if payload.get("ok"):
+            path = str(payload.get("result") or "")
+            self.toast("已下载：%s" % os.path.basename(path))
+            self._append_log("下载完成：%s" % path)
+        else:
+            self._append_log("下载未完成：%s（%s）" % (name, payload.get("result")))
+            self.toast("下载失败：%s" % payload.get("result"))
+        self._share_rows = []           # 强制重建，把按钮文案复位
+        self._refresh_share_view()
+
+    def _restyle_share(self, *_):
+        """主题切换后重画拖拽区（它的边框高亮是内联样式，不跟 QSS 走）。"""
+        try:
+            self.drop_zone.restyle()
+        except (AttributeError, RuntimeError):
+            pass
+
     def _build_log_card(self):
         card = QFrame()
         card.setObjectName("Card")
@@ -568,6 +1107,10 @@ class LanPage(BasePage):
             "走社区节点中继。虚拟网卡驱动已内置，无需提前装任何东西；首次运行\n"
             "Windows 防火墙若弹窗，允许即可，否则隧道建不起来。\n"
             "房间码 + 密码双重校验，密码不落盘、不明文传输，停止后即从内存清除。\n"
+            "\n"
+            "临时云盘：进房后把文件拖进「临时云盘」的框里，同房间的人就能下载。\n"
+            "文件只在你自己的电脑上，不经任何服务器；退出房间服务即关闭，\n"
+            "之后谁都下不到（已下载到本地的不受影响）。\n"
             "\n"
             "备注：神力科莎用 acServer 开服后走游戏内 LAN 列表，或直接填 IP:9600；\n"
             "以撒的结合不支持局域网联机（只能同屏或走 Steam 在线），列表里只是提醒。",
@@ -799,6 +1342,8 @@ class LanPage(BasePage):
             ip, name_lookup=self._beacon.get_info, on_log=log,
         )
         self._tracker.start()
+        # 临时云盘与这一对同生共死（进房起、退房停、IP 变了重绑）
+        self._ensure_share_hub(ip)
 
     def _on_stop(self):
         if self._etier_busy:
@@ -832,11 +1377,13 @@ class LanPage(BasePage):
         self._running = False
         self._my_ip = ""
         self._host_nick = ""
+        # 先关云盘（此刻信标还在，能把"我关了云盘"广播出去），再停后台线程
+        self._stop_share_hub()
         self._stop_room_threads()
         self._set_running(False)
         self._set_status_note("")
         self._clear_members()
-        self._append_log("跨网房间已停止")
+        self._append_log("跨网房间已停止（临时云盘已关闭）")
 
     def _set_running(self, flag):
         self.btn_stop.setEnabled(flag)
@@ -861,6 +1408,9 @@ class LanPage(BasePage):
                   self.node_combo):
             w.setEnabled(not flag)
         self.game_combo.setEnabled(True)
+        # 云盘只在房间运行期间可用：没进房间时没有虚拟网卡可绑，
+        # 拖进去也无处可分享。
+        self.drop_zone.setEnabled(flag)
         # IP 显示与复制按钮
         self.btn_copy_ip.setEnabled(flag and bool(self._my_ip))
         self.btn_copy_addr.setEnabled(flag and bool(self._my_ip))
@@ -1049,6 +1599,12 @@ class LanPage(BasePage):
                 self._on_done(payload or {})
             elif kind == "_etier_stopped":
                 self._on_stopped()
+            elif kind == "share_poll":
+                self._on_share_poll(payload or {})
+            elif kind == "share_prog":
+                self._on_share_prog(payload or {})
+            elif kind == "share_done":
+                self._on_share_done(payload or {})
         except Exception as exc:                     # 界面出错不该拖垮转发
             self._append_log("界面更新出错：%s" % exc)
 
@@ -1106,6 +1662,12 @@ class LanPage(BasePage):
         tier, self._etier = self._etier, None
         self._running = False
         self._etier_busy = False
+        # 退出程序也要关云盘：否则服务线程会吊着端口，用户以为"关了软件
+        # 别人还能下"。
+        try:
+            self._stop_share_hub()
+        except Exception:
+            pass
         if tier is not None:
             tier.request_stop()      # 同步写停止信号（瞬时、必达）
             tier.wait_stopped(1.5)   # 给看门狗一点时间；等不到也无妨

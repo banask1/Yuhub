@@ -704,15 +704,18 @@ class MemberTracker:
     def snapshot(self):
         """当前在线成员，按 IP 排序。UI 线程调用，零阻塞。
 
-        返回 [{"ip", "name", "game", "port"}]。game / port 是对端在
+        返回 [{"ip", "name", "game", "port", "share"}]。game / port 是对端在
         「游戏快连」里选的那款游戏（由昵称信标一起广播过来），队友的
         成员行据此显示"他在玩什么"，复制按钮也用**他的**端口拼地址。
+        share 是对端「临时云盘」的服务端口（0 = 没开 / 旧版本），拉文件
+        清单时直接拿它拼地址，不用先猜再试。
         """
         with self._lock:
             return [{"ip": ip,
                      "name": (p.get("name") or ""),
                      "game": (p.get("game") or ""),
-                     "port": int(p.get("port") or 0)}
+                     "port": int(p.get("port") or 0),
+                     "share": int(p.get("share") or 0)}
                     for ip, p in sorted(self._peers.items())]
 
     # ------------------------------------------------ 后台线程主体
@@ -738,7 +741,7 @@ class MemberTracker:
             for ip in arp:
                 p = self._peers.setdefault(
                     ip, {"confirmed": now, "ping_fail": 0,
-                         "name": "", "game": "", "port": 0})
+                         "name": "", "game": "", "port": 0, "share": 0})
                 p["confirmed"] = now
                 p["ping_fail"] = 0
         # ② 逐个 ping：保活 ARP + 主动确认活性
@@ -825,6 +828,14 @@ class MemberTracker:
                     port = 0
                 if port:
                     cur["port"] = port
+                try:
+                    share = int(info.get("share") or 0)
+                except (TypeError, ValueError):
+                    share = 0
+                # 信标里带 share 键才更新：旧版客户端不广播这个键，
+                # 此时保持原值（0），不会把"已知道对方开着云盘"给冲掉。
+                if "share" in info:
+                    cur["share"] = share
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +864,9 @@ _NICK_MAGIC = "yuhub-nick-v1"
 # 所以不用升协议版本——新旧客户端可以混在同一个房间里。
 _NICK_GAME = "game"
 _NICK_PORT = "port"
+# 「临时云盘」的服务端口。0 / 缺省 = 这个人没开云盘（或用了旧版本），
+# 对端就不用白试一次连接。同样不升协议版本——多一个键对旧版透明。
+_NICK_SHARE = "share"
 
 
 class NickBeacon:
@@ -863,11 +877,12 @@ class NickBeacon:
     TCP_QUERY_TIMEOUT = 1.0      # TCP 查询超时
     TCP_FAIL_BACKOFF = 30.0      # TCP 查询失败后的重试间隔（秒）
 
-    def __init__(self, my_ip, nick, on_log=None, game="", port=0):
+    def __init__(self, my_ip, nick, on_log=None, game="", port=0, share=0):
         self._my_ip = my_ip
         self._nick = (nick or "").strip()[:32]
         self._game = (game or "").strip()[:24]
         self._port = int(port or 0)
+        self._share = int(share or 0)
         self._on_log = on_log or (lambda msg: None)
         self._stop_evt = threading.Event()
         self._wake = threading.Event()      # 打断广播间隔（切换游戏后立刻广播）
@@ -907,6 +922,12 @@ class NickBeacon:
             self._port = int(port or 0)
         self._wake.set()
 
+    def set_share(self, port):
+        """更新本机广播的「临时云盘」端口（0 = 关闭）。同样立刻踢一次广播。"""
+        with self._lock:
+            self._share = int(port or 0)
+        self._wake.set()
+
     def get_info(self, ip, timeout=None):
         """查某虚拟 IP 的 {"name","game","port"}。
 
@@ -938,14 +959,16 @@ class NickBeacon:
         return self.get_info(ip, timeout).get("name", "")
 
     def _payload(self):
-        """当前要广播的报文（每次现取，所以切换游戏后立刻生效）。"""
+        """当前要广播的报文（每次现取，所以切换游戏/开关云盘后立刻生效）。"""
         with self._lock:
-            nick, game, port = self._nick, self._game, self._port
+            nick, game, port, share = self._nick, self._game, self._port, self._share
         d = {_NICK_MAGIC: nick}
         if game:
             d[_NICK_GAME] = game
         if port:
             d[_NICK_PORT] = int(port)
+        if share:
+            d[_NICK_SHARE] = int(share)
         return json.dumps(d, ensure_ascii=False).encode("utf-8")
 
     # ------------------------------------------------ 内部：三个小线程
@@ -1063,10 +1086,15 @@ class NickBeacon:
             port = int(d.get(_NICK_PORT) or 0)
         except (TypeError, ValueError):
             port = 0
+        try:
+            share = int(d.get(_NICK_SHARE) or 0)
+        except (TypeError, ValueError):
+            share = 0
         return {
             "name": str(d.get(_NICK_MAGIC) or "").strip()[:32],
             "game": str(d.get(_NICK_GAME) or "").strip()[:24],
             "port": port,
+            "share": share,
         }
 
 
