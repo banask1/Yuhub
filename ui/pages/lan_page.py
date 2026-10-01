@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPlainTextEdit,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -124,6 +125,7 @@ class LanPage(BasePage):
         self._host_nick = ""          # 本次启动用的昵称（成员列表第一行显示）
         self._started_wall = 0.0      # 本次进房的时间戳（time.time，给温和提示用）
         self._alone_hinted = False    # "房间里只有你"的温和提示只给一次
+        self._multi_ip_hinted = False # "检测到多个虚拟网卡地址"只提示一次
         self._event.connect(self._on_event)
         self._build_content()
 
@@ -315,8 +317,16 @@ class LanPage(BasePage):
         qk.addWidget(self._label("游戏快连"))
         self.game_combo = QComboBox()
         self.game_combo.setMaximumWidth(220)
-        for name, port in GAME_PORTS:
+        for i, (name, port) in enumerate(GAME_PORTS):
             self.game_combo.addItem("%s（%d）" % (name, port), port)
+            # 纯游戏名单独存一份（纯展示用：成员行里的贴片 + 广播给队友）
+            self.game_combo.setItemData(i, name, Qt.UserRole + 1)
+        self.game_combo.setToolTip(
+            "选你这次要玩的游戏。选好之后：\n"
+            "· 你自己的选择会广播给队友，「在线成员」里每行都会显示\n"
+            "  那个人玩的是什么；\n"
+            "· 每行的「复制」会给**那个人的**「IP:端口」。\n"
+            "进房间后也能改，改完 1 秒内队友那边就更新。")
         qk.addWidget(self.game_combo)
         self.btn_copy_addr = ghost_button("复制 IP:端口")
         self.btn_copy_addr.setEnabled(False)
@@ -324,6 +334,10 @@ class LanPage(BasePage):
         qk.addWidget(self.btn_copy_addr)
         qk.addStretch(1)
         v.addLayout(qk)
+
+        # 放在最后连：addItem 填充期间也会发 currentIndexChanged，
+        # 那时 _beacon / 成员行还没建起来，提前连会打到空对象上。
+        self.game_combo.currentIndexChanged.connect(self._on_game_changed)
 
         v.addWidget(self._note(
             "约定一组房间码 + 密码（谁定都行，点「随机」可自动生成一个），"
@@ -335,7 +349,14 @@ class LanPage(BasePage):
             "昵称是必填项：队友在「在线成员」里看到的就是它，没填不能进入房间。"
             "\n"
             "虚拟 IP 由 EasyTier 自动分配（不固定），所以每次启动可能不一样；"
-            "「在线成员」里每个人都带独立的「复制」按钮，直接复制即可，不用记。",
+            "中途卡死重进房间后尤其容易变。一旦变化，这里会**弹提示并写进"
+            "运行日志**，你也可以随时点「在线成员」右上角的「刷新」：它会"
+            "立刻重读本机 IP、重扫成员，不用「停止 → 再进入」。"
+            "\n"
+            "「游戏快连」选的是你这次要玩的游戏——它会广播给队友，"
+            "「在线成员」里每行都显示那个人玩的是什么，"
+            "那行的「复制」也给的是**他自己**的「IP:端口」。"
+            "进房间后照样能改。",
             warn=False
         ))
 
@@ -376,9 +397,21 @@ class LanPage(BasePage):
         self.members_count.setObjectName("Muted")
         self.members_count.setStyleSheet("font-size: 11px;")
         head.addWidget(self.members_count)
+        # 手动刷新：IP 突然变了 / 列表看着不对时，不用"停止再进入"——
+        # 点一下立刻重读虚拟 IP、重扫成员，并把变化写进日志。
+        self.btn_members_refresh = QPushButton("刷新")
+        self.btn_members_refresh.setObjectName("MiniButton")
+        self.btn_members_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_members_refresh.setFixedHeight(26)
+        self.btn_members_refresh.setToolTip(
+            "立刻重读本机虚拟 IP、重新扫描房间成员。\n"
+            "中途卡死重进房间后 IP 变了、或列表看着不对时点这里。")
+        self.btn_members_refresh.clicked.connect(self._on_refresh)
+        head.addWidget(self.btn_members_refresh)
         v.addLayout(head)
 
-        self.members_hint = QLabel("启动后这里会显示同一房间的成员昵称与虚拟 IP")
+        self.members_hint = QLabel("启动后这里会显示同一房间的成员昵称、虚拟 IP"
+                                   "与各自的「游戏快连」")
         self.members_hint.setObjectName("Faint")
         self.members_hint.setWordWrap(True)
         self.members_hint.setStyleSheet("font-size: 11px;")
@@ -394,11 +427,16 @@ class LanPage(BasePage):
         v.addWidget(self.members_box)
         return card
 
-    def _make_member_row(self, name, ip, is_self=False):
-        """构造一行成员：色块 + 昵称 + IP + 复制按钮。
+    def _make_member_row(self, name, ip, is_self=False, game="", port=0):
+        """构造一行成员：色块 + 昵称 + IP + 游戏快连贴片 + 复制按钮。
 
         is_self 为真时高亮并标注"（我）"，方便用户一眼分清
         "哪个地址是我自己的"——填进游戏别填错了。
+
+        game / port 是**这个人**在「游戏快连」里选的那款游戏（自己就是
+        当前下拉值，队友由昵称信标广播过来）。显示它是为了省掉"你玩的
+        是哪个、端口多少"的来回问；点「复制」时也用他的端口拼地址，
+        不再受我自己那个下拉的影响。
         """
         p = theme.current()
         row = QFrame()
@@ -434,34 +472,66 @@ class LanPage(BasePage):
             " color: %s; background: transparent; border: none;" % p["text"]
         )
         h.addWidget(ip_lb)
+
+        # 游戏快连贴片：他对战/联机用的是哪款游戏。没广播过来（旧版本
+        # 队友、或信标还没到）就不显示，宁缺勿假。
+        if game:
+            tag = QLabel(game)
+            tag.setStyleSheet(
+                "font-size: 11px; color: %s; background: transparent;"
+                " border: 1px solid %s; border-radius: 4px; padding: 1px 6px;"
+                % (p["text_dim"], p["border_strong"])
+            )
+            tag.setToolTip(
+                "%s 的游戏快连：%s%s" % (
+                    "我" if is_self else (name or ip),
+                    game,
+                    "（端口 %d）" % port if port else ""))
+            h.addWidget(tag)
+
         h.addStretch(1)
 
-        btn = ghost_button("复制")
-        btn.setFixedWidth(52)
+        # 「复制」用标准 mini 尺寸：以前用 ghost_button + setFixedWidth(52)，
+        # 而 ghost 样式自带 18px 左右内边距，52 宽留给文字的只有十几像素，
+        # 两个字被挤成"显示不清楚"。MiniButton 的内边距是 2px 12px，够用。
+        btn = QPushButton("复制")
+        btn.setObjectName("MiniButton")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(26)
+        btn.setMinimumWidth(56)
         # 复制「IP:端口」而不是裸 IP：游戏里要填的就是带端口的直连地址
-        # （「IP:端口」缺一不可），端口取「游戏快连」当前选中的那一款。
-        # 运行中游戏快连下拉是禁用的，所以房间存续期内端口稳定、不会串。
-        port = self.game_combo.currentData()
-        addr = "%s:%s" % (ip, port) if port else ip
+        # （「IP:端口」缺一不可）。端口优先用**这个人的**游戏快连；
+        # 他还没广播过来时退回我自己选的那个，至少能用。
+        use_port = port or (self.game_combo.currentData() or 0)
+        addr = "%s:%s" % (ip, use_port) if use_port else ip
+        btn.setToolTip("复制直连地址 %s" % addr)
         btn.clicked.connect(lambda _=False, v=addr: self._copy_text(v, "直连地址"))
         h.addWidget(btn)
         return row
 
     def _render_members(self, entries):
-        """按 entries 重建成员行。entries: [{"ip","name","self"}]。
+        """按 entries 重建成员行。
 
-        每次都整体重建而不是做差量更新：成员数量是个位数，
-        重建 5 个小控件的开销可以忽略，换来的是"不会漏删/重影"。
+        entries: [{"ip","name","self","game","port"}]。每次都整体重建而不是
+        做差量更新：成员数量是个位数，重建几个小控件的开销可以忽略，
+        换来的是"不会漏删/重影"。
         """
         while self.members_layout.count():
             item = self.members_layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                # 先 hide 再 deleteLater：takeAt 只是把控件移出布局，
+                # 它仍然是 members_box 的子控件、仍然"可见"，要等下一轮
+                # 事件循环处理 DeferredDelete 才真正消失。中间那一帧
+                # 新旧行会叠在一起（就是"重影"）。hide 是立即生效的。
+                w.hide()
                 w.deleteLater()
         for e in entries:
             self.members_layout.addWidget(
                 self._make_member_row(e.get("name", ""), e["ip"],
-                                      is_self=bool(e.get("self")))
+                                      is_self=bool(e.get("self")),
+                                      game=e.get("game", ""),
+                                      port=int(e.get("port") or 0))
             )
         self.members_box.setVisible(bool(entries))
 
@@ -499,7 +569,9 @@ class LanPage(BasePage):
             "   「进入房间」（首次弹一次 UAC，点「是」）。\n"
             "3. 把房间码和密码发给队友（建议走语音/私聊，别公开）。\n"
             "4. 队友填**同一组**房间码和密码，也点「进入房间」。\n"
-            "   进入后会在 15 秒内自动校验：房间码或密码不对会明确报错并断开。\n"
+            "   进入后不做阻塞校验（校验会把偶发找不到人的队友踢出去）：\n"
+            "   若 30 秒后成员列表里还只有你自己，会给一条温和提示，\n"
+            "   让你核对房间码和密码是不是和大家完全一致。\n"
             "5. 大家打开游戏的「多人游戏」，列表里就能直接看到彼此开的房间。\n"
             "\n"
             "所有人都是同一个身份：大家都做同一件事——填同一组房间码+密码、\n"
@@ -509,10 +581,17 @@ class LanPage(BasePage):
             "昵称：填在「我的昵称」里，**必填**——队友在「在线成员」里\n"
             "看到的就是它。\n"
             "\n"
-            "虚拟 IP：由 EasyTier 自动分配，不固定（换房间/重启都可能变）。\n"
-            "要某台机器的地址时，在「在线成员」里点那一行的「复制」即可——\n"
-            "复制出来的是带端口的直连地址「IP:端口」，端口就是上面「游戏快连」\n"
-            "里选的那一款，拿到就能直接填进游戏。\n"
+            "虚拟 IP：由 EasyTier 自动分配，不固定（换房间/重启都可能变，\n"
+            "中途卡死重进房间后尤其容易变）。变了本页会弹提示并写进运行日志；\n"
+            "拿不准时点「在线成员」右上角的「刷新」——立刻重读本机 IP、\n"
+            "重扫成员列表，不用「停止 → 再进入」（省掉十几秒和一次 UAC）。\n"
+            "\n"
+            "在线成员：每行是「昵称 + 虚拟 IP + 游戏快连贴片 + 复制」。\n"
+            "贴片显示那个人自己选的是哪款游戏——看到「泰拉瑞亚」就知道\n"
+            "他在开泰拉瑞亚的服，不用再问。点「复制」拿到的是**他的**\n"
+            "「IP:端口」（用他选的那款游戏的端口），填进游戏即可。\n"
+            "如果对方是旧版本、或信标还没到，那一行不显示贴片，\n"
+            "这时「复制」会退回用你自己选的端口。\n"
             "\n"
             "中继节点：默认「自动」会尝试全部内置节点（含 MCTier 社区维护\n"
             "的海波美国/海波中国大陆、唯爱厦门等），失败自动换下一个。\n"
@@ -521,8 +600,9 @@ class LanPage(BasePage):
             "\n"
             "游戏快连：内置常见联机游戏的默认端口（Minecraft 服务器 25565、\n"
             "泰拉瑞亚 7777、幻兽帕鲁 8211、神力科莎 9600 等）。\n"
-            "这里选好游戏后，「在线成员」每行「复制」出来的就是对应的\n"
-            "「IP:端口」，右上的「复制 IP:端口」则复制本机的直连地址。\n"
+            "它同时是**广播项**：你选了哪款，队友的成员列表里就看到哪款，\n"
+            "所以进房间前选、进房间后改都行（改完 1 秒内队友那边就更新）。\n"
+            "右上的「复制 IP:端口」则复制本机的直连地址。\n"
             "神力科莎：房主先用 acServer（或 Content Manager 的 Server Manager）\n"
             "开服，队友在游戏「在线」里的 LAN 标签页能看到，也可直接填 IP:9600。\n"
             "注意：以撒的结合官方不支持局域网联机（只能同屏合作，或走 Steam\n"
@@ -558,6 +638,37 @@ class LanPage(BasePage):
             self._settings.setValue("lan_node", self.node_combo.currentData())
         except Exception:
             pass
+
+    def _selected_game(self):
+        """当前「游戏快连」选择 → (游戏名, 端口)。取不到就返回 ("", 0)。"""
+        try:
+            name = self.game_combo.currentData(Qt.UserRole + 1) or ""
+        except Exception:
+            name = ""
+        try:
+            port = int(self.game_combo.currentData() or 0)
+        except (TypeError, ValueError):
+            port = 0
+        return str(name), port
+
+    def _on_game_changed(self, _index=0):
+        """切换「游戏快连」：广播给队友 + 重画成员行。
+
+        运行中也能改（这个下拉在房间运行期间保持可用）——很多人是进了
+        房间才决定玩什么的。改完立刻踢一次信标广播，队友那边 1 秒内
+        就能看到；我这边的本机贴片和「复制 IP:端口」也马上跟着变。
+        """
+        name, port = self._selected_game()
+        if self._beacon is not None:
+            try:
+                self._beacon.set_game(name, port)
+            except Exception:
+                pass
+        if self._running:
+            self._members_row = []          # 强制重建：贴片与复制端口都变了
+            self._update_ip()
+            self._append_log("游戏快连已切换为 %s（%d），已广播给队友"
+                             % (name, port))
 
     def _on_copy_game_addr(self):
         """游戏快连：复制「虚拟 IP:端口」直连地址。"""
@@ -686,18 +797,7 @@ class LanPage(BasePage):
             # --hostname 不进 DNS/NetBIOS，gethostbyaddr 在虚拟网里查不出
             # 昵称——这就是"成员列表总显示不了昵称"的根因（v0.8.3beta 修）。
             self._stop_room_threads()
-            beacon_log = lambda m: self._event.emit("_etier_log", m)
-            self._beacon = etier.NickBeacon(
-                self._my_ip,
-                self._host_nick or self._current_nickname(),
-                on_log=beacon_log,
-            )
-            self._beacon.start()
-            self._tracker = etier.MemberTracker(
-                self._my_ip, name_lookup=self._beacon.get_name,
-                on_log=beacon_log,
-            )
-            self._tracker.start()
+            self._start_room_threads(self._my_ip)
             self._append_log("已进入房间（虚拟 IP %s）" % self._my_ip)
             self.toast("已进入房间")
         else:
@@ -724,6 +824,31 @@ class LanPage(BasePage):
                 except Exception:
                     pass
                 setattr(self, attr, None)
+
+    def _start_room_threads(self, ip):
+        """按给定虚拟 IP 起「昵称信标 + 成员跟踪」这对后台线程。
+
+        抽成函数是因为它有**两个**使用场景，而且两处的正确性要求一样高：
+          1. 刚进入房间（_on_done）；
+          2. 房间存续期内虚拟 IP 变了（_on_ip_changed）。
+        第 2 种情况以前根本不存在——信标把 socket 绑在旧 IP 上、跟踪器
+        拿旧 IP 当"排除自己"的判据，IP 一变，这一对就静默失效了：
+        人还在房间，但成员列表永远空、别人也看不到你。必须整个重建。
+        """
+        self._stop_room_threads()
+        log = lambda m: self._event.emit("_etier_log", m)     # noqa: E731
+        game, port = self._selected_game()
+        self._beacon = etier.NickBeacon(
+            ip,
+            self._host_nick or self._current_nickname(),
+            on_log=log,
+            game=game, port=port,
+        )
+        self._beacon.start()
+        self._tracker = etier.MemberTracker(
+            ip, name_lookup=self._beacon.get_info, on_log=log,
+        )
+        self._tracker.start()
 
     def _on_stop(self):
         if self._etier_busy:
@@ -779,9 +904,13 @@ class LanPage(BasePage):
             self.btn_start.setText(self._start_button_text())
         else:
             self._refresh_start_gate()
+        # 房间运行期间允许改「游戏快连」：很多人是进了房间才决定玩什么，
+        # 而且切换会立刻广播给队友、成员行的贴片与复制端口同步更新，
+        # 所以没必要锁着它逼用户"停止 → 再进入"。
         for w in (self.code_edit, self.pass_edit, self.btn_random,
-                  self.node_combo, self.game_combo):
+                  self.node_combo):
             w.setEnabled(not flag)
+        self.game_combo.setEnabled(True)
         # IP 显示与复制按钮
         self.btn_copy_ip.setEnabled(flag and bool(self._my_ip))
         self.btn_copy_addr.setEnabled(flag and bool(self._my_ip))
@@ -792,10 +921,52 @@ class LanPage(BasePage):
     def _clear_members(self):
         """清空成员列表显示（回到"未启动"的占位状态）。"""
         self._render_members([])
-        self.members_hint.setText("启动后这里会显示同一房间的成员昵称与虚拟 IP")
+        self.members_hint.setText("启动后这里会显示同一房间的成员昵称、虚拟 IP"
+                                  "与各自的「游戏快连」")
         self.members_hint.setVisible(True)
         self.members_count.setText("0 人")
         self._members_row = []
+
+    def _on_refresh(self):
+        """「刷新」按钮：立刻重读虚拟 IP、重扫成员、强制重建列表。
+
+        针对的实际场景：两个人联机中途程序卡死退出，重新进入房间后
+        虚拟 IP 变了（DHCP 重新分配），而界面上还是旧地址——拿去填游戏
+        当然连不上。以前唯一的办法是「停止 → 再进入」（十几秒 + 一次
+        UAC），现在点一下就把最新 IP 和成员列表拉回来，IP 变了会明确说。
+        """
+        old_ip = self._my_ip
+        if self._tracker is not None:
+            try:
+                self._tracker.refresh_now()   # 让后台线程立刻再扫一轮
+            except Exception:
+                pass
+        self._members_row = []                # 强制重建，清掉可能残留的旧行
+        self._update_ip()
+        if self._my_ip and old_ip and self._my_ip != old_ip:
+            return                            # 变化提示已由 _on_ip_changed 给出
+        if self._running:
+            self.toast("已刷新：本机虚拟 IP %s（%d 人在线）"
+                       % (self._my_ip or "未就绪", len(self._members_row)))
+        else:
+            self.toast("已刷新")
+        self._append_log("已手动刷新（本机虚拟 IP %s）"
+                         % (self._my_ip or "未就绪"))
+
+    def _on_ip_changed(self, old_ip, new_ip):
+        """本机虚拟 IP 在房间存续期内变了。
+
+        什么时候会变：DHCP 遇到地址冲突会自动改地址；程序卡死/被强杀后
+        重进房间，EasyTier 也可能分到一个新地址。**变了必须整对重建**
+        昵称信标与成员跟踪——它们把 IP 焊死在 socket 绑定和"排除自己"
+        的判据里，不重建就是"人还在房间、成员列表永远空、别人也看不到
+        我"，而且界面上一点异常都没有。这正是"IP 变了不知道"的代价。
+        """
+        self._append_log("⚠ 本机虚拟 IP 已变化：%s → %s（正按新地址重建成员发现…）"
+                         % (old_ip, new_ip))
+        self.toast("虚拟 IP 已变化：%s → %s" % (old_ip, new_ip))
+        self._members_row = []
+        self._start_room_threads(new_ip)
 
     def _set_status_note(self, text):
         try:
@@ -830,24 +1001,49 @@ class LanPage(BasePage):
         """
         ip = etier.virtual_adapter_ip()
         if ip:
+            # 先记下旧值：进入房间后 IP 还可能变（DHCP 冲突改址 /
+            # 卡死重进），变了要主动告知并重建成员发现（见 _on_ip_changed）
+            old_ip = self._my_ip
+            changed = bool(old_ip) and ip != old_ip
             self._my_ip = ip
             self.ip_label.setText(ip)
             self.btn_copy_ip.setEnabled(True)
             self.btn_copy_addr.setEnabled(True)
             members = self._tracker.snapshot() if self._tracker else []
 
+            # 多个虚拟地址 = 大概率残留了旧 wintun 网卡（卡死重启后常见）。
+            # 挑哪个都可能挑错，所以只如实提示一次，让用户有权决定重进房间。
+            all_ips = etier.virtual_adapter_ips()
+            if len(all_ips) > 1 and not self._multi_ip_hinted:
+                self._multi_ip_hinted = True
+                self._append_log(
+                    "⚠ 检测到多个虚拟网卡地址：%s。界面用的是 %s；"
+                    "若连接不正常，建议点「停止」再重新进入房间，"
+                    "把残留的旧网卡清掉。" % ("、".join(all_ips), ip))
+            elif len(all_ips) <= 1:
+                self._multi_ip_hinted = False
+
+            my_game, my_port = self._selected_game()
             # 自己永远排第一行——用户最常要复制的是自己的地址
-            entries = [{"ip": ip, "name": self._host_nick or self._current_nickname(),
-                        "self": True}]
+            entries = [{"ip": ip,
+                        "name": self._host_nick or self._current_nickname(),
+                        "self": True, "game": my_game, "port": my_port}]
             for m in members:
                 entries.append({
                     "ip": m["ip"],
                     "name": m.get("name") or "",
                     "self": False,
+                    "game": m.get("game") or "",
+                    "port": int(m.get("port") or 0),
                 })
-            all_ips = [e["ip"] for e in entries]
-            # 只在"行内容真的变了"时重建控件，否则每 800ms 重建一次会闪
-            if all_ips != [r["ip"] for r in self._members_row]:
+            # 只在"行内容真的变了"时重建控件，否则每 800ms 重建一次会闪。
+            # 签名必须带上昵称与游戏快连：队友中途换了游戏，他那行也得跟着
+            # 更新——只比 IP 的话，那一行会一直停在旧游戏上。
+            sig = [(e["ip"], e["name"], e.get("game", ""), int(e.get("port") or 0))
+                   for e in entries]
+            old_sig = [(r.get("ip"), r.get("name"), r.get("game", ""),
+                        int(r.get("port") or 0)) for r in self._members_row]
+            if sig != old_sig:
                 self._render_members(entries)
                 self._members_row = entries
 
@@ -861,8 +1057,9 @@ class LanPage(BasePage):
             )
             if others:
                 self.members_hint.setText(
-                    "点每行右侧「复制」即可复制那个人的直连地址「IP:端口」"
-                    "（端口取自上面的「游戏快连」）。"
+                    "每行右侧是那个人的「复制」按钮——复制出他的直连地址"
+                    "「IP:端口」，端口取自**他自己**选的「游戏快连」"
+                    "（就是名字后面那个贴片）。"
                 )
                 self._set_status_note(normal_note)
             else:
@@ -883,6 +1080,9 @@ class LanPage(BasePage):
                 elif not self._alone_hinted:
                     self._set_status_note(normal_note)
             self.members_hint.setVisible(True)
+            if changed:
+                # 放在最后：先把这一轮的新地址显示出来，再重建后台线程
+                self._on_ip_changed(old_ip, ip)
             return
         # 只有拿不到 IP 时才做 tasklist 探测（每 800ms 起一个进程太重）
         if etier.core_running():
