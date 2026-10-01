@@ -283,6 +283,26 @@ def run(out_file, timeout_sec=120):
                                                      ttl=90)}["local"]
             == "本地测试节点（26ms）")
 
+        # ------------------------------------------------ 文案：别套双层括号
+        # 用户报的 bug：节点位置名显示不全。除了控件宽度（界面侧另测），
+        # 文案本身也在往长的方向走——「自动（最快：国内中继（IP 直连） 36ms）」
+        # 这种双层括号既是多余长度，读起来也要数括号配对。
+        chk("★「自动」里的节点名去掉自带括号（不做双层括号）",
+            np.short_name("国内中继（IP 直连）") == "国内中继",
+            np.short_name("国内中继（IP 直连）"))
+        chk("没括号的名字原样保留",
+            np.short_name("海波中国大陆") == "海波中国大陆")
+        chk("英文括号同样处理",
+            np.short_name("Node (HK)") == "Node")
+        paren_choices = tuple(list(choices) + [
+            ("paren", "国内中继（IP 直连）", "tcp://127.0.0.1:1")])
+        paren_fake = {"paren": {"key": "paren", "label": "国内中继（IP 直连）",
+                                "ms": None, "ok": False, "via": "",
+                                "error": "超时", "at": now}}
+        lp = {d[0]: d[1] for d in np.decorate_choices(paren_choices, paren_fake)}
+        chk("★ 名字自带括号时状态用间隔号，不再叠一层括号",
+            lp["paren"] == "国内中继（IP 直连） · 超时", lp["paren"])
+
         chk("format_latency 数字带单位", np.format_latency(208) == "208ms")
         chk("format_latency 测不到说「超时」", np.format_latency(None) == "超时")
         chk("age_text 说人话",
