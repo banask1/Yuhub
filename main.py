@@ -374,6 +374,22 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- gpu-selftest 模式：无窗口自检显卡信息与 GPU 占用率 ----
+    # 用法： Yuhub.exe --gpu-selftest <结果json路径>
+    # A 卡机器上没有 nvidia-smi，占用率只能走 PDH 计数器；而 PDH 出错时
+    # 不抛异常，只表现为"读不到实例"或"恒为 0%"，远程无法诊断。
+    # 因此在 exe 内部把解析 / 分组 / 真实读取 / 注册表兜底全跑一遍。
+    if "--gpu-selftest" in sys.argv:
+        idx = sys.argv.index("--gpu-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import gpu_selftest
+            sys.exit(gpu_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # ---- 错误日志钩子（隐藏功能，无 UI）：出错/崩溃时静默写
     #      文档\Yuhub\error\crash_*.log。必须在建 QApplication 之前装好，
     #      否则 Qt 初始化阶段的崩溃就抓不到了。所有 --*-selftest 模式

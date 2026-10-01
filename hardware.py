@@ -31,6 +31,11 @@ import subprocess
 import sys
 from threading import Thread
 
+try:
+    import winreg                     # Windows 专有标准库
+except ImportError:                   # pragma: no cover - 非 Windows 平台
+    winreg = None
+
 PS = ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
 
 # 一次 PowerShell 调用批量取回全部信息，减少进程启动开销。
@@ -76,17 +81,26 @@ $out.battery      = @($r.battery)
 $out | ConvertTo-Json -Compress -Depth 5
 """
 
+# 精简版：去掉显卡的 WMI 查询。某些 AMD / 老驱动会让
+# Win32_VideoController 长时间不返回，把整条查询拖到超时——那样用户看到的
+# 是"未检测到硬件信息"整页空白。降级后会走注册表兜底补上显卡。
+_QUERY_LITE = _QUERY.replace(
+    "$r.gpu     = @(Get-CimInstance Win32_VideoController)",
+    "$r.gpu     = @()",
+)
+assert _QUERY_LITE != _QUERY, "精简查询的替换锚点失效，请同步 _QUERY"
 
-def _run_ps():
+
+def _run_ps(query=None, timeout=45):
     """执行 PowerShell 查询，返回 dict；失败返回 None。"""
     try:
         flags = 0
         if sys.platform == "win32":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         proc = subprocess.run(
-            PS + [_QUERY],
+            PS + [query or _QUERY],
             capture_output=True,
-            timeout=45,
+            timeout=timeout,
             creationflags=flags,
         )
         raw = proc.stdout.decode("utf-8", errors="replace").strip()
@@ -102,40 +116,88 @@ def _run_ps():
         return None
 
 
-def _reg_vram_bytes():
-    """从注册表读取各显示适配器的真实显存（解决 AdapterRAM 32 位溢出）。"""
-    if sys.platform != "win32":
-        return []
+# 显示适配器类键（{4d36e968-...} 是显卡类 GUID 的固定值）
+_REG_GPU_CLASS = (r"SYSTEM\CurrentControlSet\Control\Class"
+                  r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+
+
+def _reg_value(key, name):
+    """读注册表值，不存在返回 None。"""
     try:
-        import winreg
-    except ImportError:
+        return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return None
+
+
+def _reg_gpus():
+    """从注册表枚举显示适配器，返回 [(名称, 显存字节, 驱动版本)]。
+
+    这是显卡信息的**兜底数据源**：部分 AMD 驱动上
+    `Get-CimInstance Win32_VideoController` 会返回空数组，或慢到让整条
+    PowerShell 查询超时，于是界面显示"未检测到"。而驱动安装时必定会往
+    这个类键下写入 DriverDesc（显卡名）、HardwareInformation.qwMemorySize
+    （显存，64 位，没有 AdapterRAM 那种 >4GB 溢出）和 DriverVersion。
+
+    只取 \\0000~\\9999 形式的子键——类键下还有 Configuration / Properties
+    等非适配器子键，靠"四位数字"这个特征把它们排除掉。
+    """
+    if winreg is None:
         return []
-    sizes = []
-    base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    out = []
     try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
-            i = 0
-            while True:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _REG_GPU_CLASS) as root:
+            for index in range(64):
                 try:
-                    sub = winreg.EnumKey(root, i)
+                    sub = winreg.EnumKey(root, index)
                 except OSError:
                     break
-                i += 1
                 if not re.fullmatch(r"\d{4}", sub):
                     continue
                 try:
-                    with winreg.OpenKey(root, sub) as k:
-                        name, _ = winreg.QueryValueEx(k, "DriverDesc")
-                        try:
-                            qw, _ = winreg.QueryValueEx(k, "HardwareInformation.qwMemorySize")
-                            sizes.append((name, int(qw)))
-                        except OSError:
-                            pass
+                    with winreg.OpenKey(root, sub) as key:
+                        name = (_reg_value(key, "DriverDesc") or "").strip()
+                        if not name:
+                            continue
+                        mem = _reg_value(key,
+                                         "HardwareInformation.qwMemorySize")
+                        out.append((
+                            name,
+                            int(mem) if mem else 0,
+                            (_reg_value(key, "DriverVersion") or "").strip(),
+                        ))
                 except OSError:
                     continue
     except OSError:
         pass
-    return sizes
+    return out
+
+
+def _reg_vram_bytes():
+    """从注册表读取各显示适配器的真实显存（解决 AdapterRAM 32 位溢出）。"""
+    return [(name, mem) for name, mem, _drv in _reg_gpus() if mem]
+
+
+def _gpus_from_registry():
+    """注册表兜底：WMI 一条显卡都没给时，用驱动注册表信息顶上。
+
+    产出结构与 build_profile 里的 gpu_items 一致，让 UI 不必区分来源。
+    """
+    items = []
+    for name, mem, driver in _reg_gpus():
+        vkey, vlabel = gpu_vendor(name)
+        items.append({
+            "name": name,
+            "vram": human_bytes(mem) if mem else "--",
+            "driver": driver,
+            "resolution": "",
+            "vendor": vkey,
+            "vendor_label": vlabel,
+            "is_virtual": vkey in ("virtual", "microsoft"),
+            "from_registry": True,
+        })
+    # 真实显卡排在虚拟/基础显示适配器前面
+    items.sort(key=lambda x: x["is_virtual"])
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -197,32 +259,39 @@ _GPU_VENDOR_BY_VEN = {
     "1AF4": ("virtio", "Virtual"),
     "15AD": ("vmware", "VMware"),
 }
+# "基础显示适配器"这类名字是**强信号**：出现它就说明显卡驱动没装好或没生效。
+# 中文系统上的名字是"Microsoft 基本显示适配器"，不含英文关键词，所以中英都要有。
 _VIRTUAL_NAME_KEYS = ("virtual", "basic display", "remote", "microsoft basic",
-                      "standard vga", "displaylink", "rdp")
+                      "standard vga", "displaylink", "rdp",
+                      "基本显示适配器", "基础显示适配器", "标准 vga")
 
 
 def gpu_vendor(name, pnp=""):
     """判断显卡厂商。返回 (key, 中文标签)。
 
     key ∈ {"amd","nvidia","intel","microsoft","virtual","other"}。
-    优先解析 PnP 设备 ID 的 VEN_xxxx，其次名称关键词，最后"虚拟/基础显示"。
+
+    顺序：名称里的"基础显示适配器"关键词 → PnP 的 VEN_xxxx → 名称厂商词。
+    把虚拟/基础显示提到最前，是因为驱动被卸载或没生效时，PnP 里常常还留着
+    真实厂商的 VEN_（如 VEN_1002），若按 VEN_ 判成 AMD，就会把它的显存当成
+    真实显卡的显存显示出去。
     """
+    nl = (name or "").lower()
+    for k in _VIRTUAL_NAME_KEYS:
+        if k in nl:
+            return ("virtual", "虚拟/基础显示")
     if pnp:
         m = re.search(r"VEN_([0-9A-Fa-f]{4})", pnp or "")
         if m:
             hit = _GPU_VENDOR_BY_VEN.get(m.group(1).upper())
             if hit:
                 return hit
-    nl = (name or "").lower()
     if "radeon" in nl or "amd" in nl or "ati" in nl:
         return ("amd", "AMD")
     if "nvidia" in nl or "geforce" in nl or "quadro" in nl or "rtx" in nl or "gtx" in nl:
         return ("nvidia", "NVIDIA")
     if "intel" in nl and "arc" in nl or "iris" in nl or "uhd graphics" in nl or "hd graphics" in nl:
         return ("intel", "Intel")
-    for k in _VIRTUAL_NAME_KEYS:
-        if k in nl:
-            return ("virtual", "虚拟/基础显示")
     return ("other", "其他")
 
 
@@ -450,10 +519,17 @@ def build_profile(raw):
         gpus = [gpus]
     reg_vram = dict(_reg_vram_bytes())
     gpu_items = []
+    # 全机只有"一块 WMI 显卡 + 一项注册表显存"时才允许按名字无关地兜底：
+    # A 卡 WMI 名偶尔带 "(TM)"、厂商后缀，逐字匹配容易漏。但机器上有
+    # 核显 + 独显时 len(reg_vram) 常常只有 1（核显没有专用显存，被过滤掉），
+    # 那种情况下再兜底会把独显的显存安到核显头上，所以同时要求 WMI 也只有一条。
+    wmi_count = len([x for x in gpus if (x.get("name") or "").strip()])
     for item in gpus:
         name = (item.get("name") or "--").strip()
         if not name:
             continue
+        vkey, vlabel = gpu_vendor(name, item.get("pnp") or "")
+        is_virtual = vkey in ("virtual", "microsoft")
         vram = item.get("vram")
         # 注册表值优先（能正确处理 >4GB），否则退回 WMI 值
         real = None
@@ -461,6 +537,12 @@ def build_profile(raw):
             if rname and (rname.lower() in name.lower() or name.lower() in rname.lower()):
                 real = rsize
                 break
+        # 名字对不上时按位置兜底，但必须同时满足：这块不是基础显示适配器、
+        # 注册表只有一项显存、WMI 也只给了一条。否则会出现把独显的 4GB
+        # 安到"Microsoft 基本显示适配器"头上的荒唐结果。
+        if (real is None and not is_virtual
+                and len(reg_vram) == 1 and wmi_count == 1):
+            real = next(iter(reg_vram.values()))
         if real:
             vram = real
         # WMI 的 AdapterRAM 若恰好接近 4GB 上限，视为溢出不可信
@@ -472,7 +554,6 @@ def build_profile(raw):
         w, h = item.get("w"), item.get("h")
         if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
             res = f"{w}×{h}"
-        vkey, vlabel = gpu_vendor(name, item.get("pnp") or "")
         gpu_items.append({
             "name": name,
             "vram": vram_txt,
@@ -480,8 +561,14 @@ def build_profile(raw):
             "resolution": res,
             "vendor": vkey,
             "vendor_label": vlabel,
-            "is_virtual": vkey in ("virtual", "microsoft"),
+            "is_virtual": is_virtual,
         })
+
+    # WMI 一条显卡都没返回（部分 AMD 驱动上 Win32_VideoController 会空，
+    # 或慢到让整条 PowerShell 查询超时）→ 用驱动注册表兜底，至少把
+    # 型号 / 显存 / 驱动版本显示出来，而不是让用户看到"未检测到"。
+    if not gpu_items:
+        gpu_items = _gpus_from_registry()
 
     # ---- 内存 ----
     rams = g("ram", [])
@@ -654,7 +741,15 @@ def build_profile(raw):
 
 def query_hardware():
     """同步采集（阻塞约 1~3 秒）。建议放在后台线程调用。"""
-    return build_profile(_run_ps())
+    raw = _run_ps()
+    if raw is None:
+        # 整条查询超时——最常见的原因是某个显卡驱动让 Win32_VideoController
+        # 长时间不返回。改用去掉显卡的精简查询再试一次：宁可显卡那项退回
+        # 注册表兜底，也别让用户看到整页"未能读取到硬件信息"。
+        raw = _run_ps(_QUERY_LITE, timeout=30)
+        if raw is not None:
+            raw["_gpu_skipped"] = True
+    return build_profile(raw)
 
 
 class HardwareScanner:

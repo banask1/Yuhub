@@ -27,6 +27,24 @@ from . import theme
 import live_monitor as lm
 
 
+def _gpu_mem_text(gpu):
+    """显卡显存文本："已用 / 总量 MB"。
+
+    两半来自不同数据源（总量读注册表、已用读 PDH 计数器），在部分驱动上
+    可能只有一半有值。缺哪半就只显示哪半——直接格式化 None 会抛
+    TypeError，把整个实时刷新线程带崩（这是 A 卡用户会碰到的路径）。
+    """
+    used = gpu.get("mem_used_mb")
+    total = gpu.get("mem_total_mb")
+    if used is not None and total is not None:
+        return "%.0f / %.0f MB" % (used, total)
+    if total is not None:
+        return "共 %.0f MB" % total
+    if used is not None:
+        return "已用 %.0f MB" % used
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 迷你趋势条
 # ---------------------------------------------------------------------------
@@ -524,15 +542,14 @@ class LiveMonitorPanel(QFrame):
         # 显卡
         if gpu:
             bits = []
-            if gpu.get("mem_total_mb"):
-                bits.append(
-                    f"{gpu['mem_used_mb']:.0f} / {gpu['mem_total_mb']:.0f} MB"
-                )
+            mem_txt = _gpu_mem_text(gpu)
+            if mem_txt:
+                bits.append(mem_txt)
             if gpu.get("temp") is not None:
                 bits.append(f"{gpu['temp']:.0f}°C")
             self.tiles["gpu"].set_metric(gpu.get("util"), " · ".join(bits))
         else:
-            self.tiles["gpu"].set_metric(None, "未检测到可用显卡")
+            self.tiles["gpu"].set_metric(None, "显卡数据不可用")
 
         # 底部其他实时参数
         parts = []
@@ -569,8 +586,9 @@ class LiveMonitorPanel(QFrame):
             g = d["gpu"]
             if g.get("util") is not None:
                 live["当前占用率"] = f"{g['util']:.0f} %"
-            if g.get("mem_used_mb") is not None:
-                live["显存占用"] = f"{g['mem_used_mb']:.0f} / {g['mem_total_mb']:.0f} MB"
+            mem_txt = _gpu_mem_text(g)
+            if mem_txt:
+                live["显存占用"] = mem_txt
             if g.get("temp") is not None:
                 live["当前温度"] = f"{g['temp']:.0f} °C"
             if g.get("power_w") is not None:
@@ -675,8 +693,9 @@ def _build_live_rows(kind, data):
         if g:
             if g.get("util") is not None:
                 out.append(("当前占用率", f"{g['util']:.0f} %"))
-            if g.get("mem_used_mb") is not None:
-                out.append(("显存占用", f"{g['mem_used_mb']:.0f} / {g['mem_total_mb']:.0f} MB"))
+            mem_txt = _gpu_mem_text(g)
+            if mem_txt:
+                out.append(("显存占用", mem_txt))
             if g.get("temp") is not None:
                 out.append(("当前温度", f"{g['temp']:.0f} °C"))
             if g.get("power_w") is not None:
@@ -738,19 +757,24 @@ def _build_detail_rows(kind, live):
         ctrls = d.get("controllers") or []
         if isinstance(ctrls, dict):
             ctrls = [ctrls]
+        if not ctrls:
+            # WMI 没给出显卡（部分 AMD 驱动上 Win32_VideoController 会返回空）
+            # → 从驱动注册表兜底，至少把型号 / 驱动版本列出来，别是一片"--"
+            ctrls = [{"Name": n, "DriverVersion": v or None}
+                     for n, _mem, v in _reg_gpu_rows()]
         for i, c in enumerate(ctrls, 1):
             prefix = f"显卡 {i} · " if len(ctrls) > 1 else ""
-            rows.append((prefix + "型号", c.get("Name")))
-            rows.append((prefix + "生产商", c.get("AdapterCompatibility")))
+            rows.append((prefix + "型号", c.get("Name") or "--"))
+            rows.append((prefix + "生产商", c.get("AdapterCompatibility") or "--"))
             rows.append((prefix + "显存", _vram_of(i - 1, c.get("Name"))))
             res = c.get("CurrentHorizontalResolution")
             resv = c.get("CurrentVerticalResolution")
             rows.append((prefix + "当前分辨率",
                          f"{res} × {resv}" if res and resv else "--"))
-            rows.append((prefix + "驱动版本", c.get("DriverVersion")))
+            rows.append((prefix + "驱动版本", c.get("DriverVersion") or "--"))
             rows.append((prefix + "驱动日期", _ps_date(c.get("DriverDate"))))
-            rows.append((prefix + "设备状态", c.get("Status")))
-            rows.append((prefix + "设备 ID", c.get("PNPDeviceID")))
+            rows.append((prefix + "设备状态", c.get("Status") or "--"))
+            rows.append((prefix + "设备 ID", c.get("PNPDeviceID") or "--"))
         # 附加 nvidia-smi 能拿到的规格
         g = live.get("gpu")
         if g:
@@ -789,6 +813,20 @@ def _kb(v):
     return f"{n / 1024:.1f} MB"
 
 
+def _reg_gpu_rows():
+    """注册表里的显示适配器 [(名称, 显存字节, 驱动版本)]。
+
+    详情页的兜底数据源：部分 AMD 驱动上 Win32_VideoController 返回空，
+    详情页会是一片"--"。这里复用 hardware 里那份注册表读取实现，
+    避免同样的解析逻辑写两遍。
+    """
+    try:
+        import hardware
+        return hardware._reg_gpus()
+    except Exception:
+        return []
+
+
 def _vram_of(index, name):
     """查注册表拿真实显存（WMI 的 AdapterRAM 32 位会溢出）。"""
     sizes = lm._reg_vram_sizes()
@@ -796,6 +834,10 @@ def _vram_of(index, name):
         for rname, rsize in sizes:
             if rname and (rname.lower() in name.lower() or name.lower() in rname.lower()):
                 return lm.fmt_bytes(rsize)
+    # 名字对不上时：全机只有一项注册表显存就直接用它——A 卡 WMI 名偶尔
+    # 带 "(TM)"、厂商后缀，逐字匹配容易漏，漏了就只剩"--"。
+    if len(sizes) == 1:
+        return lm.fmt_bytes(sizes[0][1])
     return "见下方驱动报告"
 
 
