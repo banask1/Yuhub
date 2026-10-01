@@ -431,7 +431,12 @@ class LanPage(BasePage):
 
         btn = ghost_button("复制")
         btn.setFixedWidth(52)
-        btn.clicked.connect(lambda _=False, v=ip: self._copy_text(v, "虚拟 IP"))
+        # 复制「IP:端口」而不是裸 IP：游戏里要填的就是带端口的直连地址
+        # （「IP:端口」缺一不可），端口取「游戏快连」当前选中的那一款。
+        # 运行中游戏快连下拉是禁用的，所以房间存续期内端口稳定、不会串。
+        port = self.game_combo.currentData()
+        addr = "%s:%s" % (ip, port) if port else ip
+        btn.clicked.connect(lambda _=False, v=addr: self._copy_text(v, "直连地址"))
         h.addWidget(btn)
         return row
 
@@ -498,8 +503,9 @@ class LanPage(BasePage):
             "看到的就是它。\n"
             "\n"
             "虚拟 IP：由 EasyTier 自动分配，不固定（换房间/重启都可能变）。\n"
-            "要某台机器的地址时，在「在线成员」里点那一行的「复制」即可，\n"
-            "每个人的 IP 都能单独复制。\n"
+            "要某台机器的地址时，在「在线成员」里点那一行的「复制」即可——\n"
+            "复制出来的是带端口的直连地址「IP:端口」，端口就是上面「游戏快连」\n"
+            "里选的那一款，拿到就能直接填进游戏。\n"
             "\n"
             "中继节点：默认「自动」会尝试全部内置节点（含 MCTier 社区维护\n"
             "的海波美国/海波中国大陆、唯爱厦门等），失败自动换下一个。\n"
@@ -507,9 +513,10 @@ class LanPage(BasePage):
             "**只连所选节点**，出问题时更容易定位原因。\n"
             "\n"
             "游戏快连：内置常见联机游戏的默认端口（Minecraft 服务器 25565、\n"
-            "泰拉瑞亚 7777、幻兽帕鲁 8211 等），房间运行中点「复制 IP:端口」\n"
-            "就能把直连地址发给队友。Minecraft「对局域网开放」的端口是随机的，\n"
-            "以游戏聊天栏显示的为准。\n"
+            "泰拉瑞亚 7777、幻兽帕鲁 8211 等）。这里选好游戏后，「在线成员」\n"
+            "每行「复制」出来的就是对应的「IP:端口」，右上的\n"
+            "「复制 IP:端口」则复制本机的直连地址。\n"
+            "Minecraft「对局域网开放」的端口是随机的，以游戏聊天栏显示的为准。\n"
             "\n"
             "原理：内嵌 EasyTier（Apache 2.0 开源）创建一块二层虚拟网卡，\n"
             "把填了相同房间码+密码的电脑拉进同一个虚拟局域网。P2P 打洞优先，\n"
@@ -843,7 +850,8 @@ class LanPage(BasePage):
             )
             if others:
                 self.members_hint.setText(
-                    "点每行右侧「复制」即可单独复制那个人的 IP。"
+                    "点每行右侧「复制」即可复制那个人的直连地址「IP:端口」"
+                    "（端口取自上面的「游戏快连」）。"
                 )
                 self._set_status_note(normal_note)
             else:
