@@ -253,12 +253,14 @@ def _check_nick_beacon(etier_mod, ip, mark):
              "got=%r" % (got,))
 
         # 旧版本客户端只发昵称：新版本必须照常解析（混房间不炸）。
-        # 期望值要带上后来加的字段（share = 对方的临时云盘端口，0 = 没开），
-        # 否则"新增字段"这件事本身会把这条断言打红。
+        # 期望值要带上后来加的字段（share = 对方的临时云盘端口，0 = 没开；
+        # srev = 对方云盘清单的版本号），否则"新增字段"这件事本身会把这条
+        # 断言打红。
         legacy = etier_mod.NickBeacon._parse_info(
             b'{"yuhub-nick-v1":"OldPeer"}')
         mark("兼容旧版仅昵称报文",
-             legacy == {"name": "OldPeer", "game": "", "port": 0, "share": 0},
+             legacy == {"name": "OldPeer", "game": "", "port": 0,
+                        "share": 0, "srev": 0},
              "legacy=%r" % (legacy,))
 
         # 注入"收到 Bob 的广播"：get_info 应命中新鲜表
@@ -369,6 +371,211 @@ def _check_ui_state(result, mark):
     _check_nickname(page, mark)
     _check_member_row_ui(page, mark)
     _check_node_combo_ui(page, mark, app)
+    _check_share_live(page, mark, app)
+    _check_node_probe_policy(page, mark, app)
+
+
+def _check_share_live(page, mark, app):
+    """临时云盘：分享实时同步 + 退出即消失 + 下载自选位置。
+
+    三条都是用户直接提出的诉求（v0.8.14beta）：
+      1. 谁上传 / 取消分享文件，所有人都刷新一次；
+      2. 分享的人退出房间，他那些文件立刻从列表里消失；
+      3. 下载时每次都让用户自己选保存位置（顺带：云盘卡片里那个
+         「打开文件夹」按钮已按需求移除）。
+
+    全部离线可跑：摆好状态直接调界面逻辑，不发任何网络请求。
+    """
+    import json as _json
+
+    import etier as _etier
+
+    from PySide6.QtWidgets import QFileDialog
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    # ---- 卡片上不该再有「打开文件夹」按钮 ----
+    mark("★ 云盘卡片已移除「打开文件夹」按钮（改由下载时自选位置）",
+         not hasattr(page, "btn_share_dir"), "hasattr=False")
+
+    class _Hub:
+        running = True
+        port = 41777
+
+        def __init__(self):
+            self.calls = []
+
+        def own_files(self):
+            return [{"id": "mine1", "name": "我的文件.txt", "size": 10,
+                     "mtime": 1}]
+
+        def collect(self, peers, timeout=0):
+            self.calls.append(list(peers))
+            return []
+
+    class _Tracker:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def snapshot(self):
+            return list(self.rows)
+
+    hub = _Hub()
+    page._hub = hub
+    page._running = True
+    page._my_ip = "10.126.126.5"
+    beacon = _etier.NickBeacon("10.126.126.5", "SelfNick")
+    page._beacon = beacon
+    page._tracker = _Tracker([{"ip": "10.126.126.9", "name": "队友", "game": "",
+                               "port": 0, "share": 41800, "srev": 1}])
+    beacon._peers["10.126.126.9"] = {
+        "info": {"name": "队友", "share": 41800, "srev": 1,
+                 "game": "", "port": 0},
+        "until": time.monotonic() + 10}
+    remote_row = {"id": "f1", "name": "队友的存档.zip", "size": 100, "mtime": 2}
+    page._share_remote = {"10.126.126.9": [dict(remote_row)]}
+    page._share_seen = {"10.126.126.9": (41800, 1)}
+
+    n0 = len(hub.calls)
+    page._share_watch()
+    mark("云盘状态没变时不做多余轮询", len(hub.calls) == n0, len(hub.calls))
+
+    beacon._peers["10.126.126.9"]["info"]["srev"] = 2
+    page._share_watch()
+    mark("★ 对方动过分享清单（版本号变）就立刻重拉一次（所有人都刷新）",
+         len(hub.calls) == n0 + 1,
+         "调用次数=%d 参数=%r" % (len(hub.calls), hub.calls[-1:]))
+    mark("重拉清单时带上了对方的云盘端口",
+         hub.calls[-1:] == [[{"ip": "10.126.126.9", "port": 41800}]],
+         hub.calls[-1:])
+
+    n1 = len(hub.calls)
+    beacon._peers["10.126.126.9"]["info"]["share"] = 0
+    page._share_watch()
+    mark("★ 对方关掉云盘 -> 他的文件行当场从列表撤下",
+         "10.126.126.9" not in page._share_remote, page._share_remote)
+
+    page._share_remote = {"10.126.126.9": [dict(remote_row)]}
+    page._tracker.rows = []
+    page._share_watch()
+    mark("★ 分享者退出房间 -> 他的文件行当场从列表撤下",
+         "10.126.126.9" not in page._share_remote, page._share_remote)
+    page._share_watch()
+    mark("撤下之后不再反复重拉（别自己刷自己）",
+         len(hub.calls) == n1, len(hub.calls))
+
+    # ---- 自己增删文件：版本号 +1 并立刻广播 ----
+    page._tracker.rows = []
+    page._share_rev = 0
+    page._bump_share_rev()
+    mark("分享清单增删 -> 版本号 +1", page._share_rev == 1, page._share_rev)
+    mark("★ 版本号随信标广播出去（队友据此立刻刷新）",
+         _json.loads(beacon._payload().decode("utf-8")).get("srev") == 1,
+         beacon._payload())
+
+    # ---- 下载：每次都弹保存对话框 ----
+    seen = {}
+
+    def _fake_save(parent, title, suggested, filt):
+        seen["title"] = title
+        seen["suggested"] = suggested
+        return os.path.join(os.path.abspath("."), "自选位置.bin"), ""
+
+    real_save = QFileDialog.getSaveFileName
+    try:
+        QFileDialog.getSaveFileName = staticmethod(_fake_save)
+        picked = page._ask_save_path("队友的存档.zip")
+        mark("★ 下载前弹出「选择保存位置」并采用用户所选路径",
+             picked.endswith("自选位置.bin"), picked)
+        mark("保存框默认文件名 = 被下载的文件名",
+             str(seen.get("suggested") or "").endswith("队友的存档.zip"),
+             seen.get("suggested"))
+
+        QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: ("", ""))
+        mark("用户取消保存 -> 返回空（不会偷偷下到默认目录）",
+             page._ask_save_path("队友的存档.zip") == "", "")
+        page._download = None
+        page._start_download({"key": "k", "fid": "f", "name": "x.bin",
+                              "owner": "队友", "ip": "10.126.126.9",
+                              "port": 41800})
+        mark("取消保存位置时根本不发起下载请求",
+             page._download is None, page._download)
+    finally:
+        QFileDialog.getSaveFileName = real_save
+
+    # ---- 拖拽区：点一下就能选文件 ----
+    clicked = []
+    real_open = QFileDialog.getOpenFileNames
+    try:
+        QFileDialog.getOpenFileNames = staticmethod(lambda *a, **k: ([], ""))
+        page.drop_zone.clicked.connect(lambda: clicked.append(1))
+        mark("★ 拖拽区未进房间也是可点的（不是点不动的灰块）",
+             page.drop_zone.isEnabled(), page.drop_zone.isEnabled())
+        QTest.mouseClick(page.drop_zone, Qt.LeftButton)
+        QTest.mouseClick(page.drop_zone.title, Qt.LeftButton)
+        QTest.mouseClick(page.drop_zone.sub, Qt.LeftButton)
+        mark("★ 点拖拽区（含标题文字）都会打开文件选择框",
+             len(clicked) == 3, clicked)
+    finally:
+        QFileDialog.getOpenFileNames = real_open
+
+
+def _check_node_probe_policy(page, mark, app):
+    """节点测速的触发时机（v0.8.14beta 改版）。
+
+    以前是"数据过期就自动重测"（每 90 秒一次），用户挂机时白占带宽；
+    现在只有两个触发点：**点进这一页** 和 **手点「测速」**。
+    同时下拉里不再因为"数据超过 90 秒"就整列变「待测」——数字留着，
+    由旁边的「延迟数据：x 分钟前」如实说明新旧。
+    """
+    import unittest.mock as _mock
+
+    import etier as _etier
+    import node_probe as _np
+
+    def _valueless(*a, **k):
+        return {}
+
+    page._running = False
+    page._hub = None
+    try:
+        with _mock.patch.object(_np, "probe_all", _valueless):
+            page._tick()
+            mark("★ 页面停留（每 800ms 的 tick）不再自动测速",
+                 not page._probing, "_probing=%s" % page._probing)
+
+            page._probing = False
+            page._probe.clear()
+            page.on_shown()
+            # 立刻读 _probing：测速线程可能瞬间就跑完（自检里把它打桩成
+            # 立即返回），等 processEvents 之后再看就已经复位了。
+            started_probe = page._probing
+            mark("★ 点进这一页 -> 自动测一次", started_probe,
+                 "_probing=%s" % started_probe)
+            t_loop = time.time()
+            while page._probing and time.time() - t_loop < 5:
+                app.processEvents()
+                time.sleep(0.02)
+        mark("测速结束后按钮文案复位",
+             page.btn_node_speed.text() == "测速", page.btn_node_speed.text())
+    except Exception as exc:
+        mark("测速触发策略可验证", False, repr(exc))
+        return
+
+    # 旧数据仍然显示数字
+    page._probe.update(
+        {k: {"key": k, "label": "L", "addr": "udp://192.0.2.9:11010",
+             "ms": 33, "ok": True, "via": "icmp", "error": ""}
+         for k, _l, _a in _etier.NODE_CHOICES[:2]},
+        at=time.time() - 600)
+    page._fill_node_combo()
+    texts = [page.node_combo.itemText(i) for i in range(page.node_combo.count())]
+    mark("★ 10 分钟前的实测数字仍然显示（不再整列变「待测」）",
+         any("33ms" in t for t in texts), texts)
+    page._update_node_age()
+    mark("★ 数据放旧时明确提示「点测速更新」",
+         "点「测速」更新" in page.node_age_label.text(),
+         page.node_age_label.text())
 
 
 def _check_node_combo_ui(page, mark, app):
