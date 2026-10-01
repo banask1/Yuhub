@@ -390,6 +390,23 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- share-selftest 模式：无窗口自检「临时云盘」----
+    # 用法： Yuhub.exe --share-selftest <结果json路径>
+    # 云盘的核心承诺是"退出房间就下不到"，而这依赖 HTTP 服务只绑虚拟 IP、
+    # token 派生正确、stop() 真的关掉监听——三样都不会抛异常，坏掉的话
+    # 表现是"看着正常但谁都能拉"。这里在 127.0.0.1 上跑真实 HTTP 把它
+    # 固化成断言（不碰 EasyTier、不要管理员权限）。
+    if "--share-selftest" in sys.argv:
+        idx = sys.argv.index("--share-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import share_selftest
+            sys.exit(share_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # ---- 错误日志钩子（隐藏功能，无 UI）：出错/崩溃时静默写
     #      文档\Yuhub\error\crash_*.log。必须在建 QApplication 之前装好，
     #      否则 Qt 初始化阶段的崩溃就抓不到了。所有 --*-selftest 模式
