@@ -65,14 +65,17 @@ class SplashScreen(QWidget):
 
     # ---------------------------------------------------------------- 外观
     def _load_icon(self):
-        """加载 Yuhub 图标：优先高分辨率 PNG（1920×1920），退回 ico。
+        """加载 Yuhub 图标：优先透明底 PNG（1920×1920），退回白底源图 / ico。
 
-        按 devicePixelRatio 缩放：高分屏（150% 等）下物理像素 = 逻辑尺寸
-        × DPR，直接给逻辑尺寸的 QPixmap 会被 Qt 拉伸导致模糊。
+        ⚠️ app_source.png 是无透明通道的白底图——浅色模式下白底与启动屏
+        融为一体，深色模式下图标周围会有一圈白边。app_source_alpha.png
+        是从它抠出来的透明底版本（复用 build_icon._white_to_alpha 的
+        边缘洪水填充，锦鲤内部的白色高光不受影响），必须优先使用。
         """
         dpr = self.devicePixelRatioF() or 1.0
         want = int(ICON_SIZE * dpr)
-        for rel in ("resources/app_source.png", "resources/app.ico"):
+        for rel in ("resources/app_source_alpha.png",
+                    "resources/app_source.png", "resources/app.ico"):
             path = resource_path(rel)
             if not os.path.exists(path):
                 continue
