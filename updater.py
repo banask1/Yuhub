@@ -577,6 +577,70 @@ def _api_attempts(api_base):
     return attempts
 
 
+def format_progress(payload):
+    """把 on_progress 回调的载荷统一成**一句人类可读的进度文本**。
+
+    download_update 的进度回调有两种形态（历史协议，主窗口的
+    emit_progress 依赖它，不能随便改）：
+      ① 探测 / 换线阶段 → {"status_text": "...", "phase": "probing"}
+      ② 下载进行中     → downloader 的 snapshot 字典
+    调用方要是直接 str(payload)，界面上就会糊出一坨 JSON——
+    用户实际截图反馈的就是这个（设置页「修复软件」里那串大括号）。
+
+    统一在这里转，避免每个调用点各写一遍、各错一遍。
+    返回 (phase, text)：phase ∈ {"probing", "download", ""}。
+    """
+    try:
+        import downloader
+    except Exception:  # noqa: BLE001
+        return "", ""
+    if not isinstance(payload, dict):
+        return ("probing", str(payload)) if payload else ("", "")
+
+    if payload.get("phase") == "probing":
+        return "probing", str(payload.get("status_text") or "正在连接更新源…")
+
+    # 容忍两种包装：裸 snapshot，或 {"snap": {...}}
+    snap = payload.get("snap")
+    if not isinstance(snap, dict):
+        snap = payload
+    if not any(k in snap for k in ("status", "downloaded", "percent")):
+        text = payload.get("status_text")
+        return ("probing", str(text)) if text else ("", "")
+
+    status = snap.get("status") or "running"
+    total = snap.get("total") or 0
+    got = snap.get("downloaded") or 0
+
+    if status == downloader.STATUS_DONE:
+        return "download", "下载完成：%s" % downloader.human_bytes(got)
+    if status == downloader.STATUS_ERROR:
+        return "download", "下载失败：%s" % (snap.get("error") or "未知错误")
+    if status == downloader.STATUS_CANCELLED:
+        return "download", "已取消"
+    if status == downloader.STATUS_PROBING:
+        return "probing", "正在探测下载线路…"
+
+    parts = []
+    if total:
+        parts.append("%.1f%%" % (got * 100.0 / total))
+    parts.append("%s / %s" % (downloader.human_bytes(got),
+                              downloader.human_bytes(total) if total else "未知"))
+    if snap.get("cancelling"):
+        parts.append("正在取消…")
+    else:
+        speed = snap.get("speed") or 0
+        if speed:
+            parts.append(downloader.human_speed(speed))
+        eta = snap.get("eta")
+        if eta:
+            parts.append("剩余 " + downloader.human_time(eta))
+    msgs = snap.get("messages") or []
+    if msgs:
+        parts.append(str(msgs[-1]))
+    return "download", "　·　".join(parts)
+
+
 def _probe_line(url, timeout=15.0, proxy=None, cancel=None):
     """探测一条下载线路，**取消以 0.1 秒粒度生效**。
 
@@ -634,6 +698,16 @@ def download_update(info, on_progress=None, cancel=None, threads=None):
 
     dest = package_path(info)
     last_err = ""
+
+    # 清掉上次失败 / 崩溃留下的半成品：旧 `.part` 会一直占着几十 MB，
+    # 而被句柄占用改名的 `.part.bad` 更是永远没人收拾（用户反馈过
+    # 更新目录里躺着两个 59MB 的残包）。
+    for stale in (dest + ".part", dest + ".part.bad"):
+        try:
+            if os.path.exists(stale):
+                os.remove(stale)
+        except OSError:
+            pass
 
     def cancelled():
         return bool(cancel and cancel())

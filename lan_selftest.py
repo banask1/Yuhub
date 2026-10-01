@@ -471,7 +471,9 @@ def _check_share_live(page, mark, app):
     mark("分享清单增删 -> 版本号 +1", page._share_rev == 1, page._share_rev)
     mark("★ 版本号随信标广播出去（队友据此立刻刷新）",
          _json.loads(beacon._payload().decode("utf-8")).get("srev") == 1,
-         beacon._payload())
+         # ⚠️ _payload() 是 bytes：直接把 bytes 塞进 detail 会让 json.dump
+         # 抛 TypeError，结果文件被写成半截（v0.8.14beta 就是这么坏的）
+         beacon._payload().decode("utf-8", "replace"))
 
     # ---- 下载：每次都弹保存对话框 ----
     seen = {}
@@ -1011,8 +1013,22 @@ def _check_member_rows(page, mark):
 
 
 def _dump(result, out_file):
+    """写结果 JSON。
+
+    ⚠️ 先 `dumps` 成字符串再落盘，并且 `default=str` 兜底：
+    某个 detail 塞了 bytes / 自定义对象时，json.dump 会直接抛 TypeError，
+    而流式写入意味着**文件已经被写了半截**——最后拿到的是一份读不出来的
+    残档，前面的检查结果全丢了（v0.8.14beta 的 lan 自检就是这个症状：
+    永远停在 "detail": 后面，谁都看不出是哪一项干的）。
+    """
+    try:
+        text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError) as exc:
+        text = json.dumps({"ok": False, "checks": result.get("checks", []),
+                           "dump_error": repr(exc)},
+                          ensure_ascii=False, indent=2, default=str)
     try:
         with open(out_file, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, ensure_ascii=False, indent=2)
+            fh.write(text)
     except OSError:
         pass

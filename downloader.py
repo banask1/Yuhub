@@ -17,6 +17,7 @@
     """
 
 import os
+import random
 import re
 import ssl
 import threading
@@ -42,8 +43,25 @@ DEFAULT_UA = (
 MAX_THREADS = 32
 CHUNK = 256 * 1024          # 单次请求读取的字节数
 TIMEOUT = 20                # 单次请求超时（秒）
-MAX_RETRY = 3               # 单个分块的重试次数
+MAX_RETRY = 3               # 单块单轮重试次数（第 1 轮用这个值，见 RETRY_SCHEDULE）
 SAMPLE_INTERVAL = 0.4       # 速度采样间隔（秒）
+
+# ---- 分块补漏（v0.8.15beta）---------------------------------------------
+# 旧版所有分块只跑一轮：某个块重试 3 次仍失败就**静默放弃**，
+# 而收尾校验看的是预分配后的文件大小（零填充，恒等于总大小），
+# 于是"少了 7 个块"的残包照样被判定为下载成功。
+# 现在改成多轮：第 1 轮全并发，之后逐轮缩小并发 + 加长退避，
+# 把被限流/断连的那几块捞回来；捞不回来就明确报错，绝不产出坏文件。
+MAX_ROUNDS = 4
+RETRY_SCHEDULE = (MAX_RETRY, 5, 7, 9)   # 每轮单块重试次数
+ROUND_PAUSE = (0.0, 1.5, 4.0, 8.0)      # 轮间等待（秒）
+SUPPLEMENT_CONCURRENCY = 4              # 补漏轮次的并发上限（别再压垮线路）
+
+# 取消 / 卡死的响应上限：worker 里任何阻塞（DNS 挂起、TCP 建连）都可能
+# 永不返回，`join()` 无限等会让任务状态永远落不了定——用户看到的就是
+# "点了取消，界面一直停在「正在取消…」"。
+CANCEL_GRACE = 3.0          # 取消后给 worker 自己退出的宽限期（秒）
+STALL_TIMEOUT = 45.0        # 看门狗：这么久一个字节没动就判定连接僵死
 
 # ---------------------------------------------------------------------------
 # 线程档位
@@ -101,6 +119,72 @@ def describe_level(level):
     """
     label = THREAD_LEVEL_LABELS.get(level, "中")
     return f"本机 {describe_cpu()} · {label}档 {threads_for_level(level)} 线程"
+
+
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
+def _batches(items, size):
+    """把列表切成每片最多 size 个（补漏轮次按批跑，控制并发）。"""
+    size = max(1, int(size or 1))
+    seq = list(items)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _backoff(retry, base=0.6, cap=8.0):
+    """指数退避 + 抖动。
+
+    纯指数退避会让同一个批次里失败的 worker 在同一时刻集体重连，
+    对已经因为并发过高而掐连接的服务器等于又打了一轮同步攻击；
+    加 ±30% 抖动把它们错开。上限 8 秒，避免"重试太久像卡死"。
+    """
+    raw = min(base * (2 ** max(0, retry - 1)), cap)
+    return max(0.05, raw * (0.7 + random.random() * 0.6))
+
+
+def _open_rw(path):
+    """以读写方式打开文件；Windows 下额外允许"被删除 / 被改名"。
+
+    为什么不直接用 `open(path, "r+b")`：
+    Windows 上 Python 的 `open()` 共享模式是 READ|WRITE，**不含 DELETE**，
+    只要还有一个句柄没关，这个文件就既删不掉、也改不了名。
+    取消下载时 worker 可能卡在 DNS 解析里几十秒（socket 超时管不住 DNS），
+    期间它攥着 `.part` 的句柄，于是：
+      * `_cleanup_part` 删不掉 → 半成品赖在磁盘上；
+      * 紧接着重新下载，收尾的 `os.replace` 报
+        "另一个程序正在使用此文件，进程无法访问"（WinError 32）。
+    加上 FILE_SHARE_DELETE 之后，句柄还在也不妨碍改名/删除
+    （Windows 会把它标记为"待删除"，名字立刻腾出来）。
+    失败则退化到普通打开：功能不受影响，只是极端情况下要多等一会儿。
+    """
+    if os.name != "nt":
+        return open(path, "r+b")
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        GENERIC_RW = 0x80000000 | 0x40000000
+        SHARE_ALL = 0x1 | 0x2 | 0x4        # READ | WRITE | DELETE
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL = 3, 0x80
+        INVALID = 0xFFFFFFFFFFFFFFFF
+
+        h = k32.CreateFileW(path, GENERIC_RW, SHARE_ALL, None,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+        if not h or h == INVALID:
+            raise OSError(ctypes.get_last_error(), "CreateFileW 失败")
+        fd = msvcrt.open_osfhandle(h, os.O_RDWR | os.O_BINARY)
+        return os.fdopen(fd, "r+b")
+    except Exception:  # noqa: BLE001
+        return open(path, "r+b")
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +528,12 @@ class DownloadTask:
         self._messages = []
         self._samples = []         # [(t, downloaded), ...]
         self._fallback_single = False
+        # 当前轮次的单块重试预算（_download_multi 每轮设置，worker 读取）
+        self._retry_budget = MAX_RETRY
+        # 看门狗 / 放弃等待（见 _await）
+        self._last_progress = time.time()
+        self._cancel_at = 0.0
+        self._abandoned = False
 
     # ------------------------------------------------------------ 属性
     @property
@@ -471,6 +561,10 @@ class DownloadTask:
             self._samples = []
             self._started_at = time.time()
             self._finished_at = 0.0
+            self._last_progress = time.time()
+        self._cancel_at = 0.0
+        self._abandoned = False
+        self._retry_budget = MAX_RETRY
 
         t = threading.Thread(target=self._run, name="YuhubDownload", daemon=True)
         self._threads = [t]
@@ -484,8 +578,13 @@ class DownloadTask:
         ② 立即关闭所有在途响应：阻塞在 read()/connect() 里的 worker
            会马上抛异常退出，而不是干等 20 秒 socket 超时——
            用户点取消后界面应在 1 秒内响应，而不是"卡在正在取消"。
+        ③ 记下取消时刻：`_await` 用它做宽限期兜底——万一有 worker
+           卡在 DNS 解析这类"关不掉的阻塞"里，到点就放弃等待、
+           先让状态落定（见 CANCEL_GRACE）。
         状态仍由 `_run` 在 worker 全部退出后统一落定。
         """
+        if not self._cancel_at:
+            self._cancel_at = time.monotonic()
         self._cancel.set()
         with self._resp_lock:
             resps = list(self._active_resps)
@@ -544,19 +643,40 @@ class DownloadTask:
             else:
                 self._download_multi(total)
 
-            if self._cancel.is_set():
-                # 顺序很重要：**先清临时文件、再落状态**。
-                # 反过来的话，状态一变成「已取消」，UI/调用方立刻就能看到，
-                # 但此时磁盘上的 .part 还没删掉（删除带重试等待），
-                # 表现为"取消了但文件还在"，若紧接着往同一路径再下一次还会撞车。
-                self._cleanup_part()
+            if self._cancel.is_set() or self._abandoned:
+                # 顺序很重要：**先把状态落定**，让 UI 立刻响应，
+                # 再谈磁盘清理。
+                # 反过来的话，清理要重试好几轮（句柄没释放时每次删失败
+                # 都要等），用户点完取消会眼睁睁看着界面卡住不还。
+                # 若刚放弃等待过僵尸线程，文件句柄可能还攥在它手里，
+                # 清理交给 _reap 在后台完成。
+                cancelled = self._cancel.is_set()
+                if not self._abandoned:
+                    self._cleanup_part()
                 with self._lock:
-                    self._status = STATUS_CANCELLED
+                    self._status = (STATUS_CANCELLED if cancelled
+                                    else STATUS_ERROR)
+                    if not cancelled:
+                        self._error = "下载停滞：长时间没有收到数据，已中止"
                     self._finished_at = time.time()
                 return
 
             # 子流程（预分配失败 / 连接中断等）已经报错，别再往下走 _finish
             if self.status == STATUS_ERROR:
+                return
+
+            # ---- 完整性闸门（v0.8.15beta 修复的核心）----
+            # 不能只看文件大小：`.part` 是按总大小**预分配**的（零填充），
+            # 哪怕一个字节都没下到，大小也恒等于 total。
+            # 旧版据此判定成功，把满是空洞的残包交给替换器，
+            # 用户看到的就是"提示下载完成，但程序打不开/报错"。
+            missing = self._missing_indexes()
+            if missing:
+                total_blocks = len(self._blocks) or 1
+                self._fail(
+                    "下载不完整：%d/%d 个分块多次重试后仍失败，"
+                    "已丢弃不完整文件，请重试或更换下载线路"
+                    % (len(missing), total_blocks))
                 return
 
             self._finish()
@@ -566,6 +686,16 @@ class DownloadTask:
 
     # ------------------------------------------------------------ 多线程
     def _download_multi(self, total):
+        """分块下载：**多轮补漏**（v0.8.15beta）。
+
+        第 1 轮按线程数全并发；之后每轮只看"还没下完的块"，
+        且逐轮缩小并发、加长退避——国内直连 GitHub 常见的情况是
+        首轮并发一上去就被限流/掐断，若干块集中失败；这时候用更少的
+        连接慢慢补，成功率远高于原地死磕。
+
+        任何一轮补完就收工；跑满 MAX_ROUNDS 仍缺块 → 由 _run 的
+        完整性闸门报错。**绝不**把缺块的残包当成功品。
+        """
         n = min(self.threads, max(1, total // (64 * 1024)))  # 文件太小就别开那么多线程
         n = int(max(1, n))
         self._block_count = n
@@ -590,32 +720,140 @@ class DownloadTask:
             return
 
         self._start_sampler()
-        workers = []
-        for i in range(n):
-            t = threading.Thread(
-                target=self._worker, args=(i, blocks[i][0], blocks[i][1]),
-                name=f"YuhubDl-{i}", daemon=True,
-            )
-            workers.append(t)
-            t.start()
+        try:
+            for rnd in range(MAX_ROUNDS):
+                if self._cancel.is_set() or self._abandoned:
+                    return
+                todo = self._missing_indexes()
+                if not todo:
+                    return
+                if rnd:
+                    self._note("第 %d 轮补下：%d/%d 个分块需要重试"
+                               % (rnd + 1, len(todo), n))
+                    if not self._sleep_cancellable(ROUND_PAUSE[rnd]):
+                        return
+                self._retry_budget = RETRY_SCHEDULE[rnd]
+                # 首轮全并发；补漏轮次限制并发，别再压垮本就不稳的线路
+                cap = len(todo) if rnd == 0 else max(
+                    1, min(SUPPLEMENT_CONCURRENCY, len(todo)))
+                for batch in _batches(todo, cap):
+                    if self._cancel.is_set() or self._abandoned:
+                        return
+                    workers = []
+                    for i in batch:
+                        t = threading.Thread(
+                            target=self._worker,
+                            args=(i, blocks[i][0], blocks[i][1]),
+                            name=f"YuhubDl-{i}", daemon=True,
+                        )
+                        workers.append(t)
+                        t.start()
+                    with self._lock:
+                        self._threads.extend(workers)
+                    if not self._await(workers):
+                        return
+                if not self._missing_indexes():
+                    return
+        finally:
+            self._stop_sampler()
+
+    # ------------------------------------------------------------ 分块进度
+    def _missing_indexes(self):
+        """还没下满的分块下标。
+
+        判据是**每块实际写入的字节数**，不是文件大小——
+        预分配过的 .part 大小恒等于总大小，拿它做判断永远"完整"。
+        """
         with self._lock:
-            self._threads.extend(workers)
+            blocks = list(self._blocks)
+        out = []
+        for i, (start, end, done) in enumerate(blocks):
+            span = (end - start + 1) if end >= start else 0
+            if span > 0 and done != span:
+                out.append(i)
+        return out
+
+    def _sleep_cancellable(self, seconds):
+        """可被取消打断的退避睡眠。
+
+        旧版直接 `time.sleep(5)`：用户点取消后，正在退避的 worker
+        还要睡满 5 秒才轮到检查取消标志——"取消不灵"的体感多半来自这里。
+        切成 0.1 秒小片，取消最多 0.1 秒生效。
+        """
+        end = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self._cancel.is_set() or self._abandoned:
+                return False
+            left = end - time.monotonic()
+            if left <= 0:
+                return True
+            time.sleep(min(0.1, left))
+
+    def _await(self, workers):
+        """等 worker 退出，但**不无限等**。
+
+        worker 里的阻塞调用（DNS 解析挂起、TCP 建连被黑洞）可能永不返回。
+        无限 `join()` 的后果不是"慢"，是**任务状态永远落不了定**：
+        UI 停在「正在取消…」，用户怎么点都没反应，只能杀进程。
+        两种情况下放弃等待，先把状态交出去，僵尸线程交给 _reap 收尾：
+          ① 已取消且超过 CANCEL_GRACE 秒还没退干净；
+          ② 连续 STALL_TIMEOUT 秒没有任何字节进展（连接僵死）。
+        """
+        while True:
+            alive = [t for t in workers if t.is_alive()]
+            if not alive:
+                return True
+            if self._cancel.is_set() and self._cancel_at:
+                if time.monotonic() - self._cancel_at >= CANCEL_GRACE:
+                    self._abandon(alive, "已取消但线程未响应")
+                    return False
+            elif time.monotonic() - self._last_progress >= STALL_TIMEOUT:
+                self._abandon(alive, "长时间没有数据")
+                return False
+            time.sleep(0.1)
+
+    def _abandon(self, alive, why):
+        """放弃等待这些卡死的 worker，并安排后台收尾。"""
+        self._abandoned = True
+        self._note("有 %d 个下载线程（%s）未在限时内退出，已放弃等待"
+                   % (len(alive), why))
+        threading.Thread(target=self._reap, args=(list(alive),),
+                         name="YuhubDlReap", daemon=True).start()
+
+    def _reap(self, workers):
+        """后台收尾：等僵尸线程真退出后，把半成品文件删干净。
+
+        不能在这条路径上做清理——那正是要躲开的阻塞。
+        """
         for t in workers:
-            t.join()
-        self._stop_sampler()
+            try:
+                t.join()
+            except Exception:  # noqa: BLE001
+                pass
+        self._cleanup_part()
 
     def _worker(self, idx, start, end):
-        """抓取 [start, end] 这一段（闭区间）。"""
+        """抓取 [start, end] 这一段（闭区间）。
+
+        **支持续下**：从本块已有的写入进度处接着下。
+        补漏轮次靠这个特性避免把已经拿到的部分重下一遍（进度条也不会回退）。
+        """
         f = None
         try:
-            f = open(self.part_path, "r+b")
+            # 用 _open_rw 而不是 open(..., "r+b")：允许句柄未关时改名/删除，
+            # 否则僵尸 worker 会把这半成品文件"锁死"（见 _open_rw 注释）
+            f = _open_rw(self.part_path)
         except Exception:  # noqa: BLE001
             return
-        pos = start
+        span = end - start + 1
+        with self._lock:
+            have = int(self._blocks[idx][2]) if idx < len(self._blocks) else 0
+        pos = start + max(0, min(have, span))
         retry = 0
+        budget = max(1, int(self._retry_budget))
         try:
             while pos <= end:
-                if self._cancel.is_set():
+                if self._cancel.is_set() or self._abandoned:
                     return
                 req_end = min(pos + CHUNK - 1, end)
                 want = req_end - pos + 1
@@ -639,17 +877,20 @@ class DownloadTask:
                     if exc.code == 416:      # 区间越界 = 这段已经下完
                         break
                     retry += 1
-                    if retry > MAX_RETRY:
-                        self._note(f"分块 {idx + 1} 失败：HTTP {exc.code}")
+                    if retry > budget:
+                        self._note(f"分块 {idx + 1} 失败：HTTP {exc.code}"
+                                   f"（已重试 {budget} 次）")
                         return
-                    time.sleep(min(1.5 * retry, 5.0))
+                    if not self._sleep_cancellable(_backoff(retry)):
+                        return
                     continue
                 except Exception:  # noqa: BLE001
                     retry += 1
-                    if retry > MAX_RETRY:
-                        self._note(f"分块 {idx + 1} 多次重试后仍失败")
+                    if retry > budget:
+                        self._note(f"分块 {idx + 1} 重试 {budget} 次后仍失败")
                         return
-                    time.sleep(min(1.5 * retry, 5.0))
+                    if not self._sleep_cancellable(_backoff(retry)):
+                        return
                     continue
 
                 if not data:
@@ -665,6 +906,8 @@ class DownloadTask:
                     self._downloaded += len(data)
                     if idx < len(self._blocks):
                         self._blocks[idx][2] += len(data)
+                    # 看门狗心跳：有字节落地就说明连接还活着
+                    self._last_progress = time.time()
         finally:
             if f is not None:
                 try:
@@ -685,19 +928,22 @@ class DownloadTask:
             self._fail(f"连接失败：{exc}")
             return
         retry = 0
+        budget = max(1, int(self._retry_budget))
         try:
             with open(self.part_path, "wb") as f:
                 while True:
-                    if self._cancel.is_set():
+                    if self._cancel.is_set() or self._abandoned:
                         return
                     try:
                         data = resp.read(CHUNK)
                     except Exception:  # noqa: BLE001
                         retry += 1
-                        if retry > MAX_RETRY:
-                            self._note("多次重试后连接中断")
-                            break
-                        time.sleep(min(1.5 * retry, 5.0))
+                        if retry > budget:
+                            self._note("多次重试后连接中断，下载未完成")
+                            self._fail("连接中断：重试 %d 次后仍未恢复" % budget)
+                            return
+                        if not self._sleep_cancellable(_backoff(retry)):
+                            return
                         continue
                     if not data:
                         break
@@ -707,6 +953,7 @@ class DownloadTask:
                         self._downloaded += len(data)
                         if self._blocks:
                             self._blocks[0][2] += len(data)
+                        self._last_progress = time.time()
         finally:
             try:
                 resp.close()
@@ -760,20 +1007,54 @@ class DownloadTask:
 
     def _finish(self):
         total = self._total
-        got = os.path.getsize(self.part_path) if os.path.exists(self.part_path) else 0
-        if total > 0 and got != total:
-            self._fail(f"文件大小不符：期望 {human_bytes(total)}，实际 {human_bytes(got)}")
+        with self._lock:
+            got = self._downloaded
+        if not os.path.exists(self.part_path):
+            self._fail("临时文件丢失，下载未完成")
             return
-        try:
-            os.replace(self.part_path, self.save_path)
-        except Exception as exc:  # noqa: BLE001
-            self._fail(f"无法保存到目标路径：{exc}")
+        # 用**实际写入的字节数**校验，而不是 os.path.getsize()。
+        # 分块模式下 .part 是按总大小预分配的（零填充），大小恒等于 total，
+        # 拿它做判断等于没有校验——旧版正是靠这个"永远通过"的检查，
+        # 把缺了 7 个分块的残包判定为"下载完成"。
+        # 分块的完整性由 _run 的闸门（_missing_indexes）保证，
+        # 这里再对总量兜一次底。
+        if total > 0 and got != total:
+            self._fail("下载不完整：期望 %s，实际 %s"
+                       % (human_bytes(total), human_bytes(got)))
+            return
+        err = self._replace_with_retry(self.part_path, self.save_path)
+        if err is not None:
+            self._fail(f"无法保存到目标路径：{err}")
             return
         with self._lock:
-            self._downloaded = got
             self._total = total or got
             self._status = STATUS_DONE
             self._finished_at = time.time()
+
+    def _replace_with_retry(self, src, dst, wait=8.0, step=0.2):
+        """把临时文件挪到目标路径，遇到"被占用"就退避重试。
+
+        正常取消时 worker 秒退，句柄立刻释放，第一次就能成。
+        只有在 worker 卡死（DNS 挂起之类）时才会撞上 WinError 32——
+        这时等它退出比直接报错好：等不到再如实报错，用户至少知道
+        是被什么挡住了，而不是看到一句看不出所以然的"无法保存"。
+
+        返回 None = 成功，否则返回最后的异常。
+        """
+        end = time.monotonic() + max(0.0, wait)
+        last = None
+        while True:
+            try:
+                os.replace(src, dst)
+                return None
+            except OSError as exc:
+                last = exc
+                # 5 = 拒绝访问，32 = 文件被占用；其它错误重试也没意义
+                if getattr(exc, "winerror", None) not in (5, 32):
+                    return exc
+                if time.monotonic() >= end or self._cancel.is_set():
+                    return exc
+                time.sleep(step)
 
     def _cleanup_part(self):
         """删除半成品文件（取消 / 失败时调用）。
@@ -793,6 +1074,18 @@ class DownloadTask:
                 last = exc
                 # 给还没关干净的句柄一点时间释放
                 time.sleep(0.15 * (attempt + 1))
+        # 最后一搏：删不掉通常是还有僵尸线程攥着句柄。
+        # 改名虽然仍占磁盘，但能保证下次往同一路径下载不撞车
+        #（否则下次 "wb" 打开就撞上被占用的文件，报的错还看不出原因）。
+        try:
+            bad = self.part_path + ".bad"
+            os.replace(self.part_path, bad)
+            with self._lock:
+                self._messages.append(
+                    "半成品文件被占用，已改名保留：%s" % os.path.basename(bad))
+            return False
+        except Exception:
+            pass
         with self._lock:
             self._messages.append(f"临时文件清理失败：{last}")
         return False

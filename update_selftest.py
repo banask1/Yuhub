@@ -398,6 +398,119 @@ def _test_download_sources_and_cancel(port):
 
 
 
+def _test_block_integrity():
+    """v0.8.15beta 回归：分块失败**绝不能**被当成"下载完成"。
+
+    线上 bug（用户截图反馈）：10 个分块里 7 个"多次重试后仍失败"，
+    任务却报 status=done、downloaded=total。根因是收尾校验看的是
+    `.part` 的文件大小，而它是按总大小**预分配**的（零填充内容），
+    大小恒等于 total —— 缺块的残包照样放行，交给替换器之后
+    用户看到的就是"提示更新完成，但程序打不开 / 报不兼容"。
+    """
+    import re
+
+    import downloader as _dl
+
+    size = 2 * 1024 * 1024
+    data = (bytes(range(256)) * (size // 256 + 1))[:size]
+    digest = hashlib.sha256(data).hexdigest()
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        fail_lo = -1
+        fail_hi = -1
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            if rng:
+                m = re.match(r"bytes=(\d+)-(\d+)", rng)
+                lo, hi = int(m.group(1)), int(m.group(2))
+            else:
+                lo, hi = 0, size - 1
+            lo = max(0, min(lo, size - 1))
+            hi = max(lo, min(hi, size - 1))
+            # 长度为 1 的 Range 是探测请求（probe 用 bytes=0-0），不注入
+            # 故障 —— 否则测出来的是"探测失败"，而不是"分块失败"
+            if hi > lo and self.fail_lo <= lo <= self.fail_hi:
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            chunk = data[lo:hi + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (lo, hi, size))
+            self.send_header("Content-Length", str(len(chunk)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            self.wfile.write(chunk)
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/f.bin" % srv.server_address[1]
+    work = tempfile.mkdtemp(prefix="yuhub_bi_")
+
+    # 退避调小：逻辑一字未改，只是不让自检为了等 4 轮指数退避跑上几分钟
+    saved_pause, saved_backoff = _dl.ROUND_PAUSE, _dl._backoff
+    _dl.ROUND_PAUSE = (0.0, 0.0, 0.0, 0.0)
+    _dl._backoff = lambda retry, base=0.6, cap=8.0: 0.05
+
+    def _run(name, fail_lo=-1, fail_hi=-1):
+        _H.fail_lo, _H.fail_hi = fail_lo, fail_hi
+        dest = os.path.join(work, name)
+        task = _dl.DownloadTask(url, dest, threads=4)
+        task.start()
+        end = time.monotonic() + 90
+        while task.running and time.monotonic() < end:
+            time.sleep(0.05)
+        return task.snapshot(), dest
+
+    try:
+        # ① 第 3 块（4 块均分 2MB → 512KB/块 → 1048576..1572863）全部失败
+        snap, dest = _run("bad.bin", 1048576, 1572863)
+        leftover = [f for f in os.listdir(work) if f.startswith("bad.bin")]
+        _add("★ 分块失败必须报错误（不许报 done）",
+             snap["status"] == _dl.STATUS_ERROR,
+             "status=%s error=%r" % (snap["status"], snap["error"]))
+        _add("★ 分块失败不留残包",
+             (not os.path.exists(dest)) and (not leftover),
+             "残留=%s" % leftover)
+        _add("失败原因指明是分块问题",
+             "分块" in (snap["error"] or ""), snap["error"])
+
+        # ② 无故障时下载仍然完整（别为了防错把正常路径也掐了）
+        snap2, dest2 = _run("good.bin")
+        ok2 = (snap2["status"] == _dl.STATUS_DONE
+               and os.path.isfile(dest2)
+               and hashlib.sha256(open(dest2, "rb").read()).hexdigest() == digest
+               and not os.path.exists(dest2 + ".part"))
+        _add("无故障时下载完整且校验通过", ok2,
+             "status=%s error=%r" % (snap2["status"], snap2["error"]))
+
+        # ③ 进度文案：snapshot 字典必须转成人话
+        #    （用户截图里那坨 {"status": "done", ...} 就是没转的结果）
+        _phase, text = updater.format_progress({
+            "status": "running", "downloaded": 1024, "total": 2048,
+            "percent": 50.0, "speed": 512.0, "eta": 2.0, "messages": []})
+        _add("★ 进度文案不含原始 JSON",
+             "{" not in text and "}" not in text and "50.0%" in text,
+             repr(text))
+        _phase2, text2 = updater.format_progress(
+            {"status_text": "正在连接更新源…", "phase": "probing"})
+        _add("探测阶段文案原样透传",
+             "{" not in text2 and "连接更新源" in text2, repr(text2))
+    finally:
+        _dl.ROUND_PAUSE, _dl._backoff = saved_pause, saved_backoff
+        try:
+            srv.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _test_http_downgrade_rejected():
     """非 https 的更新地址必须被拒绝（防降级到明文）。"""
     info = updater.ReleaseInfo(
@@ -733,6 +846,7 @@ def run(out_path):
 
         _test_http_downgrade_rejected()
         _test_download_sources_and_cancel(port)
+        _test_block_integrity()
         _test_replace_flow(port, tag, sha, fake_exe)
         _test_selftest_mode_guarded()
         _test_package_guard()
