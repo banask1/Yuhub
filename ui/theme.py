@@ -482,6 +482,27 @@ QLineEdit {
 }
 QLineEdit:focus { border-color: $accent; }
 
+/* ---------- 数字框 ----------
+   内存优化页的"自定义间隔"用它。极简色块风格里不放那对系统小箭头
+   （箭头要靠图片才能正确渲染，见上方 QComboBox::down-arrow 的注释），
+   直接收起按钮、当成一个窄输入框用；旁边本来就有 6 个挡位按钮。 */
+QSpinBox {
+    background: $input_bg;
+    border: 1px solid $border_strong;
+    border-radius: 5px;
+    padding: 7px 10px;
+    color: $text;
+    selection-background-color: $accent;
+    selection-color: $accent_text;
+}
+QSpinBox:focus { border-color: $accent; }
+QSpinBox:disabled { color: $text_faint; border-color: $border; }
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 0px;
+    border: none;
+    background: transparent;
+}
+
 /* ---------- 右键菜单 ----------
    上面那条 `QWidget { background: transparent }` 通配规则**也会作用到 QMenu**。
    QMenu 是原生弹窗窗口，"透明背景"会让它自身的底不被绘制 → 漏出窗口默认的黑底；
