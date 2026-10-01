@@ -368,6 +368,68 @@ def _check_ui_state(result, mark):
     _check_join_validation(page, mark)
     _check_nickname(page, mark)
     _check_member_row_ui(page, mark)
+    _check_node_combo_ui(page, mark, app)
+
+
+def _check_node_combo_ui(page, mark, app):
+    """中继节点下拉的宽度回归。
+
+    用户报的 bug：「中继节点的位置文字显示不完全」——控件实际宽度只有
+    162px，连最短的「海波中国大陆（44ms）」都放不下，显示成「海波中国大…」。
+
+    根因不是文字太长，而是 QComboBox 默认的宽度策略只在**首次显示时**
+    量一次：首屏的裸名字（「自动（尝试全部节点）」）把它钉死在 162px，
+    之后测速回来重建列表、塞进「自动（最快：海波中国大陆 44ms）」这种
+    长一倍的项，它不会自己变宽。所以断言不能只测"某项文案对不对"，
+    必须拿真实字体量一遍宽度。
+    """
+    combo = page.node_combo
+    try:
+        import node_probe
+    except Exception as exc:                       # pragma: no cover - 防御
+        mark("导入 node_probe（界面宽度检查）", False, repr(exc))
+        return
+
+    # 用假数据把四种状态都摆上：可用（带延迟）、不可达（超时）、
+    # 名字自带括号的（最长的那个），离线可跑，不依赖外网。
+    now = time.time()
+    fake = {}
+    for key, ms in (("weiai", 19), ("haibo_cn", 34), ("haibo_us", 193),
+                    ("cn_ip", None)):
+        fake[key] = {
+            "key": key, "label": "", "addr": "",
+            "ms": ms, "ok": ms is not None,
+            "via": "icmp" if ms is not None else "",
+            "error": "" if ms is not None else "超时",
+            "at": now,
+        }
+    page._probe.update(fake)
+    page._fill_node_combo()
+    app.processEvents()
+
+    fm = combo.fontMetrics()
+    widest, widest_text = 0, ""
+    for i in range(combo.count()):
+        text = combo.itemText(i)
+        w = fm.horizontalAdvance(text)
+        if w > widest:
+            widest, widest_text = w, text
+    floor = combo.minimumWidth()
+    mark("★ 中继节点下拉留足了最宽一项的宽度（地名不再被切掉半个）",
+         widest > 0 and floor >= widest,
+         "最宽项=%r 需要=%dpx 控件下限=%dpx" % (widest_text, widest, floor))
+    mark("下拉宽度有上限（不会把同行的「测速」按钮挤出去）",
+         combo.maximumWidth() <= 360 and combo.maximumWidth() >= floor,
+         "下限=%dpx 上限=%dpx" % (floor, combo.maximumWidth()))
+
+    first = combo.itemText(0)
+    mark("★「自动」项报出最快节点，且不套双层括号",
+         "最快" in first and first.count("（") == 1, first)
+    mark("「自动」报的就是实测最快那个（19ms 的唯爱厦门）",
+         "唯爱厦门" in first and "19ms" in first, first)
+    mark("名字自带括号的节点改用间隔号接状态",
+         any("· 超时" in combo.itemText(i) for i in range(combo.count())),
+         [combo.itemText(i) for i in range(combo.count())])
 
 
 def _check_member_row_ui(page, mark):

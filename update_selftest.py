@@ -36,6 +36,31 @@ def _add(name, passed, detail=""):
             {"name": name, "pass": bool(passed), "detail": str(detail)})
 
 
+def _local_machine():
+    """本机 OS 的 PE Machine（体检放行要用同一个口径）。"""
+    arch = (os.environ.get("PROCESSOR_ARCHITEW6432")
+            or os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+    return {"AMD64": 0x8664, "ARM64": 0xAA64, "X86": 0x14C,
+            "ARM": 0x1C0}.get(arch, 0x14C)
+
+
+def _fake_pe_payload(size=8192, machine=None):
+    """造一个"体检能过"的假更新包：MZ + PE 签名 + Machine 字段。
+
+    为什么不能再用一段随机字节：给 apply 加了"坏包体检"之后，
+    「下载下来的必须是个真程序」成了契约的一部分，随机字节会被拦下——
+    那是**正确**行为，只是不该拿来测"下载成功/替换成功"。
+    这里不追求它能真的执行（下载、校验、两步改名都不需要）。
+    """
+    buf = bytearray(b"\0" * max(4096, size))
+    buf[0:2] = b"MZ"
+    off = 0x80
+    buf[0x3C:0x40] = off.to_bytes(4, "little")
+    buf[off:off + 4] = b"PE\0\0"
+    buf[off + 4:off + 6] = (machine or _local_machine()).to_bytes(2, "little")
+    return bytes(buf)
+
+
 # ================================================================ 假更新源
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -446,15 +471,24 @@ def _test_replace_flow(port, tag, good_sha, payload_bytes):
 
 
 def _test_apply_main(work):
-    """验证 apply_update_main 的完整替换路径。
+    """验证替换器的入口行为——重点是新增的「坏包体检」闸门。
 
-    关键：目标 exe 和"新 exe"都必须是**真能启动的 PE 文件**，
-    否则 apply_update_main 会走"启动失败→回滚"分支（返回 7），
-    那是正确行为但测不到正常路径。
+    ⚠️ 这里必须用**非 PE** 的假包，这是回归的靶子：
 
-    做法：两边都用"当前自己的可执行文件"的副本。
-    - 冻结态：就是 Yuhub.exe 自身，拷两份即可
-    - 源码态：是 python.exe（带参数会立刻退出，但能启动）
+    以前 apply_update_main 不做任何检查就把新包 rename 就位、直接 Popen。
+    把一个不是真 64 位程序的文件交给 Windows，系统会弹一个**模态对话框**：
+
+        不支持的 16 位应用程序
+        由于与 64 位版本的 Windows 不兼容，此程序或功能
+        "…\\Temp\\Yuhub_updtest_<pid>\\apply\\Target.exe" 无法启动或运行。
+        请联系软件供应商询问是否有与 64 位 Windows 兼容的版本。
+
+    用户报的正是这个（弹窗里点名 Target.exe）。明明是更新包坏了，
+    看起来却像"Yuhub 跟你的系统不兼容"，而且是系统级弹窗，
+    用户除了点「确定」什么也做不了。
+
+    现在的契约：体检不合格 → 返回 9，**一个文件都不动、也不启动任何东西**，
+    所以系统压根没有机会弹框。
     """
     d = os.path.join(work, "apply")
     os.makedirs(d, exist_ok=True)
@@ -464,28 +498,20 @@ def _test_apply_main(work):
     real = updater.current_exe()
     try:
         shutil.copy2(real, target)
-        shutil.copy2(real, new_exe)
     except Exception as e:
-        _add("apply_update_main：准备真实可执行目标", False, "拷贝失败：%s" % e)
+        _add("apply_update_main：准备替换目标", False, "拷贝失败：%s" % e)
         return
 
     try:
         target_size = os.path.getsize(target)
     except OSError:
         target_size = 0
-    _add("apply_update_main：准备真实可执行目标", target_size > 0,
+    _add("apply_update_main：准备替换目标", target_size > 0,
          "%s (%d 字节)" % (os.path.basename(real), target_size))
 
-    # 为了让"启动新版"这一步能干净地成功返回，给新版传一个会立刻
-    # 正常退出（退出码 0）的参数：--update-selftest 用一个不存在的路径会
-    # 返回非 0，所以改用"能识别但无害"的方式——直接不给参数，
-    # 冻结态下它会尝试启动 GUI（可能长时间不退）。
-    # 因此这里改成：用一个**假的可执行文件**，让 Popen 失败并走回滚，
-    # 专门验证回滚路径的健壮性；正常路径已由上面的两步改名测试覆盖。
-    os.remove(new_exe)
+    # ---- ① 坏包：体检必须拦下，且不动目标文件 ----
     with open(new_exe, "wb") as f:
         f.write(b"NOT-A-PE" * 64)
-
     payload = updater.build_request(new_exe, target, 0, new_version="vtest")
     b64 = updater.encode_payload(payload)
 
@@ -497,12 +523,89 @@ def _test_apply_main(work):
         return
 
     _add("apply_update_main 不抛异常", rc is not None, "返回码=%r" % rc)
-    # 非 PE 文件启动必然失败 → 必须回滚，目标应仍是原来的副本
-    rolled_back = os.path.getsize(target) == target_size
-    _add("启动失败时自动回滚（目标保持原样）", rolled_back,
-         "target 大小=%d（原 %d），返回码=%r" % (os.path.getsize(target), target_size, rc))
-    _add("回滚后未遗留 .bak", not os.path.exists(target + ".bak"),
+    _add("★ 坏包被体检拦下（返回 9，绝不交给 Windows 启动）", rc == 9,
+         "返回码=%r" % rc)
+    exist = os.path.exists(target)
+    _add("★ 坏包不改动目标文件（旧版原封不动，用户照样能用）",
+         exist and os.path.getsize(target) == target_size,
+         "target=%s %d 字节（原 %d）"
+         % ("存在" if exist else "不见了",
+            os.path.getsize(target) if exist else -1, target_size))
+    _add("坏包不遗留 .bak", not os.path.exists(target + ".bak"),
          "bak 存在=%s" % os.path.exists(target + ".bak"))
+
+    # ---- ② 好包不能误杀（否则正常更新全被拦） ----
+    with open(new_exe, "wb") as f:
+        f.write(_fake_pe_payload())
+    fine, why = updater.check_package_runnable(new_exe)
+    _add("★ 合法 PE 能通过体检（正常更新不被误拦）", fine, why or "通过")
+
+    # ---- ③ 兜底防线：载入器系统弹窗开关已关 ----
+    _add("已关闭 Windows 载入器系统弹窗（兜底防线）",
+         updater.loader_dialogs_silenced(),
+         "GetErrorMode & SEM_FAILCRITICALERRORS = %s"
+         % updater.loader_dialogs_silenced())
+
+
+def _test_package_guard():
+    """更新包体检：四种典型坏包都要认出来，好包不能误杀。
+
+    这些坏包不是假想——下载被掐断就会留下半截文件；被代理/镜像劫持时
+    拿回来的常常是一个 HTML 错误页被原样存成 .exe。它们以前都会一路
+    走到"交给 Windows 启动"，然后弹系统对话框。
+    """
+    d = os.path.join(tempfile.gettempdir(), "Yuhub_pkgtest_%d" % os.getpid())
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    try:
+        def put(name, data):
+            p = os.path.join(d, name)
+            with open(p, "wb") as f:
+                f.write(data)
+            return p
+
+        good = put("good.exe", _fake_pe_payload())
+        ok, why = updater.check_package_runnable(good)
+        _add("体检放行合法 PE", ok, why or "通过")
+
+        tiny = put("tiny.exe", b"YUHUBNEW" + os.urandom(200))
+        ok, why = updater.check_package_runnable(tiny)
+        _add("★ 只有几 KB 的「更新包」被拒（下载中断）",
+             (not ok) and ("字节" in why), why)
+
+        html = put("html.exe", b"<!DOCTYPE html><html>" + b"<div>" * 2000)
+        ok, why = updater.check_package_runnable(html)
+        _add("★ HTML 错误页存成 .exe 被拒（代理/镜像劫持）",
+             (not ok) and ("不是有效" in why), why)
+
+        arm = put("arm.exe", _fake_pe_payload(machine=0xAA64))
+        arch = (os.environ.get("PROCESSOR_ARCHITEW6432")
+                or os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+        ok, why = updater.check_package_runnable(arm)
+        if arch == "AMD64":
+            _add("★ 架构不符的包被拒（就是「不兼容本机」这一条）",
+                 (not ok) and ("不兼容" in why), why)
+        else:
+            _add("★ 架构不符的包被拒（就是「不兼容本机」这一条）", True,
+                 "本机 %s，该分支不适用" % arch)
+
+        ok, why = updater.check_package_runnable(os.path.join(d, "nope.exe"))
+        _add("更新包不存在 → 明确拒绝（不是直接崩）", not ok, why)
+
+        _add("pe_machine 读得出 Machine 字段",
+             updater.pe_machine(good) in updater.runnable_machines(),
+             updater.pe_machine(good))
+        _add("pe_machine 对非 PE 返回 None",
+             updater.pe_machine(html) is None, updater.pe_machine(html))
+
+        # e_lfanew 离谱（随机字节里恰好出现 MZ 的情况）也不能崩
+        junk = put("junk.exe", b"MZ" + os.urandom(8190))
+        _add("头部像 PE 其实是垃圾 → 返回 None 而不是抛异常",
+             updater.pe_machine(junk) is None, updater.pe_machine(junk))
+    except Exception as e:
+        _add("体检自检自身未崩溃", False, repr(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _test_selftest_mode_guarded():
@@ -579,11 +682,14 @@ def _test_checker_signals_connectable():
 def run(out_path):
     started = time.time()
     srv = None
+    info = None                # 收尾清理假更新包要用（异常时也要能取到）
     try:
         # ---- 准备：假的"新版 exe"内容 ----
-        # 用一段可辨识的字节当假更新包（不必是真 PE，
-        # 因为替换流程只关心文件是否正确搬运）。
-        fake_exe = b"YUHUBNEW" + os.urandom(4096)
+        # ⚠️ 必须是**能过体检的假 PE**：download_update 现在会在下载后
+        # 体检（"拿到手的必须是个真程序"），随机字节会被合法地拦下来，
+        # 那样测不到"下载成功"这条正常路径。
+        # 坏包的拒绝路径由 _test_package_guard / _test_apply_main 专门覆盖。
+        fake_exe = _fake_pe_payload()
 
         sha = hashlib.sha256(fake_exe).hexdigest()
         tag = "v0.99.0"
@@ -629,6 +735,7 @@ def run(out_path):
         _test_download_sources_and_cancel(port)
         _test_replace_flow(port, tag, sha, fake_exe)
         _test_selftest_mode_guarded()
+        _test_package_guard()
         _test_checker_signals_connectable()
 
     except Exception as e:
@@ -641,6 +748,17 @@ def run(out_path):
                 srv.server_close()
             except Exception:
                 pass
+        # 自检往**真实的更新目录**里写过一个假更新包（v0.99.0，它是
+        # download_update 真实路径的产物，正是要覆盖 package_path 的
+        # 命名规则）。测完必须自己擦掉：那不是用户的东西，留在那儿
+        # 会让更新目录越来越脏，也可能被误当成"已下载好的更新包"。
+        try:
+            if info is not None:
+                leftover = updater.package_path(info)
+                if os.path.isfile(leftover):
+                    os.remove(leftover)
+        except Exception:
+            pass
 
     checks = _RESULT["checks"]
     _RESULT["ok"] = all(c["pass"] for c in checks) and len(checks) > 0

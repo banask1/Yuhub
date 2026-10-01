@@ -459,6 +459,22 @@ def _rank(rec):
     return (2, 10 ** 6)
 
 
+def short_name(label):
+    """把「国内中继（IP 直连）」压成「国内中继」。
+
+    只用在要嵌进别的括号里的场合（「自动（最快：…）」）。节点名自带的
+    括号是用来补充说明的，套一层就成「自动（最快：国内中继（IP 直连） 36ms）」
+    ——双层括号，读起来要数括号配对，反而看不清最快的到底是哪个。
+    """
+    txt = str(label or "").strip()
+    for sep in ("（", "("):
+        cut = txt.find(sep)
+        if cut > 0:
+            txt = txt[:cut]
+            break
+    return txt.strip() or str(label or "")
+
+
 def _node_label(label, rec, missing_text="待测"):
     """单个节点的下拉文案。
 
@@ -468,8 +484,15 @@ def _node_label(label, rec, missing_text="待测"):
     if not rec:
         return "%s（%s）" % (label, missing_text) if missing_text else label
     if rec.get("ok"):
-        return "%s（%s）" % (label, format_latency(rec.get("ms")))
-    return "%s（%s）" % (label, rec.get("error") or "超时")
+        suffix = format_latency(rec.get("ms"))
+    else:
+        suffix = rec.get("error") or "超时"
+    # 节点名自带括号时（「国内中继（IP 直连）」）再套一层就成了
+    # 「国内中继（IP 直连）（超时）」——连着两组括号要数配对，读着累。
+    # 这种情况改用间隔号，一眼能看出后半截是状态而不是名字的一部分。
+    if "（" in str(label):
+        return "%s · %s" % (label, suffix)
+    return "%s（%s）" % (label, suffix)
 
 
 def decorate_choices(choices, results, now=None, ttl=None, missing_text="待测"):
@@ -502,7 +525,7 @@ def decorate_choices(choices, results, now=None, ttl=None, missing_text="待测"
                 best = (_label, rec)
     if best is not None:
         auto_label_text = "自动（最快：%s %s）" % (
-            best[0], format_latency(best[1].get("ms")))
+            short_name(best[0]), format_latency(best[1].get("ms")))
 
     ordered = []
     rest = []

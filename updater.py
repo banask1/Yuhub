@@ -390,6 +390,116 @@ def verify_sha256(path, expect):
         return False
 
 
+# ---------------------------------------------------------------- 包体检
+#
+# 为什么要在"启动新版"之前自己看一眼文件：
+#
+# 把不是一个合法 64 位 PE 的东西交给 CreateProcess，Windows 不会安静地失败，
+# 而是弹一个**模态系统对话框**：
+#
+#     不支持的 16 位应用程序
+#     由于与 64 位版本的 Windows 不兼容，此程序或功能
+#     "C:\...\Target.exe" 无法启动或运行。
+#     请联系软件供应商询问是否有与 64 位 Windows 兼容的版本。
+#
+# 用户看到的是"更新完电脑坏了、要联系软件商"，而不是"更新包损坏，已回滚"。
+# 这个场景并不罕见：下载被中途掐断会留下半截文件；被代理/镜像劫持时，
+# 拿回来的可能是一个 HTML 错误页被原样存成了 .exe。
+#
+# 所以在改名换文件**之前**先体检，不合格就原地返回、一个文件都不动。
+
+# 本机 Windows 能执行的 PE Machine。任何 Windows 都跑得了 32 位；
+# 64 位 x64 额外接受 x64；ARM64 额外接受 ARM64 与 x64（系统带模拟）。
+_PE_MACHINE = {"X86": 0x14C, "AMD64": 0x8664, "ARM64": 0xAA64, "ARM": 0x1C0}
+
+_SEM_FAILCRITICALERRORS = 0x0001
+
+
+def silence_loader_dialogs():
+    """关掉本进程加载器弹系统错误框的行为（兜底，不是主防线）。
+
+    主防线是 check_package_runnable()——正常情况下根本不会把坏文件交给
+    Windows。这里再兜一层：万一是别的原因触发载入器报错（杀软拦了、
+    文件刚好在改名和启动之间被删），也不要弹框吓人。
+    """
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.SetErrorMode(_SEM_FAILCRITICALERRORS)
+    except Exception:
+        pass
+
+
+def loader_dialogs_silenced():
+    """本进程是否已关掉载入器系统弹窗（自检 / 诊断用）。"""
+    if os.name != "nt":
+        return True
+    try:
+        return bool(ctypes.windll.kernel32.GetErrorMode()
+                    & _SEM_FAILCRITICALERRORS)
+    except Exception:
+        return False
+
+
+def pe_machine(path):
+    """读 PE 头里的 Machine 字段；不是 PE 就返回 None。
+
+    只读前几百字节，60MB 的包也是瞬间完成，不用整文件读。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+            if len(head) < 64 or head[:2] != b"MZ":
+                return None
+            off = int.from_bytes(head[0x3C:0x40], "little")
+            if not 0 < off < 16 * 1024 * 1024:
+                return None                # e_lfanew 离谱 → 不是真 PE
+            f.seek(off)
+            sig = f.read(6)
+            if len(sig) < 6 or sig[:4] != b"PE\0\0":
+                return None
+            return int.from_bytes(sig[4:6], "little")
+    except (OSError, ValueError):
+        return None
+
+
+def runnable_machines():
+    """本机 Windows 能跑哪些 Machine（决定体检放行范围）。"""
+    arch = (os.environ.get("PROCESSOR_ARCHITEW6432")
+            or os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+    ok = {_PE_MACHINE["X86"]}              # 32 位在任何 Windows 上都能跑
+    if arch == "AMD64":
+        ok.add(_PE_MACHINE["AMD64"])
+    elif arch == "ARM64":
+        ok.add(_PE_MACHINE["ARM64"])
+        ok.add(_PE_MACHINE["AMD64"])       # ARM64 Windows 自带 x64 模拟
+    elif arch == "ARM":
+        ok.add(_PE_MACHINE["ARM"])
+    return ok
+
+
+def check_package_runnable(path):
+    """更新包能不能在本机跑起来。返回 (ok, 给用户看的原因)。
+
+    只判"能不能启动"，不判内容对不对——内容由 sha256 负责。
+    """
+    if not path or not os.path.isfile(path):
+        return False, "更新包不存在"
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return False, "读不到更新包：%s" % e
+    if size < 4096:
+        # 真 Yuhub.exe 是几十 MB。几 KB 的东西只可能是错误页或半截文件。
+        return False, "更新包只有 %d 字节，明显没下载完整" % size
+    machine = pe_machine(path)
+    if machine is None:
+        return False, "更新包不是有效的 Windows 程序（多半是下载中断或被抓成了错误页）"
+    if os.name == "nt" and machine not in runnable_machines():
+        return False, "更新包的架构与你的系统不匹配（不兼容本机 64 位 Windows）"
+    return True, ""
+
+
 def update_dir():
     """更新工作目录：%LOCALAPPDATA%\\Yuhub\\update。
 
@@ -605,6 +715,18 @@ def download_update(info, on_progress=None, cancel=None, threads=None):
                 except OSError:
                     pass
                 return False, "校验失败，文件可能已损坏或被篡改，已删除", ""
+
+            # ④ 体检：sha256 拿不到时（老 release 没 digest）这条路是
+            #    唯一的把关；拿得到时它也是最后一道，确保交给替换器的
+            #    一定是本机能跑的真程序。不合格的当场删掉，免得下次
+            #    「继续下载」时又把这个坏文件当成已完成的任务。
+            fine, why = check_package_runnable(dest)
+            if not fine:
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                return False, why, ""
             return True, "下载完成", dest
 
     return False, last_err or "所有下载线路均不可达，请检查网络后重试", ""
@@ -653,10 +775,20 @@ def kill_pid(pid):
 
 
 def current_exe():
-    """当前运行的可执行文件路径（打包后就是 Yuhub.exe）。"""
+    """当前运行的可执行文件路径（打包后就是 Yuhub.exe）。
+
+    源码态用 argv[0] 当"自己"，但 `python -c "..."` 这类调用方式下
+    argv[0] 就是字面量 `-c`——一个根本不存在的文件。调用方（拷一份自己
+    当替换器、自检里拷一份当"要替换的目标"）拿到这种路径只会
+    报「系统找不到指定的文件」，看不出问题出在哪。所以不成立时
+    退回解释器路径，与 sys_executable() 同一套判据。
+    """
     if getattr(sys, "frozen", False):
         return os.path.abspath(sys.executable)
-    return os.path.abspath(sys.argv[0])
+    arg0 = sys.argv[0] if sys.argv else ""
+    if arg0 and os.path.isfile(arg0):
+        return os.path.abspath(arg0)
+    return os.path.abspath(sys.executable)
 
 
 def sys_executable():
@@ -768,9 +900,19 @@ def needs_elevation(target_exe):
 def apply_update_main(b64_payload):
     """`Yuhub.exe --apply-update <base64-json>` 模式（在 main() 里早返回）。
 
-    职责：等旧进程退出 → 两步改名替换 → 启动新版 → 观察是否秒退 → 必要时回滚。
+    职责：体检新包 → 等旧进程退出 → 两步改名替换 → 启动新版 →
+    观察是否秒退 → 必要时回滚。
 
-    返回进程退出码（0 表示成功完成替换流程）。
+    返回进程退出码：
+        0  成功
+        2  载荷解不开
+        3  文件缺失 / 路径非法
+        4  旧进程不退
+        5  旧 exe 改名失败（权限/占用）
+        6  新包就位失败（已回滚）
+        7  新包启动失败（已回滚）
+        8  新版秒退且非 0（已回滚）
+        9  **新包体检不合格，未动任何文件**（损坏 / 架构不符）
     """
     try:
         p = decode_payload(b64_payload)
@@ -785,6 +927,16 @@ def apply_update_main(b64_payload):
 
     if not new_exe or not target or not os.path.isfile(new_exe):
         return 3
+
+    # ---- ⓪ 体检新包：不合格就地返回，一个文件都不动 ----
+    # 放在改名之前是关键。若等到第 ④ 步才由 Popen 发现文件是坏的，
+    # 旧的 exe 已经被改名、坏的已经就位——那是"先砸了再修"；
+    # 而且 Windows 会在此时弹「不支持的 16 位应用程序」系统对话框。
+    # 这里提前拦下，用户的机器全程保持原样。
+    silence_loader_dialogs()               # 兜底：之后任何失败都不弹框
+    fine, why = check_package_runnable(new_exe)
+    if not fine:
+        return 9
 
     # ---- ① 等旧进程彻底退出 ----
     if old_pid and _pid_alive(old_pid):

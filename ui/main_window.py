@@ -409,6 +409,15 @@ class MainWindow(QWidget):
         """把更新交给替换器：拷一份自己做替换器 → 拉起 → 自己退出。"""
         import updater
 
+        # 体检更新包：不合格就**不要**进入替换流程。
+        # 因为一旦把替换器拉起来，本进程马上就退出了；替换器再发现包是坏的，
+        # 用户看到的就是"点了更新、窗口没了、什么也没发生"，而不是一句原因。
+        # 更糟的是坏包会被 Windows 弹成「不支持的 16 位应用程序」系统框。
+        fine, why = updater.check_package_runnable(package)
+        if not fine:
+            show_toast(self, "更新包有问题：%s" % why)
+            return
+
         try:
             payload = updater.build_request(
                 package, updater.sys_executable(), os.getpid(),

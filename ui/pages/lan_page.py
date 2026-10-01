@@ -45,6 +45,12 @@ from .base_page import BasePage
 # 生成房间码用的字母表：去掉 0/O、1/I/L 这类肉眼易混的字符
 _CODE_CHARS = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 
+# 「中继节点」下拉的宽度上限。节点名后面要挂实测延迟（「海波中国大陆（209ms）」）
+# 甚至嵌进「自动（最快：…）」，比裸名字长不少——但也不能无限宽，否则窄窗口下
+# 会把同一行的「测速」按钮和「延迟数据」提示挤出去。360 是两侧都留够的折中：
+# 现有全部内置节点的最长一项（含延迟）约 230px。
+_NODE_COMBO_MAX_W = 360
+
 # 游戏快连（参考 MCTier 的同名功能）：常见联机游戏的**专用服务器/直连
 # 端口**预设，运行中一键拼出「虚拟 IP:端口」复制给队友。
 # 注意 Minecraft「对局域网开放」的端口是随机的（看游戏聊天栏提示），
@@ -253,6 +259,8 @@ class LanPage(BasePage):
 
         theme.bus.changed.connect(self._refresh_status_style)
         theme.bus.changed.connect(self._restyle_share)
+        # 换主题会换字体 → 之前量出来的宽度就不准了，必须重量一次
+        theme.bus.changed.connect(self._fit_node_combo)
 
         # 启动即清理上次残留（后台线程，不打扰用户、不弹 UAC）
         threading.Thread(target=self._cleanup_orphans_on_launch,
@@ -400,9 +408,16 @@ class LanPage(BasePage):
         r3.setSpacing(8)
         r3.addWidget(self._label("中继节点"))
         self.node_combo = QComboBox()
+        # 宽度必须跟着内容走。QComboBox 默认的宽度策略只在**首次显示**时
+        # 量一次文字宽度，之后 _fill_node_combo() 往列表里塞进「自动（最快：
+        # 国内中继 36ms）」这类更长的项，它不会自己变宽——于是最长的几项
+        # 被切掉尾巴，用户看到的是「海波中国大…」这种半截地名。
+        # AdjustToContents 会在每次内容变化时重新量；_fit_node_combo()
+        # 再用当前字体实测一遍兜底（字体随主题变，光靠策略不够稳）。
+        self.node_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._saved_node = str(self._settings.value("lan_node", "auto") or "auto")
         self._fill_node_combo()
-        self.node_combo.setMaximumWidth(280)
         self.node_combo.currentIndexChanged.connect(self._on_node_changed)
         r3.addWidget(self.node_combo)
 
@@ -1155,6 +1170,8 @@ class LanPage(BasePage):
         self._saved_node = key
         try:
             self._settings.setValue("lan_node", key)
+            # 换项不重建列表，悬停提示得跟着换，否则停在旧节点上
+            self.node_combo.setToolTip(self.node_combo.currentText())
         except Exception:
             pass
         # 选的时候把这一项的**本次实测值**写进日志：回头"连不上/很卡"要查
@@ -1211,6 +1228,36 @@ class LanPage(BasePage):
         finally:
             self.node_combo.blockSignals(False)
         self._saved_node = keep
+        self._fit_node_combo()
+
+    def _fit_node_combo(self, *_args):
+        """把下拉撑到「刚好放得下最长那一项」，一个字都不切。
+
+        为什么不能只靠 Qt 的宽度策略：QComboBox 默认只在首次显示时量一次
+        文字宽度，而带延迟的项（尤其「自动（最快：海波中国大陆 44ms）」）
+        是测速回来之后才出现的，比首屏的裸名字长一倍。不重新量就会出现
+        「海波中国大…」——地名被切掉一半，用户根本分不清是哪个节点。
+
+        这里直接按当前字体逐项实测。上限 _NODE_COMBO_MAX_W 兜住超长节点名，
+        *（*_args 是为了能直接挂到主题切换信号上——那个信号带参。）
+        """
+        try:
+            fm = self.node_combo.fontMetrics()
+            widest = 0
+            for i in range(self.node_combo.count()):
+                widest = max(widest,
+                             fm.horizontalAdvance(self.node_combo.itemText(i)))
+            if not widest:
+                return
+            # 左右内边距 + 下拉箭头：箭头宽度随主题变，统一多留一点，
+            # 宁可宽几像素，也不要最后一两个字被箭头压掉。
+            self.node_combo.setMinimumWidth(
+                min(widest + 52, _NODE_COMBO_MAX_W))
+            self.node_combo.setMaximumWidth(_NODE_COMBO_MAX_W)
+            # 万一以后节点名更长顶到上限，全文至少能在悬停提示里看全
+            self.node_combo.setToolTip(self.node_combo.currentText())
+        except RuntimeError:
+            pass                          # 页面正在销毁，别碰控件
 
     def _start_node_probe(self, force=False):
         """起一轮节点测速（后台线程）。
