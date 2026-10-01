@@ -252,11 +252,13 @@ def _check_nick_beacon(etier_mod, ip, mark):
              got.get("game") == "泰拉瑞亚" and got.get("port") == 7777,
              "got=%r" % (got,))
 
-        # 旧版本客户端只发昵称：新版本必须照常解析（混房间不炸）
+        # 旧版本客户端只发昵称：新版本必须照常解析（混房间不炸）。
+        # 期望值要带上后来加的字段（share = 对方的临时云盘端口，0 = 没开），
+        # 否则"新增字段"这件事本身会把这条断言打红。
         legacy = etier_mod.NickBeacon._parse_info(
             b'{"yuhub-nick-v1":"OldPeer"}')
         mark("兼容旧版仅昵称报文",
-             legacy == {"name": "OldPeer", "game": "", "port": 0},
+             legacy == {"name": "OldPeer", "game": "", "port": 0, "share": 0},
              "legacy=%r" % (legacy,))
 
         # 注入"收到 Bob 的广播"：get_info 应命中新鲜表
@@ -696,21 +698,28 @@ def _check_member_rows(page, mark):
         % (len(rows), [len([b for b in r.findChildren(QPushButton)
                             if b.text() == "复制"]) for r in rows]))
 
-    # 点别人的行 → 复制的必须是别人的 IP（不能错拿成自己的）
+    # 点别人的行 → 复制的必须是别人的「IP:端口」（不能错拿成自己的）
+    #
+    # 复制的早就不是裸 IP 了：游戏里要填的是「IP:端口」，缺一不可。端口优先
+    # 用"他自己选的游戏快连"，他没广播过游戏信息时才退回我自己选的那个——
+    # 所以这里的期望端口取当前下拉值，而不是写死某个数字。
+    my_port = page._selected_game()[1]
     copied.clear()
     if len(rows) == 2:
         [b for b in rows[1].findChildren(QPushButton)
          if b.text() == "复制"][0].click()
-    mark("点成员行复制到的是该行 IP", copied == [("虚拟 IP", "10.126.126.23")],
-        "复制结果=%r" % (copied,))
+    mark("点成员行复制到的是该行「IP:端口」",
+         copied == [("直连地址", "10.126.126.23:%d" % my_port)],
+         "复制结果=%r" % (copied,))
 
-    # 点自己的行 → 复制自己的 IP
+    # 点自己的行 → 复制自己的「IP:端口」
     copied.clear()
     if rows:
         [b for b in rows[0].findChildren(QPushButton)
          if b.text() == "复制"][0].click()
-    mark("点自己那行复制到的是自己的 IP",
-         copied == [("虚拟 IP", "10.126.126.11")], "复制结果=%r" % (copied,))
+    mark("点自己那行复制到的是自己的「IP:端口」",
+         copied == [("直连地址", "10.126.126.11:%d" % my_port)],
+         "复制结果=%r" % (copied,))
 
     # 「复制全部」已按需求移除：方法与按钮都不该存在
     no_all = (not hasattr(page, "_on_copy_all_ips")

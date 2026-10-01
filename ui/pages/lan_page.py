@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 import etier
 import lan_share
+import node_probe
 from .. import theme
 from ..widgets import ghost_button, info_card, primary_button
 from .base_page import BasePage
@@ -228,8 +229,15 @@ class LanPage(BasePage):
         self._share_peers = {}        # ip -> 昵称（渲染来源用）
         self._download = None         # {"key","name"} 正在下载的那一项
         self._cancel_dl = False       # 下载取消标志（后台线程读）
+        # 节点测速（方案 A）：结果带时间戳存这里，过期就重测、绝不复用旧数字
+        self._probe = node_probe.NodeProbeCache()
+        self._probing = False         # 后台测速进行中（别叠加第二轮）
+        self._probe_stop = False      # 页面销毁时让测速线程尽快收手
+        self._node_age_text = ""      # 上一次写进「延迟数据：xx前」的文案
+        self._saved_node = "auto"     # 所选中继节点的 key（重建下拉要用）
         self._event.connect(self._on_event)
         self._build_content()
+        self._update_node_age()       # 首屏就把「延迟数据」一栏写上字
 
         self._timer = QTimer(self)
         self._timer.setInterval(800)
@@ -382,22 +390,36 @@ class LanPage(BasePage):
 
         # 中继节点（参考 MCTier 的节点选择）：自动 = 全部内置节点由
         # EasyTier 择优；手动 = 只连所选节点（确定性，好排查）。
+        #
+        # v0.8.12beta（方案 A）：每个节点的**实测延迟**直接写进下拉项，
+        # 并按延迟从低到高排。「自动」不再是盲选——它后面跟着当前最快的
+        # 那个节点，用户一眼就知道"自动会优先打到哪、大概多少毫秒"。
+        # 延迟是**本机实测**的：同一个节点在国内是 109ms、在国外可能
+        # 266ms，谁快取决于你在哪，程序写不死，只能测。
         r3 = QHBoxLayout()
         r3.setSpacing(8)
         r3.addWidget(self._label("中继节点"))
         self.node_combo = QComboBox()
-        for key, label, _addr in etier.NODE_CHOICES:
-            self.node_combo.addItem(label, key)
-        saved_node = str(self._settings.value("lan_node", "auto") or "auto")
-        idx = self.node_combo.findData(saved_node)
-        self.node_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.node_combo.setMaximumWidth(240)
+        self._saved_node = str(self._settings.value("lan_node", "auto") or "auto")
+        self._fill_node_combo()
+        self.node_combo.setMaximumWidth(280)
         self.node_combo.currentIndexChanged.connect(self._on_node_changed)
-        self.node_combo.setToolTip(
-            "某个节点连不上 / 延迟高时，可手动指定一个。\n"
-            "手动指定后**只连这个节点**（更易排查问题）；\n"
-            "自动则会尝试全部内置节点。")
         r3.addWidget(self.node_combo)
+
+        self.btn_node_speed = QPushButton("测速")
+        self.btn_node_speed.setObjectName("MiniButton")
+        self.btn_node_speed.setCursor(Qt.PointingHandCursor)
+        self.btn_node_speed.setFixedHeight(26)
+        self.btn_node_speed.setToolTip(
+            "并发测一遍所有内置节点的延迟，按快的排前面。\n"
+            "打开本页会自带一次，之后每 90 秒自动重测——\n"
+            "下拉里的数字永远是刚测的，不会拿旧的糊弄你。")
+        self.btn_node_speed.clicked.connect(lambda: self._start_node_probe(force=True))
+        r3.addWidget(self.btn_node_speed)
+
+        self.node_age_label = self._note("")
+        self.node_age_label.setStyleSheet("font-size: 11px;")
+        r3.addWidget(self.node_age_label)
         r3.addStretch(1)
         v.addLayout(r3)
 
@@ -1100,7 +1122,9 @@ class LanPage(BasePage):
             "虚拟 IP 由 EasyTier 自动分配，重启或卡死重进后可能变——变了本页会\n"
             "提示，拿不准就点「在线成员」右上角的「刷新」，不用重进房间。\n"
             "「游戏快连」选你这次要玩的游戏，会广播给队友；每行的「复制」拿到的\n"
-            "是**那个人的**「IP:端口」，填进游戏即可。中继节点一般保持「自动」。\n"
+            "是**那个人的**「IP:端口」，填进游戏即可。中继节点一般保持「自动」——\n"
+            "下拉里各节点的毫秒是本机实测、按快慢排序，每 90 秒自动重测；\n"
+            "想手动指定更快/更稳的那个，点「测速」看清延迟再选。\n"
             "\n"
             "原理：内嵌 EasyTier（Apache 2.0 开源）建一块虚拟网卡，把填了相同\n"
             "房间码 + 密码的电脑拉进同一个虚拟局域网——P2P 直连优先，打洞不通时\n"
@@ -1127,9 +1151,147 @@ class LanPage(BasePage):
 
     def _on_node_changed(self, _index):
         """记住所选中继节点（下次打开还是它，MCTier 同款行为）。"""
+        key = self.node_combo.currentData() or "auto"
+        self._saved_node = key
         try:
-            self._settings.setValue("lan_node", self.node_combo.currentData())
+            self._settings.setValue("lan_node", key)
         except Exception:
+            pass
+        # 选的时候把这一项的**本次实测值**写进日志：回头"连不上/很卡"要查
+        # 原因时，日志里得有当时看到的数字，而不是一句"他选了这个节点"。
+        label = next((l for k, l, _a in etier.NODE_CHOICES if k == key), key)
+        name = "自动（全部节点）" if key == "auto" else label
+        rec = self._probe.get(key) if key != "auto" else None
+        if rec is not None:
+            self._append_log("中继节点：%s（本机实测 %s，%s）"
+                             % (name, node_probe.format_latency(rec.get("ms")),
+                                node_probe.age_text(self._probe.age())))
+        else:
+            self._append_log("中继节点：%s" % name)
+
+    # ---------------------------------------------------- 中继节点测速（方案 A）
+    def _fill_node_combo(self):
+        """按当前测速结果重建「中继节点」下拉：快的排前面，数字带在标签上。
+
+        重建会换掉整个下拉内容，所以必须 blockSignals——否则清空/重填
+        会把用户的选择当成"用户改了节点"再回调一次，写坏设置项。
+        选中的 key 在重建后要原样找回来（排序会挪位置）。
+        """
+        try:
+            keep = self.node_combo.currentData() or self._saved_node or "auto"
+        except RuntimeError:
+            return
+        now = time.time()
+        addr_of = {k: a for k, _l, a in etier.NODE_CHOICES}
+        # 首屏还没测过：保持裸标签，别一开页就是一列「（待测）」
+        missing = "待测" if self._probe.has_data() else None
+        decorated = node_probe.decorate_choices(
+            etier.NODE_CHOICES, self._probe.results(now=now),
+            missing_text=missing)
+        self.node_combo.blockSignals(True)
+        try:
+            self.node_combo.clear()
+            for key, label, _addr, rec in decorated:
+                self.node_combo.addItem(label, key)
+                row = self.node_combo.count() - 1
+                addr = addr_of.get(key) or ""
+                tip = [label,
+                       "地址：%s" % (addr or "全部内置节点（由 EasyTier 自行择优）")]
+                if rec:
+                    tip.append("本机实测：%s（%s）"
+                               % (node_probe.format_latency(rec.get("ms")),
+                                  node_probe.age_text(
+                                      now - float(rec.get("at") or 0.0))))
+                elif addr:
+                    tip.append("暂无本机实测数据，点「测速」")
+                tip.append("手动选中后只连这个节点（连不上时更好排查）。")
+                self.node_combo.setItemData(row, "\n".join(tip), Qt.ToolTipRole)
+            idx = self.node_combo.findData(keep)
+            self.node_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self.node_combo.blockSignals(False)
+        self._saved_node = keep
+
+    def _start_node_probe(self, force=False):
+        """起一轮节点测速（后台线程）。
+
+        force=False 时只在数据过期 / 从没测过时才真跑——所以它可以被
+        800ms 的 _tick 反复调用而不产生任何开销，也就不会出现"忘了刷新"
+        这种状态：只要数字变旧，下一拍就会自己去测。
+        """
+        if self._probing:
+            return
+        if not force and not self._probe.is_stale():
+            return
+        self._probing = True
+        try:
+            self.btn_node_speed.setEnabled(False)
+            self.btn_node_speed.setText("测速中…")
+        except RuntimeError:
+            return
+        items = [(k, l, a) for k, l, a in etier.NODE_CHOICES if a]
+        self._update_node_age()
+        threading.Thread(target=self._do_node_probe, args=(items,),
+                         daemon=True).start()
+
+    def _do_node_probe(self, items):
+        """后台线程：并发测完所有节点，把结果用信号送回主线程。"""
+        try:
+            results = node_probe.probe_all(
+                items, should_stop=lambda: self._probe_stop)
+        except Exception as exc:
+            results = {}
+            self._safe_emit("_etier_log", "节点测速出错：%s" % exc)
+        self._safe_emit("node_speed", results)
+
+    def _safe_emit(self, kind, payload):
+        """从后台线程发信号：页面已销毁时静默放弃。
+
+        测速线程是 daemon，退出程序时可能刚好醒来对着一个已经不存在的
+        页面发信号（RuntimeError）。这不是错误，只是"太晚了"。
+        """
+        try:
+            self._event.emit(kind, payload)
+        except RuntimeError:
+            pass
+
+    def _on_node_speed(self, results):
+        """测速回到主线程：入缓存 → 重排下拉 → 更新"数据年龄"。"""
+        self._probing = False
+        try:
+            self.btn_node_speed.setEnabled(True)
+            self.btn_node_speed.setText("测速")
+        except RuntimeError:
+            return                        # 页面正在销毁，别碰控件了
+        self._probe.update(results or {})
+        self._fill_node_combo()
+        self._update_node_age()
+        if results:
+            self._append_log("节点测速完成：" + node_probe.summary_text(results))
+        else:
+            self._append_log("节点测速没有拿到任何结果（可能网络刚断）")
+
+    def _update_node_age(self):
+        """把「这批延迟数据有多新」写在按钮旁边——新鲜度必须是看得见的。
+
+        刻意不做成"测完就完事"：延迟会变（切网、节点拥塞、自己从国内
+        飞到国外），用户有权知道眼前的数字是几秒前的还是半小时前的。
+        """
+        age = self._probe.age()
+        if age is None:
+            text = "还没测过，点「测速」"
+        elif self._probing:
+            text = "正在重测…（上次 %s）" % node_probe.age_text(age)
+        elif self._probe.is_stale():
+            text = "延迟数据已过期（%s），马上重测…" % node_probe.age_text(age)
+        else:
+            text = "延迟数据：%s" % node_probe.age_text(age)
+        if text == self._node_age_text:
+            return                        # 每 800ms 都会被叫到，别反复刷控件
+        self._node_age_text = text
+        try:
+            self.node_age_label.setText(text)
+        except RuntimeError:
             pass
 
     def _selected_game(self):
@@ -1244,7 +1406,15 @@ class LanPage(BasePage):
         self._save_nickname(nick)
         self._host_nick = nick                # 校验回调（后台线程）要用
         # EasyTier.start 会阻塞最长 45 秒（轮询虚拟网卡就绪），必须丢后台
-        node_addr = etier.node_address(self.node_combo.currentData() or "auto")
+        node_key = self.node_combo.currentData() or "auto"
+        node_addr = etier.node_address(node_key)
+        if node_key != "auto":
+            node_label = next((l for k, l, _a in etier.NODE_CHOICES
+                               if k == node_key), node_key)
+            rec = self._probe.get(node_key)
+            extra = ("（本机实测 %s）" % node_probe.format_latency(rec.get("ms"))
+                     if rec else "（尚未测速）")
+            self._append_log("指定中继节点：%s%s" % (node_label, extra))
         threading.Thread(target=self._do_start,
                          args=(code, password, nick, node_addr),
                          daemon=True).start()
@@ -1605,6 +1775,8 @@ class LanPage(BasePage):
                 self._on_share_prog(payload or {})
             elif kind == "share_done":
                 self._on_share_done(payload or {})
+            elif kind == "node_speed":
+                self._on_node_speed(payload or {})
         except Exception as exc:                     # 界面出错不该拖垮转发
             self._append_log("界面更新出错：%s" % exc)
 
@@ -1626,6 +1798,14 @@ class LanPage(BasePage):
 
     # ------------------------------------------------------------------ 刷新
     def _tick(self):
+        # 节点延迟的自愈在这里：数据一过期就被安排重测，不需要谁记得点按钮。
+        # 只在页面可见时跑——用户没在看这一页就别占他的带宽。
+        try:
+            if self.isVisible():
+                self._start_node_probe()
+        except RuntimeError:
+            pass
+        self._update_node_age()
         if self._etier is not None and self._running:
             # 检测网络切换（WiFi→热点 / 换 WiFi）：物理网络指纹变了说明
             # 虚拟局域网大概率已失效，自动关闭，避免一直卡在「房间开着」。
@@ -1662,6 +1842,8 @@ class LanPage(BasePage):
         tier, self._etier = self._etier, None
         self._running = False
         self._etier_busy = False
+        # 让还没跑完的测速线程别再把信号发回来（页面正在拆）
+        self._probe_stop = True
         # 退出程序也要关云盘：否则服务线程会吊着端口，用户以为"关了软件
         # 别人还能下"。
         try:

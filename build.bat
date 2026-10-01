@@ -8,22 +8,13 @@ echo [1/2] Generating icon...
 "%PY%" build_icon.py
 
 echo [2/2] Building exe with PyInstaller...
-rem resources must be bundled: app.ico is the icon, qtbase_zh_CN.qm is the
-rem Qt Chinese translation (without it the input right-click menu falls back
-rem to Qt's built-in English strings).
+rem 打包参数统一放在 Yuhub.spec 里（单一来源）。以前这里另抄了一份命令行
+rem 参数，结果 --hidden-import 列表跟不上（gpu/share/node 三套自检都漏了，
+rem 打包后 --*-selftest 会 ImportError），所以改成直接吃 spec。
 rem
-rem --hidden-import is required for modules only imported inside functions:
-rem theme_selftest / uninstaller_selftest / lan_selftest / update_selftest
-rem are pulled in lazily by main.py's --*-selftest modes, so PyInstaller's
-rem static scan misses them.
-"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name Yuhub ^
-  --icon resources\app.ico ^
-  --add-data "resources;resources" ^
-  --hidden-import theme_selftest ^
-  --hidden-import uninstaller_selftest ^
-  --hidden-import lan_selftest ^
-  --hidden-import update_selftest ^
-  main.py
+rem resources 必须打进去：app.ico 是图标，qtbase_zh_CN.qm 是 Qt 中文翻译
+rem （没有它输入框右键菜单会退回 Qt 内置的英文串）。
+"%PY%" -m PyInstaller --noconfirm --clean Yuhub.spec
 
 echo.
 echo Done! Output: dist\Yuhub.exe
