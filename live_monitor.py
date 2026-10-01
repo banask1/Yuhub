@@ -15,11 +15,12 @@ r"""Yuhub 实时硬件监控（完全离线，性能优先）。
 """
 
 import ctypes
+import re
 import subprocess
 import sys
 import time
 from ctypes import wintypes
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from PySide6.QtCore import QObject, Signal
 
@@ -233,112 +234,300 @@ def read_gpu():
 
 
 # ---------------------------------------------------------------------------
-# GPU：AMD/Intel 兜底 —— Windows PDH 性能计数器（跨厂商，零依赖）
+# GPU：全厂商通用 —— Windows PDH 性能计数器（WDDM 上报，与任务管理器同源）
 # ---------------------------------------------------------------------------
-# nvidia-smi 只覆盖 NVIDIA。AMD/Intel 显卡之前一律返回 None、UI 显示
-# "无 NVIDIA 显卡"。这里用 Windows 自带的 PDH 计数器做兜底：
-#   * GPU Engine 计数器（"GPU Engine(*)\Utilization Percentage"）
-#     → 各引擎利用率，取最大即近似 GPU 占用
-#   * GPU Adapter Memory（"...\Dedicated Usage" / "...\Dedicated Limit"）
-#     → 显存占用与总量
-# PDH 是系统自带、全厂商通用，代价是拿不到温度/功耗（那是 ADL/NVAPI 专属）。
-# 用 ctypes 直调 pdh.dll（比 Get-Counter 首次 ~4s 快两个数量级）。
+# nvidia-smi 只覆盖 NVIDIA：AMD / Intel 机器上根本没有这个命令，所以 A 卡用户
+# 以前只能看到"未检测到可用显卡"。这里用 Windows 自带的 PDH 性能计数器兜底，
+# 它由 WDDM 图形内核（VidSch / VidMem）直接上报，AMD / Intel / NVIDIA 全通用：
+#
+#   \GPU Engine(*)\Utilization Percentage
+#       → 每个进程在每个引擎上的占用。实例名形如
+#         pid_4956_luid_0x00000000_0x0000D0BA_phys_0_eng_0_engtype_3D
+#   \GPU Local Adapter Memory(*)\Local Usage     （新驱动）
+#   \GPU Adapter Memory(*)\Dedicated Usage       （旧驱动 / Intel）
+#       → 专用显存占用
+#
+# 【坑 1】ctypes 调 pdh.dll 必须显式声明 argtypes / restype。
+#   用默认转换时，64 位句柄会被按 c_int 传入，PdhGetFormattedCounterArrayW
+#   会返回 PDH_MORE_DATA 却把所需长度写成 0——表现为"一条实例都读不到"，
+#   也就是 A 卡用户看到的"读不到显卡占用率"。显式声明后同样的调用立刻
+#   返回 351 个实例，这是本次修复的关键。
+#
+# 【坑 2】带通配符 (*) 的计数器**不能**用 PdhGetFormattedCounterValue 读单值。
+#   实测它只返回第一个匹配实例，而 GPU Engine 的第一个实例往往是空闲引擎，
+#   于是恒为 0.0%。这个假数据比报错更有害（界面上显示 0% 而不是"不可用"）。
+#   必须用 PdhGetFormattedCounterArrayW 一次取回全部实例。
+#
+# 【口径】"整卡占用率"取**最繁忙的引擎**，与任务管理器一致。微软 DirectX
+#   团队的原话是：简单求和会超 100%，取平均不准，只取 3D 引擎在纯视频解码时
+#   又恒为 0，最终选定"当前最繁忙的引擎占用率"作为代表值。同一个引擎类型下
+#   多个进程的占用要相加——它们共享同一个引擎的容量。
+#
+# PDH 的代价是拿不到温度 / 功耗 / 频率（那是 NVAPI、AMD ADL、Intel IGCL 的
+# 专属接口，且需要厂商动态库）。本函数只保证 util + 显存，其余字段留 None，
+# 由 UI 降级显示。
 _PDH_FMT_DOUBLE = 0x00000200
+_PDH_MORE_DATA = 0x800007D2
 
 
-def _pdh_read_counter_paths(paths, timeout_ms=1500):
-    """读一组 PDH 计数器，返回 [(path, value)]，失败返回 []。"""
-    if not IS_WIN:
-        return []
-    try:
-        import ctypes as _ct
-        from ctypes import wintypes as _w
-        pdh = _ct.windll.pdh
-        q = _w.HANDLE()
-        if pdh.PdhOpenQueryW(None, 0, _ct.byref(q)) != 0:
-            return []
-        counters = []
+class _PDH_COUNTERVALUE(ctypes.Structure):
+    """PDH_FMT_COUNTERVALUE。
+
+    CStatus 是 4 字节，后面有一个对齐填充：union 里的 double / LONGLONG
+    要求 8 字节对齐。字段顺序和 padding 都不能改，否则读出来是垃圾值。
+    """
+
+    class _UNION(ctypes.Union):
+        _fields_ = [
+            ("longValue", ctypes.c_long),
+            ("doubleValue", ctypes.c_double),
+            ("largeValue", ctypes.c_longlong),
+            ("WideStringValue", ctypes.c_wchar_p),
+        ]
+
+    _fields_ = [("CStatus", ctypes.c_uint), ("value", _UNION)]
+
+
+class _PDH_ITEM(ctypes.Structure):
+    """PDH_FMT_COUNTERVALUE_ITEM_W。"""
+
+    _fields_ = [("szName", ctypes.c_wchar_p),
+                ("FmtValue", _PDH_COUNTERVALUE)]
+
+
+class PdhGpuReader:
+    """PDH GPU 计数器读取器（AMD / Intel / NVIDIA 全通用）。
+
+    内部持有一个**常驻查询**：只 add 一次通配符计数器，之后每轮采样只做
+    CollectQueryData + 读数组，省掉反复枚举数百个 GPU 实例的开销
+    （本机实测 351 个实例，每次都重建会明显变慢）。
+
+    非线程安全，应由单个采样线程持有；对外只通过 read_gpu_pdh() 加锁访问。
+    """
+
+    ENGINE_PATH = r"\GPU Engine(*)\Utilization Percentage"
+    # 显存计数器名随驱动版本而变：实测本机（新驱动）是
+    # "GPU Local Adapter Memory\Local Usage"，旧驱动 / Intel 是
+    # "GPU Adapter Memory\Dedicated Usage"，两个都挂，命中哪个用哪个。
+    MEM_USED_PATHS = (
+        r"\GPU Local Adapter Memory(*)\Local Usage",
+        r"\GPU Adapter Memory(*)\Dedicated Usage",
+    )
+    SETTLE = 0.2            # 两次 Collect 之间的最小间隔（秒）
+    MAX_RETRY = 3           # 建查询连续失败几次后放弃，避免每轮都重试
+
+    # 实例名拆解：pid_4956_luid_0x00000000_0x0000D0BA_phys_0_eng_0_engtype_3D
+    _RE_LUID = re.compile(r"luid_(0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)")
+    _RE_PHYS = re.compile(r"phys_(\d+)")
+    _RE_ENG = re.compile(r"engtype_([A-Za-z0-9]+)")
+
+    def __init__(self):
+        self._pdh = None
+        self._query = None
+        self._counters = []          # [(path, handle)]
+        self._retry = 0
+
+    # ---------------------------------------------------------------- 公共
+    def read(self):
+        """返回与 read_gpu() 同构的 dict；完全读不到时返回 None。"""
+        if not IS_WIN:
+            return None
+        if self._query is None:
+            if self._retry >= self.MAX_RETRY:
+                return None
+            if not self._open():
+                self._retry += 1
+                return None
+            self._retry = 0
+
+        # 第一次 collect 建立基线，第二次才有速率类计数器的差值
+        if self._pdh.PdhCollectQueryData(self._query) != 0:
+            self._discard()
+            return None
+        time.sleep(self.SETTLE)
+        if self._pdh.PdhCollectQueryData(self._query) != 0:
+            self._discard()
+            return None
+
+        util = None
+        mem_used_mb = None
+        for path, handle in self._counters:
+            items = self._read_array(handle)
+            if not items:
+                continue
+            if path == self.ENGINE_PATH:
+                util = self._overall_util(items)
+            else:
+                vals = [v for _n, v in items if v > 0]
+                if vals:
+                    mem_used_mb = self._as_mb(max(vals))
+
+        if util is None and mem_used_mb is None:
+            return None
+        return {
+            "util": util,
+            "mem_used_mb": mem_used_mb,
+            "mem_total_mb": _reg_dedicated_vram_mb(),
+            "temp": None,
+            "power_w": None,
+            "power_limit_w": None,
+            "clock_sm_mhz": None,
+            "clock_max_mhz": None,
+            "fan_percent": None,
+            "vendor": "pdh",
+        }
+
+    # ---------------------------------------------------------------- 内部
+    @staticmethod
+    def _bind():
+        """载入 pdh.dll 并显式声明全部原型（见本章开头「坑 1」）。"""
+        pdh = ctypes.windll.pdh
+        hq = ctypes.POINTER(wintypes.HANDLE)
+        pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t, hq]
+        pdh.PdhOpenQueryW.restype = ctypes.c_long
+        pdh.PdhAddCounterW.argtypes = [wintypes.HANDLE, ctypes.c_wchar_p,
+                                       ctypes.c_size_t, hq]
+        pdh.PdhAddCounterW.restype = ctypes.c_long
+        pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+        pdh.PdhCollectQueryData.restype = ctypes.c_long
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [
+            wintypes.HANDLE, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(_PDH_ITEM)]
+        pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_long
+        pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+        pdh.PdhCloseQuery.restype = ctypes.c_long
+        return pdh
+
+    def _open(self):
+        """打开查询并挂上通配符计数器。成功返回 True。"""
         try:
-            for path in paths:
-                h = _w.HANDLE()
-                if pdh.PdhAddCounterW(q, path, 0, _ct.byref(h)) != 0:
-                    continue
-                counters.append((path, h))
-            pdh.PdhCollectQueryData(q)
-            time.sleep(0.25)
-            pdh.PdhCollectQueryData(q)
-            out = []
-            for path, h in counters:
-                typ = _ct.c_ulong()
-                val = _ct.c_double()
-                if pdh.PdhGetFormattedCounterValue(
-                        h, _PDH_FMT_DOUBLE, _ct.byref(typ),
-                        _ct.byref(val)) == 0:
-                    out.append((path, val.value))
-            return out
-        finally:
-            pdh.PdhCloseQuery(q)
+            if self._pdh is None:
+                self._pdh = self._bind()
+            q = wintypes.HANDLE()
+            if self._pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0:
+                return False
+            counters = []
+            for path in (self.ENGINE_PATH,) + self.MEM_USED_PATHS:
+                h = wintypes.HANDLE()
+                if self._pdh.PdhAddCounterW(q, path, 0, ctypes.byref(h)) == 0:
+                    counters.append((path, h))
+            if not counters:
+                self._pdh.PdhCloseQuery(q)
+                return False
+            self._query, self._counters = q, counters
+            return True
+        except Exception:
+            return False
+
+    def _discard(self):
+        """查询失效（驱动重启等）→ 关掉，下轮重建。"""
+        try:
+            if self._pdh and self._query:
+                self._pdh.PdhCloseQuery(self._query)
+        except Exception:
+            pass
+        self._query, self._counters = None, []
+
+    def _read_array(self, handle):
+        """读一个通配符计数器的全部实例，返回 [(实例名, 值)]。
+
+        两次调用：先问所需缓冲长度（PDH 返回 PDH_MORE_DATA），再按长度取数。
+        只保留状态有效的实例——CStatus 为 0x0(VALID) / 0x1(NEW)，其余
+        （无数据 / 无效）的 doubleValue 无意义，收了会污染统计。
+        """
+        size = ctypes.c_uint(0)
+        count = ctypes.c_uint(0)
+        rc = self._pdh.PdhGetFormattedCounterArrayW(
+            handle, _PDH_FMT_DOUBLE, ctypes.byref(size),
+            ctypes.byref(count), None)
+        if (rc & 0xFFFFFFFF) != _PDH_MORE_DATA or size.value == 0:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        rc = self._pdh.PdhGetFormattedCounterArrayW(
+            handle, _PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count),
+            ctypes.cast(buf, ctypes.POINTER(_PDH_ITEM)))
+        if rc != 0:
+            return []
+        arr = ctypes.cast(buf, ctypes.POINTER(_PDH_ITEM))
+        out = []
+        for i in range(count.value):
+            item = arr[i]
+            if item.FmtValue.CStatus in (0, 1):
+                out.append((item.szName or "", item.FmtValue.value.doubleValue))
+        return out
+
+    @classmethod
+    def _overall_util(cls, items):
+        """按「最繁忙的引擎」算整卡占用率（与任务管理器同口径）。"""
+        groups = {}
+        for name, val in items:
+            if val <= 0:
+                continue
+            key = cls._engine_key(name)
+            if key[2]:
+                # 能认出引擎类型 → 同一引擎上的各进程占用相加
+                groups[key] = groups.get(key, 0.0) + val
+            else:
+                # 认不出引擎类型（个别老驱动）→ 退化为取最大，宁低勿虚高
+                groups[key] = max(groups.get(key, 0.0), val)
+        if not groups:
+            return 0.0
+        return max(0.0, min(100.0, max(groups.values())))
+
+    @classmethod
+    def _engine_key(cls, inst):
+        """实例名 → (适配器, 物理卡, 引擎类型)，用于把同一引擎上的多进程合并。
+
+        去掉 pid 是关键：同一个引擎被多个进程占用时，各进程各占一份，
+        相加才是这个引擎真正的繁忙程度。
+        """
+        luid = cls._RE_LUID.search(inst or "")
+        phys = cls._RE_PHYS.search(inst or "")
+        eng = cls._RE_ENG.search(inst or "")
+        return (luid.group(1).upper() if luid else "",
+                phys.group(1) if phys else "",
+                eng.group(1).lower() if eng else "")
+
+    @staticmethod
+    def _as_mb(value):
+        """PDH 的显存计数器单位是字节，少数系统给 MB，按量级归一。"""
+        return (round(value / 1048576.0, 1) if value > 1_000_000
+                else round(value, 1))
+
+
+def _reg_dedicated_vram_mb():
+    """从注册表读专用显存总量（MB），取所有适配器中最大的。
+
+    PDH 没有 "Dedicated Limit" 计数器（本机实测 PdhAddCounterW 直接返回
+    PDH_CSTATUS_NO_COUNTER），显存总量只能走注册表——与 hardware.py 采集
+    显卡信息用的是同一个数据源（HardwareInformation.qwMemorySize，64 位，
+    不会有 AdapterRAM 那种 4GB 溢出问题）。
+    """
+    try:
+        sizes = _reg_vram_sizes()
     except Exception:
-        return []
+        return None
+    if not sizes:
+        return None
+    return round(max(size for _n, size in sizes) / 1048576.0, 1)
 
 
-_GPU_ENGINE_COUNTER = r"\GPU Engine(*)\Utilization Percentage"
-# 显存计数器名随 GPU 厂商/驱动版本不同而不同（实测本机是
-# "GPU Local Adapter Memory(*)\Local Usage"，旧驱动/Intel 是
-# "GPU Adapter Memory(*)\Dedicated Usage"），两个都试，命中哪个用哪个。
-_GPU_MEM_USED_CANDIDATES = (
-    r"\GPU Local Adapter Memory(*)\Local Usage",
-    r"\GPU Adapter Memory(*)\Dedicated Usage",
-)
-_GPU_MEM_TOTAL_CANDIDATES = (
-    r"\GPU Adapter Memory(*)\Dedicated Limit",
-)
+_PDH_READER = None
+_PDH_LOCK = Lock()
 
 
 def read_gpu_pdh():
-    """用 PDH 读 GPU 利用率 + 显存（AMD/Intel/NVIDIA 全通用）。
+    """用 PDH 读 GPU 利用率 + 显存（AMD / Intel / NVIDIA 全通用）。
 
-    返回 dict 或 None。与 read_gpu() 同构，但 temp/power/clock 为 None
-    （PDH 拿不到），UI 需据此降级显示。
+    返回 dict 或 None。与 read_gpu() 同构，但 temp / power / clock 为 None
+    （PDH 拿不到这些厂商私有的传感器指标），UI 需据此降级显示。
     """
-    paths = [_GPU_ENGINE_COUNTER]
-    paths += list(_GPU_MEM_USED_CANDIDATES)
-    paths += list(_GPU_MEM_TOTAL_CANDIDATES)
-    vals = _pdh_read_counter_paths(paths)
-    if not vals:
-        return None
-
-    eng_utils = [v for p, v in vals if "GPU Engine" in p]
-    mem_used = [v for p, v in vals
-                if "Dedicated Usage" in p or "Local Usage" in p]
-    mem_total = [v for p, v in vals if "Dedicated Limit" in p]
-
-    def to_mb(values):
-        if not values:
-            return None
-        v = max(values)
-        # PDH 的显存计数器默认字节（部分系统是 MB），按大小归一
-        return round(v / 1048576.0, 1) if v > 1_000_000 else round(v, 1)
-
-    util = None
-    if eng_utils:
-        util = max(0.0, min(100.0, max(eng_utils)))
-
-    if util is None and not mem_used:
-        return None
-
-    return {
-        "util": util,
-        "mem_used_mb": to_mb(mem_used),
-        "mem_total_mb": to_mb(mem_total),
-        "temp": None,
-        "power_w": None,
-        "power_limit_w": None,
-        "clock_sm_mhz": None,
-        "clock_max_mhz": None,
-        "fan_percent": None,
-        "vendor": "pdh",
-    }
+    global _PDH_READER
+    with _PDH_LOCK:
+        if _PDH_READER is None:
+            _PDH_READER = PdhGpuReader()
+        return _PDH_READER.read()
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +554,6 @@ class LiveMonitor(QObject):
         self._stop_evt = Event()
         self._thread = None
         self._cpu = CpuSampler()
-        self._gpu_fail_streak = 0
         self._tick = 0
 
     def start(self):
@@ -383,9 +571,14 @@ class LiveMonitor(QObject):
         return bool(self._thread and self._thread.is_alive())
 
     def _run(self):
-        # GPU 采样比 CPU/内存慢得多（~240ms vs ~0.03ms），
-        # 因此 GPU 每 N 个 tick 采一次，中间沿用上次结果，避免拖慢整体节奏。
+        # GPU 采样比 CPU/内存慢得多（nvidia-smi ~240ms、PDH 两次 collect
+        # 至少 0.2s，对比 CPU/内存 ~0.03ms），因此 GPU 每 N 个 tick 采一次，
+        # 中间沿用上次结果，避免拖慢整体节奏。
         gpu_period = 2
+        # 连续读不到 GPU 时逐步拉长重试间隔，但**永不彻底放弃**：
+        # 显卡驱动晚一点就绪、A 卡用户插上独显之后，都能自动恢复。
+        gpu_backoff = gpu_period
+        gpu_fails = 0
         last_gpu = None
 
         while not self._stop_evt.is_set():
@@ -399,20 +592,35 @@ class LiveMonitor(QObject):
             if mem:
                 payload["mem"] = mem
 
-            if self._enable_gpu and self._gpu_fail_streak < 5:
-                if self._tick % gpu_period == 0:
-                    g = read_gpu()
-                    if g is None:
-                        # NVIDIA 不可用（无卡/驱动缺失/AMD/Intel）→ PDH 兜底
-                        g = read_gpu_pdh()
-                    if g is None:
-                        self._gpu_fail_streak += 1
+            if self._enable_gpu and self._tick % gpu_backoff == 0:
+                g = read_gpu()
+                if g is None:
+                    # NVIDIA 不可用（无卡 / 驱动缺失 / AMD / Intel）→ PDH 兜底
+                    g = read_gpu_pdh()
+                else:
+                    # nvidia-smi 的 utilization 是"过去一秒内有任务在执行的时间
+                    # 占比"，而任务管理器（以及 PDH）报的是"引擎吞吐占用"。
+                    # 桌面待机时前者常报 20~30%、后者只有个位数，用户拿任务
+                    # 管理器对照会以为是我们读错了。所以占用率统一换成 PDH 的
+                    # 口径；温度 / 功耗 / 频率仍用 nvidia-smi 的（PDH 拿不到）。
+                    # PDH 读失败就保留 nvidia-smi 的值，不倒退。
+                    alt = read_gpu_pdh()
+                    if alt and alt.get("util") is not None:
+                        g["util"] = alt["util"]
+                        g["util_source"] = "pdh"
+                if g is None:
+                    gpu_fails += 1
+                    gpu_backoff = min(120, gpu_period * (2 ** min(gpu_fails, 6)))
+                    if gpu_fails >= 6:
+                        # 连续失败足够久才认定"这台机器读不到 GPU"，
+                        # 否则偶发一轮抖动会让瓦片闪一下"未检测到"。
                         last_gpu = None
-                    else:
-                        self._gpu_fail_streak = 0
-                        last_gpu = g
-                if last_gpu:
-                    payload["gpu"] = last_gpu
+                else:
+                    gpu_fails = 0
+                    gpu_backoff = gpu_period
+                    last_gpu = g
+            if last_gpu:
+                payload["gpu"] = last_gpu
 
             if self._tick % 5 == 0:
                 disk = read_disk_space(self._drive)
