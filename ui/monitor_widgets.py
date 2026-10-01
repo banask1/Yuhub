@@ -775,7 +775,7 @@ def _build_detail_rows(kind, live):
             rows.append((prefix + "驱动日期", _ps_date(c.get("DriverDate"))))
             rows.append((prefix + "设备状态", c.get("Status") or "--"))
             rows.append((prefix + "设备 ID", c.get("PNPDeviceID") or "--"))
-        # 附加 nvidia-smi 能拿到的规格
+        # 附加驱动上报的规格（NVIDIA 走 NVML、A 卡走 ADL + 注册表显存）
         g = live.get("gpu")
         if g:
             if g.get("mem_total_mb"):
