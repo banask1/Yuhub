@@ -6,10 +6,12 @@ from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
     QPropertyAnimation,
+    QRect,
+    QRectF,
     QTimer,
     QVariantAnimation,
 )
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
@@ -22,11 +24,14 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
 )
 
+from . import glass
 from . import theme
 
 
 class ToggleSwitch(QAbstractButton):
-    """自定义开关控件，带滑块动画，随主题自动换色。"""
+    """自定义开关控件（椭圆形轨道 + 圆形滑块），带滑动动画，随主题自动换色。"""
+
+    KNOB_MARGIN = 3.0       # 滑块与轨道内缘的间距（上下左右一致 → 正好居中）
 
     def __init__(self, checked=False, parent=None):
         super().__init__(parent)
@@ -41,6 +46,25 @@ class ToggleSwitch(QAbstractButton):
         self.toggled.connect(self._on_toggled)
         theme.bus.changed.connect(lambda _: self.update())
 
+    # -- 形状 -----------------------------------------------------------------
+    # 抽成方法而不是就地写常量，是为了让自检能断言"轨道是椭圆、滑块是圆"
+    # （2026-10-03：用户要求把开关从"小圆角方块"改成椭圆形 + 圆形滑块）。
+    def track_radius(self):
+        """轨道圆角 = 高度一半 → 左右两端是半圆，整体成椭圆形（胶囊）。"""
+        return self.height() / 2.0
+
+    def knob_rect(self, offset=None):
+        """滑块的方形外接框。边长 = 高度 - 2×间距，于是滑块正好居中；
+        配上 `knob_radius()` 就是个正圆。"""
+        t = self._offset if offset is None else float(offset)
+        d = max(1.0, self.height() - 2.0 * self.KNOB_MARGIN)
+        travel = max(0.0, self.width() - 2.0 * self.KNOB_MARGIN - d)
+        return QRectF(self.KNOB_MARGIN + t * travel, self.KNOB_MARGIN, d, d)
+
+    def knob_radius(self):
+        """滑块圆角 = 半径 → 正圆。"""
+        return self.knob_rect().width() / 2.0
+
     def _on_toggled(self, checked):
         self._anim.stop()
         self._anim.setStartValue(self._offset)
@@ -52,33 +76,67 @@ class ToggleSwitch(QAbstractButton):
         self.update()
 
     def paintEvent(self, event):
+        """毛玻璃开关。
+
+        视觉分三层（对齐参考 CSS 的液态玻璃写法，见 ui/glass.py 顶部注释）：
+          1) 轨道底色：关态是沉底色，开态是主题色，两态之间按滑动进度插值；
+             形状是**椭圆形**（圆角 = 高度一半），左右两端是半圆；
+          2) 玻璃光泽：45° 对角反光 + 顶部高光线 + 1px 亮边。
+             **开态明显强于关态**——这一处就是「功能开启」的毛玻璃重点：
+             点亮时整块轨道像被光穿过，而不是简单换个颜色；
+          3) 滑块：白色**正圆**，带上亮下暗的竖向渐变 + 细边 + 下方淡影，
+             做出"一颗厚玻璃珠"的立体感。
+        """
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         c = theme.current()
         off_bg = QColor(c.get("toggle_off", c["surface_sunken"]))
         on_bg = QColor(c["accent"])
-        t = self._offset
+        t = max(0.0, min(1.0, self._offset))
         col = QColor(
             int(off_bg.red() + (on_bg.red() - off_bg.red()) * t),
             int(off_bg.green() + (on_bg.green() - off_bg.green()) * t),
             int(off_bg.blue() + (on_bg.blue() - off_bg.blue()) * t),
         )
+
+        w, h = self.width(), self.height()
+        radius = self.track_radius()
+
+        # ---- 1) 轨道底色（椭圆：两端半圆）----
         p.setPen(Qt.NoPen)
         p.setBrush(col)
-        # 极简：小圆角矩形轨道
-        p.drawRoundedRect(0, 0, self.width(), self.height(), 3, 3)
+        p.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)
 
+        # ---- 2) 玻璃光泽：开态直接拉满 ----
+        glass.paint_glass(
+            p, QRect(1, 1, w - 2, h - 2), radius=max(0.5, radius - 0.5),
+            tint="#ffffff", tint_alpha=0,          # 底色已铺，这里只叠光
+            gloss_alpha=int(34 + 96 * t),           # 对角反光
+            top_alpha=int(52 + 104 * t),            # 顶部高光线
+            border_alpha=int(46 + 84 * t),          # 亮边
+            inner_alpha=0,
+            matte=None,
+        )
+
+        # 边框：关态是硬边框，开态被玻璃亮边吃掉，只留一层淡淡的锁边
         border = QColor(c["accent"] if t > 0.5 else c["border_strong"])
+        border.setAlpha(int(140 + 60 * t))
         p.setPen(border)
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(0, 0, self.width() - 1, self.height() - 1, 3, 3)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), radius, radius)
 
-        # 方形滑块（非圆形，强化色块感）
-        knob = 16
-        kx = 4 + self._offset * (self.width() - 8 - knob)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#ffffff"))
-        p.drawRoundedRect(int(kx), 4, knob, knob, 2, 2)
+        # ---- 3) 滑块：白色正圆 + 竖向渐变 + 细边 + 淡影 ----
+        kr = self.knob_rect()
+        kr_radius = kr.width() / 2.0
+        glass.paint_soft_shadow(p, kr, radius=kr_radius, offset=1, spread=1,
+                                alpha=52)
+
+        grad = QLinearGradient(kr.topLeft(), kr.bottomLeft())
+        grad.setColorAt(0.0, QColor("#ffffff"))
+        grad.setColorAt(1.0, QColor("#e9edf3"))
+        p.setPen(glass.rgba("#ffffff", 110))
+        p.setBrush(grad)
+        p.drawRoundedRect(kr, kr_radius, kr_radius)
         p.end()
 
 
@@ -276,18 +334,45 @@ def _toast_stack(parent):
     return stack
 
 
+def _alive(obj):
+    """Qt 对象是否还活着（C++ 侧没被销毁）。
+
+    场景（实测崩溃日志抓过三次）：Toast 同屏超限时 `_drop_toast` 会
+    `deleteLater()` 掉最旧那条，但它 2.2 秒后的淡出定时器还挂在事件队列里；
+    定时器到点时去碰它的子对象（QPropertyAnimation / 图形特效）就会抛
+    `RuntimeError: Internal C++ object already deleted`。
+    shiboken6 拿不到时保守地返回 True，让调用方自己的 try/except 兜住。
+    """
+    if obj is None:
+        return False
+    try:
+        from shiboken6 import isValid
+    except ImportError:
+        return True
+    try:
+        return bool(isValid(obj))
+    except (TypeError, RuntimeError):
+        return False
+
+
 def _slide_to(toast, target):
     """把一条 Toast 平滑移到新位置（被新提示顶上去时用）。"""
-    anim = getattr(toast, "_slide_anim", None)
-    if anim is not None:
-        anim.stop()
-    anim = QPropertyAnimation(toast, b"pos", toast)
-    anim.setDuration(TOAST_SLIDE_MS)
-    anim.setEasingCurve(QEasingCurve.OutCubic)
-    anim.setStartValue(toast.pos())
-    anim.setEndValue(target)
-    anim.start()
-    toast._slide_anim = anim          # 保住引用，别让动画被回收
+    if not _alive(toast):
+        return
+    try:
+        anim = getattr(toast, "_slide_anim", None)
+        if anim is not None and _alive(anim):
+            anim.stop()
+        anim = QPropertyAnimation(toast, b"pos", toast)
+        anim.setDuration(TOAST_SLIDE_MS)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(toast.pos())
+        anim.setEndValue(target)
+        anim.start()
+        toast._slide_anim = anim      # 保住引用，别让动画被回收
+    except RuntimeError:
+        # shiboken6 不在时 _alive 会乐观返回 True，这里再兜一层
+        return
 
 
 def _restack(parent, instant=None):
@@ -313,11 +398,16 @@ def _drop_toast(parent, toast):
     stack = _toast_stack(parent)
     if toast in stack:
         stack.remove(toast)
-    anim = getattr(toast, "_slide_anim", None)
-    if anim is not None:
-        anim.stop()
-    toast.hide()
-    toast.deleteLater()
+    if not _alive(toast):
+        return
+    try:
+        anim = getattr(toast, "_slide_anim", None)
+        if anim is not None and _alive(anim):
+            anim.stop()
+        toast.hide()
+        toast.deleteLater()
+    except RuntimeError:
+        return
 
 
 def _dismiss_toast(parent, toast):
@@ -377,16 +467,23 @@ def show_toast(parent, text, duration=2200):
     fade_in.start()
 
     def _fade_out():
-        anim = getattr(toast, "_slide_anim", None)
-        if anim is not None:
-            anim.stop()
-        out = QPropertyAnimation(effect, b"opacity", toast)
-        out.setDuration(240)
-        out.setStartValue(1.0)
-        out.setEndValue(0.0)
-        out.finished.connect(lambda: _dismiss_toast(parent, toast))
-        out.start()
-        toast._fade_anim = out        # 保住引用
+        # 这条 Toast 可能已经被 _drop_toast 提前删了（同屏超过 TOAST_MAX 时
+        # 挤掉最旧的），此时它的动画/特效连 C++ 对象一起没了——整段容错。
+        if not _alive(toast) or not _alive(effect):
+            return
+        try:
+            anim = getattr(toast, "_slide_anim", None)
+            if anim is not None and _alive(anim):
+                anim.stop()
+            out = QPropertyAnimation(effect, b"opacity", toast)
+            out.setDuration(240)
+            out.setStartValue(1.0)
+            out.setEndValue(0.0)
+            out.finished.connect(lambda: _dismiss_toast(parent, toast))
+            out.start()
+            toast._fade_anim = out        # 保住引用
+        except RuntimeError:
+            return
 
     QTimer.singleShot(duration, _fade_out)
 

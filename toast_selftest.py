@@ -320,5 +320,41 @@ def _run_all(mark):
                 st.setValue(k, v)
         st.sync()
 
+    # ================= H. 被挤掉的提示：淡出定时器不许再炸 =================
+    # 背景（真实崩溃日志抓过三次，2026-10-03 01:10~01:11）：
+    # 同屏超过上限时 `_drop_toast` 会 deleteLater() 掉最旧那条，但它
+    # `QTimer.singleShot(duration, _fade_out)` 的定时器还挂在事件队列里；
+    # 定时器到点后再去碰它的子对象（QPropertyAnimation）就抛
+    #   RuntimeError: libshiboken: Internal C++ object
+    #                 (PySide6.QtCore.QPropertyAnimation) already deleted
+    # 异常发生在 Qt 事件循环里（不是我们的调用栈），只能靠 sys.excepthook
+    # 拦下来验证 —— 不拦的话它只是写进崩溃日志，用户完全看不出问题。
+    errors = []
+    old_hook = sys.excepthook
+    sys.excepthook = lambda et, ev, tb: errors.append("%s: %s" % (et.__name__, ev))
+    try:
+        try:
+            import shiboken6                                # noqa: F401
+            mark("shiboken6 可用（_alive 的判定才真正生效）", True)
+        except ImportError as exc:                           # noqa: BLE001
+            mark("shiboken6 可用（_alive 的判定才真正生效）", False, exc)
+
+        host3 = new_host()
+        W.show_toast(host3, "会被挤掉的", duration=200)
+        pump(0.05)
+        for i in range(W.TOAST_MAX):        # 再进来 3 条，把第一条挤掉
+            W.show_toast(host3, "占位 %d" % i, duration=FOREVER)
+            pump(0.05)
+        st3 = stack_of(host3)
+        mark("挤掉后剩下的条数 = 上限", len(st3) == W.TOAST_MAX, len(st3))
+        flush()                             # 让 deleteLater 真的生效
+        pump(1.2)                           # 等那条 200ms 的淡出定时器到点
+        flush()
+        mark("★ 被挤掉的提示淡出到点后不抛未捕获异常", not errors, errors)
+        mark("被挤掉后原有的提示仍在（没有连带清空）",
+            len(stack_of(host3)) == W.TOAST_MAX, len(stack_of(host3)))
+    finally:
+        sys.excepthook = old_hook
+
     w.close()
     flush()
