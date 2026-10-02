@@ -4,8 +4,13 @@ import os
 import sys
 import threading
 
-from PySide6.QtCore import Qt, QEvent, QObject, QSettings, QTimer, Signal
-from PySide6.QtGui import QCursor, QGuiApplication, QIcon
+from PySide6.QtCore import (
+    Qt, QEvent, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect,
+    QRectF, QSettings, QTimer, Signal,
+)
+from PySide6.QtGui import (
+    QCursor, QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap,
+)
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -18,6 +23,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
 )
 
+from . import glass
 from . import theme
 from . import VERSION, VERSION_LABEL
 from .tray import TrayIcon, tray_available
@@ -35,6 +41,10 @@ RESIZE_MARGIN = 5
 WINDOW_MARGIN = 6           # 圆角窗口四周的透明留白（极简风格：留白收窄）
 SIDEBAR_WIDTH = 216
 SIDEBAR_COLLAPSED = 76
+PILL_RADIUS = 8.0           # 侧栏选中指示条的圆角（玻璃片形状，见 GlassPill）
+PILL_BAR_WIDTH = 5          # 选中片左缘那道 accent 亮条的宽度
+PILL_INSET_X = 2            # 选中片距按钮左右各内缩多少（右多留 2px 给描边）
+PILL_INSET_Y = 1            # 选中片距按钮上下各内缩多少（越小越"厚"）
 
 NAV_ITEMS = [
     ("home", "🏠", "首页"),
@@ -163,12 +173,80 @@ class NavButton(QPushButton):
         self.setToolTip("" if expanded else self._label)
 
 
-class TitleBar(QFrame):
+def _panel_corner_radius(widget, palette):
+    """玻璃面板该用多大的半径去圆自己的外角。
+
+    外壳（#AppFrame）的圆角是 QSS 画的，**Qt 的 QSS 圆角不会裁剪子控件**，
+    所以贴着窗口边角的玻璃面板（标题栏、侧栏）必须自己把外角圆掉，
+    否则会拿直角把外壳的圆角"补方"——用户看到的就是「软件边角凸出来的角」。
+
+    QSS 的 px 会随设备像素比缩放（实测渲染出来的半径比声明的 8px 小），
+    这个值没法反查，所以这里取主题声明值再收 1px（面板贴在外壳 1px 边框里）。
+    宁可多裁一点、露出一点外壳底色，也绝不让玻璃凸到圆角外面。
+    """
+    win = widget.window()
+    try:
+        if win is not None and win.isMaximized():
+            return 0            # 最大化时外壳圆角归零，面板跟着不圆
+    except (RuntimeError, AttributeError):
+        pass
+    r = glass.window_radius(palette)
+    return max(0, r - 1) if r > 0 else 0
+
+
+class GlassTitleBar(QFrame):
+    """毛玻璃标题栏。
+
+    和侧栏同一套取景 / 模糊 / 上色（ui/glass.paint_glass_panel），只是更宽更扁，
+    所以光泽给得略强一点——一条横贯窗口的玻璃带，是整窗毛玻璃最显眼的那一笔。
+    """
+
+    def __init__(self, backdrop, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TitleBar")
+        self._backdrop = backdrop
+        self._src = glass.BackdropSource()
+        theme.bus.changed.connect(lambda _: self.refresh_glass())
+
+    def refresh_glass(self):
+        self._src.invalidate()
+        self.update()
+
+    def paintEvent(self, event):
+        cur = theme.current()
+        tint, gloss, dim = glass.glass_params(cur)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        glass.paint_glass_panel(
+            p, self, self._backdrop(), self._src,
+            blur=9, tint_alpha=tint, gloss_alpha=gloss, dim_alpha=dim,
+            fallback=cur.get("titlebar_bg", "#12141a"),
+            # 标题栏横跨窗口顶边，左右两个外角要和外壳一起圆
+            corners=("tl", "tr"),
+            corner_radius=_panel_corner_radius(self, cur))
+        p.end()
+
+
+# 标题栏版本号：**故意不用玻璃贴片**。
+#
+# v0.10beta 那版给它单独画了一块玻璃（自己的底色 + 描边 + 投影），本意是
+# 「让人看出这是块玻璃」，但贴片终究是浮在标题栏上的一个圆角矩形，边界一眼
+# 可见——用户反馈就是「不想要顶部版本号有一个额外的框」。
+# 现在它就是普通 QLabel：不画任何底色，直接透出标题栏本身的毛玻璃，和标题栏
+# 里其它文字一样"长在玻璃上"，没有任何框；而"那一块有毛玻璃"依然成立，因为
+# 标题栏整条自己就是玻璃。
+#
+# ⚠️ QSS 里 `QLabel#AppSubtitle` 必须保持 `background: transparent`：QLabel::
+#    paintEvent 一进来就 drawFrame()，只要刷了底色就把底下的标题栏玻璃盖住，
+#    又变成"贴了一张纸"（sky glass 的 surface_hover 是 rgba(255,255,255,225)，
+#    几乎全白）。
+
+
+class TitleBar(GlassTitleBar):
     """自定义标题栏：拖动移动、双击最大化、侧栏折叠、主题切换、窗口按钮。"""
 
     def __init__(self, window):
-        super().__init__()
-        self.setObjectName("TitleBar")
+        super().__init__(lambda: getattr(window, "backdrop", None))
         self.setFixedHeight(46)
         self._window = window
         self._drag_offset = None
@@ -191,6 +269,7 @@ class TitleBar(QFrame):
 
         sub = QLabel(VERSION_LABEL)
         sub.setObjectName("AppSubtitle")
+        self.version_label = sub
         layout.addWidget(sub)
 
         layout.addStretch(1)
@@ -240,6 +319,249 @@ class TitleBar(QFrame):
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._window.toggle_max()
+
+
+class BackdropLayer(QFrame):
+    """窗口底部的静态纹理层（毛玻璃的「可模糊内容」来源）。
+
+    毛玻璃成立的前提是背后有东西可糊：玻璃盖在纯色上，模糊前后都是纯色。
+    所以窗口最底下铺这一层——极淡方格 + 两团柔光（见 ui/glass.py），
+    所有玻璃控件（侧栏、选中指示条、开关）都从这一层取背景。
+
+    纹理是静态的，缓存成一张 QPixmap；只有尺寸变化 / 换主题才重画。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BackdropLayer")
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._pm = None
+        self._radius = 0
+        # 背板版本号：每次重绘 +1。玻璃控件把它当缓存键的一部分，
+        # 于是背板一变（换主题 / 尺寸变化）所有模糊缓存自动失效。
+        self.version = 0
+        # 让出 AppFrame 那一圈 1px 边框：子控件能画到父控件的边框上，
+        # 不留出这 1px 的话背板会把窗口描边整个盖掉。
+        self._inset = 1
+        if parent is not None:
+            parent.installEventFilter(self)
+        theme.bus.changed.connect(lambda _: self.rebuild())
+
+    def set_radius(self, radius):
+        """跟随 AppFrame 的圆角。AppFrame 的 border-radius 不会裁剪子控件，
+        直角背板会把圆角"补方"，所以这里自己在绘制时裁圆角。
+
+        色板里 window_radius 是 QSS 用的字符串（如 '8px'），这里容错解析；
+        再减去 insetself 让出的边框宽度，保证圆角弧线与外框贴合。
+        """
+        try:
+            radius = int(str(radius).replace("px", "").strip())
+        except (TypeError, ValueError):
+            radius = 0
+        radius = max(0, radius - self._inset)
+        if radius != self._radius:
+            self._radius = radius
+            self.update()
+
+    def eventFilter(self, obj, event):
+        # 父壳体（AppFrame）大小变化时跟着铺满（同样让出 1px 边框）
+        if obj is self.parent() and event.type() == QEvent.Resize:
+            self.setGeometry(self.parent().rect().adjusted(
+                self._inset, self._inset, -self._inset, -self._inset))
+        return super().eventFilter(obj, event)
+
+    def rebuild(self):
+        self.version += 1
+        self._pm = None
+        self.update()
+
+    def resizeEvent(self, event):
+        self.version += 1
+        self._pm = None
+        super().resizeEvent(event)
+
+    def paintEvent(self, event):
+        if self.size().isEmpty():
+            return
+        if self._pm is None or self._pm.size() != self.size():
+            pm = QPixmap(self.size())
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            glass.paint_backdrop(p, self.size(), theme.current())
+            p.end()
+            self._pm = pm
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if self._radius > 0:
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect()), self._radius, self._radius)
+            p.setClipPath(path)
+        p.drawPixmap(0, 0, self._pm)
+        p.end()
+
+
+class GlassSidebar(QFrame):
+    """毛玻璃侧边栏：背后纹理先模糊，再叠玻璃面 + 右缘高光。
+
+    背景取的是 `BackdropLayer`（不含自己），所以不会出现"把自己糊进去"
+    的递归残影。
+    """
+
+    def __init__(self, backdrop, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Sidebar")
+        self._backdrop = backdrop
+        self._src = glass.BackdropSource()
+        theme.bus.changed.connect(lambda _: self.refresh_glass())
+
+    def refresh_glass(self):
+        self._src.invalidate()
+        self.update()
+
+    def paintEvent(self, event):
+        r = self.rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return
+        cur = theme.current()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # 1) 背后纹理的模糊版（毛玻璃的本体）+ 玻璃面色纱
+        tint, gloss, dim = glass.glass_params(cur)
+        glass.paint_glass_panel(
+            p, self, self._backdrop(), self._src,
+            blur=10, tint_alpha=tint, gloss_alpha=gloss, dim_alpha=dim,
+            fallback=cur.get("sidebar_bg", "#12141a"),
+            # 侧栏贴窗口左边、通到底：只有左下角是窗口的外角（左上角在标题栏下面）
+            corners=("bl",),
+            corner_radius=_panel_corner_radius(self, cur))
+
+        # 2) 右缘分隔：一条亮线 + 一条暗线，做出"玻璃片边缘"的厚度感
+        p.setPen(glass.rgba("#ffffff", 74))
+        p.drawLine(r.width() - 2, 0, r.width() - 2, r.height())
+        p.setPen(glass.rgba("#000000", 76))
+        p.drawLine(r.width() - 1, 0, r.width() - 1, r.height())
+        p.end()
+
+
+class GlassPill(QFrame):
+    """侧栏选中项的玻璃指示条。
+
+    它是侧栏的**子控件**、被 `stackUnder` 压到导航按钮下面，所以按钮文字
+    压在半透明玻璃上；切换页面时用 geometry 动画从旧位置滑到新位置，
+    这是「功能栏切换」那一处毛玻璃的重点。
+
+    单开一个控件（而不是在侧栏 paintEvent 里直接画）是为了能做动画：
+    QPropertyAnimation 直接驱动 geometry，比每帧手算插值省事且更顺。
+    """
+
+    def __init__(self, backdrop, parent=None):
+        super().__init__(parent)
+        self.setObjectName("GlassPill")
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._backdrop = backdrop
+        self._src = glass.BackdropSource()
+        self._relayout = None
+        self._anim = QPropertyAnimation(self, b"geometry", self)
+        self._anim.setDuration(230)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        if parent is not None:
+            parent.installEventFilter(self)
+        self.hide()
+
+    def set_relayout(self, fn):
+        """注入「目标矩形从哪来」。布局就绪/侧栏尺寸变化时用它重算位置。"""
+        self._relayout = fn
+
+    def eventFilter(self, obj, event):
+        # 侧栏尺寸变化（展开/折叠、窗口缩放）后按钮位置会变，指示条要跟上。
+        # 这一处必须"瞬时落位"不做动画：宽度已经在变了，再叠加滑动会打架。
+        if obj is self.parent() and event.type() == QEvent.Resize:
+            self.refresh_geometry(animate=False)
+        return super().eventFilter(obj, event)
+
+    def refresh_geometry(self, animate=True):
+        if self._relayout is None:
+            return
+        rect = self._relayout()
+        if rect is None:
+            self.hide()
+            return
+        self.slide_to(rect, animate=animate)
+
+    def refresh_glass(self):
+        self._src.invalidate()
+        self.update()
+
+    def slide_to(self, rect, animate=True):
+        """滑到目标矩形。首次出现（还没有几何）时不动画，直接落位。"""
+        self._anim.stop()
+        if not animate or self.geometry().width() <= 0:
+            self.setGeometry(rect)
+            self.show()
+            self.update()
+            return
+        if self.geometry() == rect:
+            self.show()
+            return
+        self.show()
+        self._anim.setStartValue(self.geometry())
+        self._anim.setEndValue(rect)
+        self._anim.start()
+
+    def paintEvent(self, event):
+        r = self.rect()
+        if r.width() <= 2 or r.height() <= 2:
+            return
+        cur = theme.current()
+        accent = cur.get("accent", "#3b82f6")
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        face = r.adjusted(1, 1, -2, -2)
+        face_path = glass.rounded_path(QRectF(face), PILL_RADIUS)
+
+        # 0) 先把整块绘制裁到"圆角玻璃片"的形状里。
+        #    血泪：这个控件原来不裁剪，而背景快照是**整块矩形** drawPixmap 上去的，
+        #    于是圆角之外那四个小三角没被玻璃面（accent 薄纱 + 反光）盖住，
+        #    露出的是"没染色的裸背板"——用户看到的就是
+        #    「选中效果蓝色四角周围没有毛玻璃」。裁进 path 之后，角上什么都不画，
+        #    底下侧栏自己的玻璃自然透出来，四角就接上了。
+        p.setClipPath(face_path, Qt.IntersectClip)
+
+        # 1) 模糊背景
+        snap = None
+        bd = self._backdrop()
+        if bd is not None:
+            tl = glass.widget_origin(self, bd)
+            snap = self._src.snapshot(bd, QRect(tl, self.size()), radius=12,
+                                      stamp=getattr(bd, "version", 0))
+        if snap is not None:
+            p.drawPixmap(0, 0, snap)
+
+        # 2) 玻璃面（accent 薄纱 + 对角反光 + 高光边）。
+        #    这一处的光泽是整窗最强的：选中项就得像一块被点亮的玻璃。
+        #    浅色主题底下是浅灰，玻璃要比底更亮 + accent 染色更实才看得清。
+        #    matte_alpha 比 v0.10beta 又提高了一档：用户反馈蓝色选中"太细"，
+        #    淡化会让它更接近周围的浅灰，观感上就是"很薄的一层"。
+        tint, gloss, _dim = glass.glass_params(cur)
+        light = not glass.is_dark(cur)
+        glass.paint_glass(p, face, radius=PILL_RADIUS,
+                          tint="#ffffff", tint_alpha=max(20, tint),
+                          gloss_alpha=max(112, gloss),
+                          top_alpha=176,
+                          border_alpha=120, inner_alpha=52,
+                          matte=accent, matte_alpha=205 if light else 188)
+        # 3) 左缘一道 accent 亮条，指示"当前所在"。
+        #    宽度原来只有 3px，在 216px 宽的侧栏上就是一根头发丝，用户报
+        #    「蓝色选中效果太细了」。现在给到 PILL_BAR_WIDTH(5px)，并且上下
+        #    留白同步收窄，让它看起来是"一条实心的色条"而不是一根细线。
+        bar = QRect(face.left() + 2, face.top() + 5, PILL_BAR_WIDTH,
+                    max(1, face.height() - 10))
+        p.setPen(Qt.NoPen)
+        p.setBrush(glass.rgba(accent, 245))
+        p.drawRoundedRect(bar, PILL_BAR_WIDTH / 2.0, PILL_BAR_WIDTH / 2.0)
+        p.end()
 
 
 class MainWindow(QWidget):
@@ -485,11 +807,18 @@ class MainWindow(QWidget):
         self._outer.setContentsMargins(WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN)
         self._outer.setSpacing(0)
 
-        # 实心圆角外壳（无玻璃模糊）
+        # 圆角外壳。QSS 里 AppFrame 仍是实心底（保证不透明、圆角正确），
+        # 玻璃只是它上面的一层「局部毛玻璃」，不改变窗口整体的不透明性。
         self.frame = QFrame()
         self.frame.setObjectName("AppFrame")
         self.frame.setProperty("rounded", True)
         self._outer.addWidget(self.frame)
+
+        # 背板纹理层：铺满外壳、压在最底，作为所有玻璃控件的"可模糊内容"。
+        # 手动定位（不进布局），跟随外壳 resize。
+        self.backdrop = BackdropLayer(self.frame)
+        self.backdrop.setGeometry(self.frame.rect().adjusted(1, 1, -1, -1))
+        self.backdrop.set_radius(theme.current().get("window_radius", 8))
 
         frame_layout = QVBoxLayout(self.frame)
         frame_layout.setContentsMargins(0, 0, 0, 0)
@@ -513,8 +842,8 @@ class MainWindow(QWidget):
         self.switch_page("home")
 
     def _build_sidebar(self):
-        sidebar = QFrame()
-        sidebar.setObjectName("Sidebar")
+        # 侧栏换成毛玻璃：背后纹理先模糊、再叠玻璃面与右缘高光
+        sidebar = GlassSidebar(lambda: getattr(self, "backdrop", None))
         sidebar.setFixedWidth(SIDEBAR_WIDTH)
 
         self._sidebar_layout = QVBoxLayout(sidebar)
@@ -543,7 +872,33 @@ class MainWindow(QWidget):
         self._sidebar_version.setAlignment(Qt.AlignCenter)
         self._sidebar_layout.addWidget(self._sidebar_version)
 
+        # 选中项的玻璃指示条。它是侧栏的子控件、但**不进布局**（不占位），
+        # 靠 stackUnder 压到导航按钮下面，按钮文字就压在半透明玻璃上。
+        #
+        # 注意 stackUnder 只保证"在指定控件之下"，逐个调用的话只有最后一次
+        # 生效——而最后一次是最后一个按钮（在最上层），结果指示条跑到按钮
+        # 上面去了，把选中项的文字整个盖住（玻璃越实越明显）。按钮是按创建
+        # 顺序叠起来的，第一个在最底，所以只需要压到第一个按钮下面即可。
+        self._nav_pill = GlassPill(lambda: getattr(self, "backdrop", None), sidebar)
+        self._nav_pill.set_relayout(self._nav_pill_rect)
+        first_btn = next(iter(self._nav_buttons.values()), None)
+        if first_btn is not None:
+            self._nav_pill.stackUnder(first_btn)
+
         return sidebar
+
+    def _nav_pill_rect(self):
+        """当前导航项对应的指示条矩形（相对侧栏），给不齐时返回 None。"""
+        btn = self._nav_buttons.get(getattr(self, "_current_nav", "home"))
+        if btn is None or btn.width() <= 8 or btn.height() <= 8:
+            return None
+        g = btn.geometry()
+        # 内缩量刻意很小：用户反馈「左侧工具栏的蓝色选中效果太细了」，所以
+        # 选中片要尽量撑满整行（只留 1px 上下、2px 左右给高光边和圆角），
+        # 而不是像原来那样上下各让 3px、整体显得一片薄薄的漂浮条。
+        return QRect(g.x() + PILL_INSET_X, g.y() + PILL_INSET_Y,
+                     max(4, g.width() - PILL_INSET_X - PILL_INSET_X - 2),
+                     max(4, g.height() - PILL_INSET_Y - PILL_INSET_Y))
 
     def _build_pages(self):
         def make(page_cls):
@@ -636,8 +991,22 @@ class MainWindow(QWidget):
             home = self._pages.get("home")
             if home is not None and hasattr(home, "start_hardware_scan"):
                 QTimer.singleShot(120, home.start_hardware_scan)
+        # 布局到这一步才真正算出按钮几何，玻璃指示条在这时补一次落位
+        QTimer.singleShot(0, self._sync_nav_pill)
         # 开机自启静默进托盘期间发现的更新，等窗口真打开时再提示
         self.show_update_if_pending()
+
+    def changeEvent(self, event):
+        """最大化 / 还原时同步外壳圆角。
+
+        双击标题栏走 toggle_max()，但 Win+↑ / 拖到屏幕顶部这类系统手势
+        只发 WindowStateChange，不经过它——不在这里补一刀的话，最大化后
+        外壳仍带着 8px 圆角、背板也还裁着圆角，四个角会露出没画到的缝隙。
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            QTimer.singleShot(0, lambda: self._set_rounded(
+                not self.isMaximized()))
 
     # ---------------------------------------------------- 启动画面联动
     def launch_with_data_wait(self, on_ready, timeout_ms=12000):
@@ -731,8 +1100,13 @@ class MainWindow(QWidget):
             return
         page = self._pages[key]
         self.stack.setCurrentWidget(page)
+        self._current_nav = key
         if key in self._nav_buttons:
             self._nav_buttons[key].setChecked(True)
+        # 玻璃指示条滑到新位置（切换动画就发生在这里）
+        pill = getattr(self, "_nav_pill", None)
+        if pill is not None:
+            pill.refresh_geometry(animate=True)
         # 通知页面已切到前台（用于惰性初始化 / 自动刷新）
         if hasattr(page, "on_shown"):
             try:
@@ -757,6 +1131,16 @@ class MainWindow(QWidget):
             self._sidebar_version.show()
             for btn in self._nav_buttons.values():
                 btn.set_expanded(True)
+        # 宽度刚改，布局要等这一轮事件处理完才重算；延后一拍让指示条
+        # 落在按钮重排后的真实位置上（否则会停在旧坐标上）。
+        QTimer.singleShot(0, self._sync_nav_pill)
+        for btn in self._nav_buttons.values():
+            btn.repaint()
+
+    def _sync_nav_pill(self):
+        pill = getattr(self, "_nav_pill", None)
+        if pill is not None:
+            pill.refresh_geometry(animate=False)
 
     # -------------------------------------------------------------- 主题
     def set_theme_setting(self, setting):
@@ -787,6 +1171,12 @@ class MainWindow(QWidget):
         theme.set_theme(resolved)
         self.setStyleSheet(theme.build_qss())
         self.titlebar.update_theme_button(resolved)
+        # 毛玻璃背板跟着换色（浅/深主题的网格与柔光强度不同）
+        if hasattr(self, "backdrop"):
+            self.backdrop.set_radius(
+                theme.current().get("window_radius", 8)
+                if not self.isMaximized() else 0)
+            self.backdrop.rebuild()
 
     # -------------------------------------------------------------- 窗口
     def _fit_to_screen(self):
@@ -806,6 +1196,11 @@ class MainWindow(QWidget):
         self.frame.setProperty("rounded", flag)
         self.frame.style().unpolish(self.frame)
         self.frame.style().polish(self.frame)
+        # 背板自己裁圆角：AppFrame 的 border-radius 不会裁子控件，
+        # 最大化时圆角为 0 才不会在四个角留出没画到的透明区。
+        if hasattr(self, "backdrop"):
+            self.backdrop.set_radius(
+                theme.current().get("window_radius", 8) if flag else 0)
 
     def toggle_max(self):
         if self.isMaximized():

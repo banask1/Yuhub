@@ -356,13 +356,16 @@ QFrame#AppFrame[rounded="false"] { border-radius: 0px; }
     border-bottom: 1px solid $titlebar_separator;
 }
 QLabel#AppTitle { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+/* 版本号是一块玻璃贴片（GlassChip 自绘：取景 → 模糊 → 白纱 → 亮边）。
+   ⚠️ 不能再给 background / border：QLabel::paintEvent 一进来就 drawFrame()，
+   会把这里的底色和边框**画在自绘玻璃之上**，玻璃就全被盖住了；
+   而且 QSS 没有 backdrop-filter，描一块 surface_hover 上去也只是"贴张纸"。
+   尺寸由 padding 撑出来（GlassChip 的 contentsMargins 给同值兜底）。 */
 QLabel#AppSubtitle {
     color: $text_dim;
     font-size: 11px;
-    background: $surface_hover;
-    border: 1px solid $glass_highlight;
-    border-radius: 4px;
-    padding: 1px 6px;
+    background: transparent;
+    padding: 2px 9px;
 }
 
 QPushButton#TitleButton {
@@ -411,9 +414,13 @@ QPushButton#SidebarButton:hover {
     color: $text;
 }
 QPushButton#SidebarButton:checked {
-    background: $accent_soft;
-    color: $accent;
-    border: 1px solid $accent;
+    /* 选中底由玻璃指示条（GlassPill）自绘：这里再刷 accent_soft 底色、
+       描一圈 accent 边，会在蓝玻璃外面套一层"没有玻璃的蓝边"——它和玻璃片
+       的圆角半径还不一样，四角就对不齐（用户报的
+       「选中特效蓝色四角周围没有毛玻璃」就是这个）。文字改用 accent_text。 */
+    background: transparent;
+    border: 1px solid transparent;
+    color: $accent_text;
     font-weight: 700;
 }
 
@@ -838,6 +845,87 @@ def ensure_builtin_theme():
     return created, d
 
 
+# ---------------------------------------------------------------------------
+# 内置 theme.qss 的"补丁升级"
+# ---------------------------------------------------------------------------
+# 为什么需要：主题包首次创建时会把内置模板写进
+# Documents\Yuhub\<包名>\theme.qss，之后**绝不覆盖**（这是保护用户改动的
+# 正确做法）。可代价是老用户手里那份永远停在旧模板上，能把新代码里的
+# 修正整份顶掉——v0.9beta 的「版本号没有毛玻璃 / 选中蓝边套在玻璃外面」
+# 就是这个坑：代码改好了，界面却还在用旧 QSS。
+#
+# 做法：**逐字命中旧写法**才替换（见 _SKY_QSS_PATCHES）。用户动过的文件
+# 自然对不上，不会被误伤；模板里另放一枚 STAMP，命中过一次就不再处理。
+QSS_STAMP = "/* yuhub builtin theme.qss v2 */"
+
+_SKY_QSS_PATCHES = (
+    # (1) 版本号：旧版是实心色块 + 4px 圆角，会盖住自绘玻璃
+    (
+        "QLabel#AppSubtitle {\n"
+        "    color: $text_dim;\n"
+        "    font-size: 11px;\n"
+        "    background: $surface_hover;\n"
+        "    border: 1px solid $glass_highlight;\n"
+        "    border-radius: 4px;\n"
+        "    padding: 1px 6px;\n"
+        "}",
+        "QLabel#AppSubtitle {\n"
+        "    color: $text_dim;\n"
+        "    font-size: 11px;\n"
+        "    background: transparent;\n"
+        "    padding: 2px 9px;\n"
+        "}",
+    ),
+    # (2) 侧栏选中态：旧版自己刷 accent 底 + 描 accent 边，跟玻璃指示条抢地
+    (
+        "QPushButton#SidebarButton:checked {\n"
+        "    background: $accent_soft;\n"
+        "    color: $accent;\n"
+        "    border: 1px solid $accent;\n"
+        "    font-weight: 700;\n"
+        "}",
+        "QPushButton#SidebarButton:checked {\n"
+        "    background: transparent;\n"
+        "    border: 1px solid transparent;\n"
+        "    color: $accent_text;\n"
+        "    font-weight: 700;\n"
+        "}",
+    ),
+)
+
+
+def upgrade_builtin_qss(path, stamp=QSS_STAMP, patches=_SKY_QSS_PATCHES):
+    """把"原样未改的内置模板"升级到当前版本；返回是否写回过。
+
+    判定很保守，只有三条全满足才动文件：
+      1. 文件里没有当前 STAMP（已经升级过的直接跳过）；
+      2. 至少有一条补丁的"旧写法"逐字命中；
+      3. 读得到、写得动（任何 OSError 都静默放弃，皮肤写坏不该拖垮启动）。
+    这样用户自己改过的 theme.qss 一律保持原样。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if stamp in text:
+        return False
+    hit = False
+    for old, new in patches:
+        if old in text:
+            text = text.replace(old, new)
+            hit = True
+    if not hit:
+        return False
+    text = stamp + "\n" + text
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        return False
+    return True
+
+
 def _ensure_sky_glass_theme():
     """内置 sky glass 主题：不存在才写，绝不覆盖用户的改动。
 
@@ -865,9 +953,12 @@ def _ensure_sky_glass_theme():
     if not os.path.isfile(qss_path):
         try:
             with open(qss_path, "w", encoding="utf-8") as f:
-                f.write(SKY_QSS)
+                f.write(QSS_STAMP + "\n" + SKY_QSS)
         except OSError:
             pass
+    else:
+        # 老版本留下的模板：只升级"原样未改"的那份（见 upgrade_builtin_qss）
+        upgrade_builtin_qss(qss_path)
 
 
 _THEME_README = """\

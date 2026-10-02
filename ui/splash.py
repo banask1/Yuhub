@@ -1,9 +1,10 @@
-"""Yuhub 启动动画：纯色背景 + 图标 + 旋转加载环，数据就绪后直接进入主窗口。
+"""Yuhub 启动动画：毛玻璃背景 + 图标 + 旋转加载环，数据就绪后直接进入主窗口。
 
 流程（由 main.py 驱动）：
-  1. show()              —— 立即显示纯色启动屏。背景色取当前主题的
-                            window_top，深浅模式由 MainWindow 之前的
-                            init_theme_from_settings() 决定。
+  1. show()              —— 立即显示启动屏。背景是**毛玻璃**：合成一层底纹
+                            （方格 + 柔光）→ 糊掉 → 叠玻璃薄纱 / 反光 / 边缘光。
+                            底色取当前主题的 window_top，深浅模式由 MainWindow
+                            之前的 init_theme_from_settings() 决定。
   2. 首页硬件数据就绪     —— main.py 调 finish()。
   3. finish()            —— 不足最短展示时长则先补足（让加载环至少转几圈），
                             然后 close() 并发出 finished。
@@ -13,11 +14,13 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import Qt, QRect, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QRect, QRectF, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap,
+)
 from PySide6.QtWidgets import QApplication, QWidget
 
-from . import theme, VERSION_LABEL
+from . import glass, theme, VERSION_LABEL
 from .main_window import resource_path
 
 # 启动画面图标的逻辑尺寸。缩放时必须乘 devicePixelRatio，
@@ -49,6 +52,10 @@ class SplashScreen(QWidget):
         self._status = "正在准备…"
         self._min_duration_ms = int(min_duration_ms)
         self._shown_at = time.monotonic()
+
+        # 毛玻璃底纹缓存（尺寸 / 主题不变就复用，见 _backdrop_pixmap）
+        self._bg = None
+        self._bg_key = None
 
         self._icon_pix = self._load_icon()
         self._center_on_screen()
@@ -113,20 +120,77 @@ class SplashScreen(QWidget):
         self._angle = (self._angle + 5) % 360
         self.update()
 
+    # ------------------------------------------------------------ 毛玻璃背景
+    def _backdrop_pixmap(self):
+        """合成"玻璃背后那一层"的模糊底纹（带缓存）。
+
+        启动画面是个独立的顶层窗口，**没有 BackdropLayer 可以抓**，所以这里
+        直接把 ui.glass.paint_backdrop 画进离屏 pixmap，再糊一次——等效于
+        「透过磨砂玻璃看背后的底纹」。底纹本身（方格 + 两团柔光）就是主窗口
+        BackdropLayer 用的同一套，所以启动屏和主窗口的玻璃观感是连续的。
+
+        缓存键含主题里的 window_top / accent：换主题后自动重算，不会残留
+        上一个主题的深浅。
+        """
+        cur = theme.current()
+        key = (self.width(), self.height(),
+               str(cur.get("window_top")), str(cur.get("accent")))
+        if self._bg is not None and self._bg_key == key:
+            return self._bg
+
+        pm = QPixmap(self.size())
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        try:
+            glass.paint_backdrop(p, self.size(), cur)
+        finally:
+            p.end()
+        # 糊一次：方格交界被抹开，才有"磨砂"的观感（不糊就是一张网格纸）。
+        # ⚠️ 半径别调太大：到 12 以上方格就彻底看不见了，整块退化成"一层渐变"，
+        #    反而看不出是毛玻璃（试过 12，纹理全没了）。
+        self._bg = glass.blur_pixmap(pm, 8.0)
+        self._bg_key = key
+        return self._bg
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         c = theme.current()
 
-        # ---- 纯色圆角底（跟随主题深浅色） ----
         try:
             radius = float(c.get("window_radius", 10) or 10)
         except (TypeError, ValueError):
             radius = 10.0
+        body = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+
+        # ---- 毛玻璃底：模糊底纹 + 玻璃面色纱 + 内侧边缘光 ----
+        # 1) 先裁进圆角形状，把"背后那一层"的模糊纹理铺上
+        p.save()
+        clip = QPainterPath()
+        clip.addRoundedRect(body, radius, radius)
+        p.setClipPath(clip)
+        p.drawPixmap(0, 0, self._backdrop_pixmap())
+        p.restore()
+
+        # 2) 玻璃面色纱（等效 CSS 的 rgba(255,255,255,.04) + brightness(.9)）
+        #    再叠一点 accent 提色，跟主窗口的背板柔光呼应
+        tint, gloss, dim = glass.glass_params(c)
+        glass.paint_glass(p, body, radius=radius,
+                          tint="#ffffff", tint_alpha=tint,
+                          gloss_alpha=gloss, top_alpha=136,
+                          border_alpha=118, inner_alpha=46,
+                          matte=c.get("accent", "#3b82f6"),
+                          matte_alpha=30 if glass.is_dark(c) else 22)
+        # 3) 内侧边缘光带：1px 描边在 380px 的面板上等于没有，要 16px 宽的
+        #    渐变带才看得出"这块玻璃有厚度"（同 ui/glass.py 的说明）
+        glass.paint_edge_glow(p, body, radius=radius, thickness=16,
+                              top_alpha=104, left_alpha=66, bottom_alpha=26)
+
+        # ---- 窗口描边 ----
         p.setPen(QPen(QColor(c.get("window_border", "#26262c")), 1))
-        p.setBrush(QColor(c.get("window_top", "#0b0b0e")))
-        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), radius, radius)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(body, radius, radius)
 
         w = self.width()
 

@@ -245,18 +245,24 @@ QFrame#AppFrame {
 QFrame#AppFrame[rounded="true"] { border-radius: $window_radius; }
 QFrame#AppFrame[rounded="false"] { border-radius: 0px; }
 
-/* ---------- 标题栏 ---------- */
+/* ---------- 标题栏 ----------
+   同侧栏：底色由 GlassTitleBar 自绘（背后纹理模糊 + 玻璃面），
+   这里留透明，只压一条底边分隔线。 */
 #TitleBar {
-    background: $titlebar_bg;
+    background: transparent;
     border-bottom: 1px solid $titlebar_separator;
 }
 QLabel#AppTitle { font-size: 13px; font-weight: 700; color: $text; background: transparent; }
+/* 版本号是一块玻璃贴片（GlassChip 自绘：取景 → 模糊 → 白纱 → 亮边）。
+   ⚠️ 这里**不能**再给 background 上色：QSS 没有 backdrop-filter，描一块
+   实心/surface_hover 上去就变成"标题栏上贴了张纸"，玻璃感全没了；
+   而且背景由 QStyleSheetStyle 在 paintEvent 之前刷，会直接盖住自绘结果。
+   只保留透明背景（让 padding 生效）+ 文字样式。 */
 QLabel#AppSubtitle {
-    color: $text_faint;
+    color: $text_dim;
     font-size: 11px;
-    background: $surface_hover;
-    border-radius: 4px;
-    padding: 1px 6px;
+    background: transparent;
+    padding: 2px 9px;
 }
 
 QPushButton#TitleButton {
@@ -270,10 +276,12 @@ QPushButton#TitleButton:hover { background: $surface_hover; border-color: $borde
 QPushButton#TitleButton:checked { background: $accent_soft; border-color: $accent; color: $accent; }
 QPushButton#TitleButton[danger="true"]:hover { background: #e81123; border-color: #e81123; color: #ffffff; }
 
-/* ---------- 侧边栏 ---------- */
+/* ---------- 侧边栏 ----------
+   底色不在这里画：侧栏现在是**毛玻璃**（Window 里的 GlassSidebar 自绘：
+   先取背后 BackdropLayer 的纹理做模糊，再叠玻璃面与右缘高光）。
+   这里必须让 #Sidebar 透明，否则 QSS 的实心底会把模糊层整个盖住。 */
 #Sidebar {
-    background: $sidebar_bg;
-    border-right: 1px solid $sidebar_separator;
+    background: transparent;
 }
 QLabel#SidebarSection {
     color: $text_faint;
@@ -295,10 +303,13 @@ QPushButton#SidebarButton {
     margin: 1px 10px;
 }
 QPushButton#SidebarButton:hover { background: $surface_hover; color: $text; }
+/* 选中态不画底：玻璃指示条（GlassPill）压在按钮下面，这里再刷底色
+   会把它糊掉。文字用 accent_text（白）——指示条本身是 accent 色的玻璃，
+   再用 accent 蓝字压上去会看不清（深色主题下实测几乎全糊）。 */
 QPushButton#SidebarButton:checked {
-    background: $accent_soft;
-    color: $accent;
-    border: 1px solid $accent;
+    background: transparent;
+    border: none;
+    color: $accent_text;
     font-weight: 700;
 }
 
