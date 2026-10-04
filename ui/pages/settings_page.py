@@ -304,7 +304,7 @@ class SettingsPage(BasePage):
         self._repair_cancel = False
         self.btn_repair_app.setText("取消")
         self.btn_repair_app.setEnabled(True)
-        self.repair_status.setText("正在查询 Release 信息…")
+        self.repair_status.setText("正在查询更新信息…")
         threading.Thread(
             target=self._do_repair_app, name="AppRepair", daemon=True).start()
 

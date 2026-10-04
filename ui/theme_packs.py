@@ -163,6 +163,7 @@ DEFAULT_DARK = {
     "tile_5": "#38bdf8",
     "tile_6": "#fb7185",
     "tile_7": "#6366f1",
+    "tile_8": "#22d3ee",
 }
 
 DEFAULT_LIGHT = {
@@ -206,6 +207,7 @@ DEFAULT_LIGHT = {
     "tile_5": "#0284c7",
     "tile_6": "#e11d48",
     "tile_7": "#4f46e5",
+    "tile_8": "#0891b2",
 }
 
 
@@ -264,6 +266,7 @@ SKY_DARK = {
     "tile_5": "#6fd8ff",
     "tile_6": "#ff8fa8",
     "tile_7": "#8b93ff",
+    "tile_8": "#7ee7f5",
     # ---- sky glass 专属键 ----
     # 玻璃边缘高光（描边色）
     "glass_highlight": "rgba(255,255,255,105)",
@@ -316,6 +319,7 @@ SKY_LIGHT = {
     "tile_5": "#0ea5e9",
     "tile_6": "#f43f6e",
     "tile_7": "#6366f1",
+    "tile_8": "#06b6d4",
     "glass_highlight": "rgba(255,255,255,235)",
     "icon_tile_style": "glass",
     "menu_bg": "rgba(252,253,255,248)",
@@ -325,6 +329,120 @@ SKY_LIGHT = {
 
 # sky glass 专属 QSS 模板：与内置极简色块模板覆盖**完全相同的选择器**，
 # 但把所有表面换成玻璃质感（渐变窗口 + rgba 半透明叠加 + 大圆角）。
+# ---------------------------------------------------------------------------
+# 交互态（按下 / 键盘焦点）—— 内置模板与 sky glass 模板**共用同一份**
+# ---------------------------------------------------------------------------
+# 为什么单独抽出来：这两套模板各写各的，之前就出现过"内置那份补了、主题包那份
+# 忘了"的漏改（侧栏选中态、版本号贴片都是这么栽过的）。交互态是纯增量的尾部
+# 规则，抽成常量后两边引用同一份文本，磁盘模板的补丁升级也直接引用它。
+#
+# 设计依据（Emil Kowalski 设计工程技能库，Buttons must feel responsive）：
+#   反馈必须发生在 pointer-down 的**那一帧**，而不是等松开。Qt 的 QSS 没有
+#   transition，但 `:pressed` 是同步重绘的，正好满足"瞬间"这个要求。
+INTERACTION_QSS = """
+/* ================= 交互态：按下 =================
+   描边类按钮（Ghost / Mini / Segment）按住时整块填成实色 —— 这是本项目
+   "实心色块"语言下覆盖面最大、最不可能认错的一种反馈。
+
+   一条硬约束：按下前后**边框宽度必须一致**，只允许换颜色。改宽度会让控件
+   重算尺寸、连带把邻居挤动（每按一下抖一次，比没有反馈更糟）。
+   所以原本写 `border: none` 的侧栏项 / 分段按钮，基础规则里改成了
+   `1px solid transparent` 占位并把内边距同步减 1px，总尺寸不变。 */
+
+QPushButton#PrimaryButton:pressed {
+    background: $accent_pressed;
+    border-color: $accent_pressed;
+}
+QPushButton#GhostButton:pressed {
+    background: $accent;
+    border-color: $accent;
+    color: $accent_text;
+}
+QPushButton#DangerButton:pressed {
+    background: $red_pressed;
+    border-color: $red_pressed;
+    color: #ffffff;
+}
+QPushButton#MiniButton:pressed {
+    background: $accent;
+    border-color: $accent;
+    color: $accent_text;
+    font-weight: 700;
+}
+QPushButton#SegmentButton:pressed:!checked {
+    background: $accent_soft;
+    color: $accent;
+}
+/* 选中的玻璃段按住：玻璃片本身由 SegmentSlider 自绘（QSS 撤不了它的颜色），
+   所以在按钮上压一层**很淡的深色纱**表示"按住了"。用绝对 rgba 而不是
+   $surface_hover：后者在深色主题下是提亮色，压在浅蓝玻璃上反而是"浮起来"，
+   方向不对。 */
+QPushButton#SegmentButton:checked:pressed {
+    background: rgba(10, 20, 36, 30);
+    color: $liquid_text;
+}
+QPushButton#SidebarButton:pressed:!checked {
+    background: $surface_hover;
+    color: $text;
+}
+QPushButton#TitleButton:pressed {
+    background: $accent_soft;
+    border-color: $accent;
+    color: $accent;
+}
+QPushButton#TitleButton[danger="true"]:pressed {
+    background: #c50f1f;
+    border-color: #c50f1f;
+    color: #ffffff;
+}
+QFrame#Card[clickable="true"]:pressed {
+    background: $accent_soft;
+    border-color: $accent;
+}
+QComboBox:pressed { border-color: $accent; }
+QCheckBox::indicator:pressed {
+    border-color: $accent;
+    background: $accent_soft;
+}
+
+/* ================= 键盘焦点环 =================
+   全局 `outline: none` 把 Qt 自带的虚线焦点框关掉了，于是键盘用户**完全看
+   不出焦点在哪**（Tab 一圈什么都不会动）。这里补一条自己的环。
+
+   两个必须做对的点：
+     1) 只改边框颜色、不改宽度（理由同上）。原本 `border: none` 的控件已在
+        基础规则里留了 1px 透明边框占位，所以这条规则永远不会挤动布局。
+     2) 配合 Qt 的 `Qt.TabFocus`：鼠标点击不留环，只有 Tab 进来的才显示。
+        Qt 没有 CSS 的 `:focus-visible`，而 `Qt.TabFocus`（只吃 Tab 焦点）
+        正好等价。设置见 ui/widgets.kb_focus_button / MainWindow 里的统一梳理。
+
+   选择器必须逐个写 ID：Qt QSS 按 CSS2 优先级匹配，`QPushButton:focus`
+   （0 个 id）会被 `QPushButton#PrimaryButton`（1 个 id）压过去，写成通配
+   等于没写——这是很容易踩空的一处。 */
+QPushButton#PrimaryButton:focus,
+QPushButton#GhostButton:focus,
+QPushButton#DangerButton:focus,
+QPushButton#MiniButton:focus,
+QPushButton#SegmentButton:focus,
+QPushButton#SidebarButton:focus,
+QPushButton#TitleButton:focus,
+QComboBox:focus,
+QLineEdit:focus,
+QSpinBox:focus {
+    border-color: $accent;
+}
+QCheckBox:focus::indicator { border-color: $accent; }
+
+/* 主要按钮要单独一条：它的常态边框**就是** $accent，上面那条"只改边框色"
+   的环在它身上等于什么都没改（实测 Δ=0，键盘用户根本看不到焦点）。
+   换成推导出来的 $accent_ring（跟填充反着来），并放在整组之后 ——
+   同 ID 选择器靠"后写的赢"覆盖掉上面那组的 border-color。 */
+QPushButton#PrimaryButton:focus {
+    border-color: $accent_ring;
+}
+"""
+
+
 SKY_QSS = """\
 * {
     font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif;
@@ -414,13 +532,15 @@ QPushButton#SidebarButton:hover {
     color: $text;
 }
 QPushButton#SidebarButton:checked {
-    /* 选中底由玻璃指示条（GlassPill）自绘：这里再刷 accent_soft 底色、
-       描一圈 accent 边，会在蓝玻璃外面套一层"没有玻璃的蓝边"——它和玻璃片
+    /* 选中底由液态玻璃指示条（GlassPill）自绘：这里再刷 accent_soft 底色、
+       描一圈 accent 边，会在玻璃外面套一层"没有玻璃的蓝边"——它和玻璃片
        的圆角半径还不一样，四角就对不齐（用户报的
-       「选中特效蓝色四角周围没有毛玻璃」就是这个）。文字改用 accent_text。 */
+       「选中特效蓝色四角周围没有毛玻璃」就是这个）。
+       文字用 **$liquid_text（深色）**：指示条已经改成浅蓝玻璃，再压白字
+       对比度只剩 1.9:1，基本读不清。 */
     background: transparent;
     border: 1px solid transparent;
-    color: $accent_text;
+    color: $liquid_text;
     font-weight: 700;
 }
 
@@ -436,7 +556,7 @@ QFrame#Card[clickable="true"]:hover {
 }
 
 /* ---------- 文本 ---------- */
-QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; }
+QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; letter-spacing: -0.4px; }
 QLabel#PageSubtitle { font-size: 13px; color: $text_dim; }
 QLabel#CardTitle { font-size: 14px; font-weight: 700; color: $text; }
 QLabel#CardDesc { font-size: 12px; color: $text_dim; }
@@ -538,7 +658,8 @@ QPushButton#PrimaryButton:hover {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 $accent, stop:1 $accent_hover);
 }
-QPushButton#PrimaryButton:pressed { background: $accent; }
+/* 按下态统一由文件末尾的 INTERACTION_QSS 定义，这里**不留**规则
+   （原因见 ui/theme.py 同一处的注释）。 */
 QPushButton#PrimaryButton:disabled {
     background: $surface_hover; border-color: $border_strong; color: $text_faint;
 }
@@ -696,13 +817,24 @@ QFrame#Segment {
 }
 QPushButton#SegmentButton {
     background: transparent;
-    border: none;
+    /* 1px 透明边框占位 + 内边距各减 1px：总尺寸与原来的 `border: none` 完全
+       一致，但焦点环可以只换颜色而不挤动布局（见 INTERACTION_QSS 的说明）。 */
+    border: 1px solid transparent;
     border-radius: 7px;
-    padding: 6px 14px;
+    padding: 5px 13px;
     color: $text_dim;
 }
 QPushButton#SegmentButton:hover { color: $text; background: $surface_hover; }
-QPushButton#SegmentButton:checked { background: $accent; color: $accent_text; font-weight: 700; }
+/* 选中段**自己不画底**：那块浅蓝液态玻璃由 ui/widgets.SegmentSlider 自绘，
+   切换时用弹簧滑过去（qss 的 :checked 是瞬时换色，做不出"滑块"）。
+   这里只留文字色与字重，边框保持透明 —— 否则按钮的方角边框会压住
+   玻璃片的圆角。 */
+QPushButton#SegmentButton:checked {
+    background: transparent;
+    color: $liquid_text;
+    border: 1px solid transparent;
+    font-weight: 700;
+}
 
 /* ---------- 弹窗 ---------- */
 QDialog {
@@ -717,7 +849,7 @@ QFrame#DialogFrame {
 }
 QFrame#DialogHeader { background: transparent; border: none; }
 QDialog QLabel { color: $text; background: transparent; }
-QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; background: transparent; }
+QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; background: transparent; letter-spacing: -0.3px; }
 QLabel#DialogSection {
     color: $text_dim;
     font-size: 11px;
@@ -790,7 +922,7 @@ QToolTip {
     border-radius: 6px;
     padding: 6px 10px;
 }
-"""
+""" + INTERACTION_QSS
 
 
 # ---------------------------------------------------------------------------
@@ -856,8 +988,88 @@ def ensure_builtin_theme():
 #
 # 做法：**逐字命中旧写法**才替换（见 _SKY_QSS_PATCHES）。用户动过的文件
 # 自然对不上，不会被误伤；模板里另放一枚 STAMP，命中过一次就不再处理。
-QSS_STAMP = "/* yuhub builtin theme.qss v2 */"
+#
+# v3：交互态（按下 / 键盘焦点）成体系补全。老盘模板缺的是**纯增量
+# 的尾部规则**，所以主力补丁是"把旧结尾换成旧结尾 + INTERACTION_QSS"；
+# 另有两条是就地改写（分段按钮的边框占位、标题的负字距），因为这两处若不同步
+# 升级，新加的焦点环反而会把布局挤动。
+#
+# v4：删掉模板里**遗留的那句** `PrimaryButton:pressed { background: $accent }`。
+# 它和 INTERACTION_QSS 末尾那条同优先级、只靠"后写的赢"才没出事；规则一旦
+# 重排，主要按钮的按下就会和常态一模一样（静默失效）。v2/v3 的老盘都有这句。
+#
+# v5：选中态从"实心 accent 蓝"改成"浅蓝液态玻璃"。要动三处：
+#   * 侧栏选中项文字色 —— 底变成浅蓝玻璃后，压白字只剩 1.9:1 对比度，
+#     必须换成深色（$liquid_text）；
+#   * 分段控件选中段 —— 实心色换成竖向渐变 + 1px 亮边；
+#   * 分段控件选中段的按下色 —— 跟同一套玻璃色走。
+# 注意侧栏那条要**两条补丁**：v2 老盘是 `color: $accent;`，v3/v4 老盘是
+# `color: $accent_text;`（v3 的补丁 (2) 改的），两个中间态都得认。
+#
+# v6（本次）：分段控件的选中底**整个撤掉**，改由 ui/widgets.SegmentSlider
+# 自绘并弹簧滑动（qss 没有过渡，做不出"滑块滑过去"）。所以要动两处：
+#   * 选中段的 `background` 由渐变改成 `transparent`（否则盖住玻璃片）；
+#   * 选中段按下的 `background` 由渐变改成一层淡深色纱。
+# v5 老盘停在"渐变写法"上，(9)/(10) 只认 v2 的实心写法 —— 因此另配
+# (11)/(12) 两条把它们落到 v6 的透明写法。
+QSS_STAMP = "/* yuhub builtin theme.qss v6 */"
 
+#: v2 模板的结尾（QToolTip 是 SKY_QSS 最后一个规则块）
+_V2_QSS_TAIL = (
+    "QToolTip {\n"
+    "    background: $toast_bg;\n"
+    "    color: $text;\n"
+    "    border: 1px solid $menu_border;\n"
+    "    border-radius: 6px;\n"
+    "    padding: 6px 10px;\n"
+    "}"
+)
+
+#: INTERACTION_QSS 的"已存在"指纹。选一条**历次版本都没变过**的规则，
+#: 这样 v3 老盘在 v4 重跑时也能认出"整块已经追加过了"，不会再来一遍。
+_INTERACTION_MARK = "QPushButton#SidebarButton:pressed:!checked"
+
+#: 焦点环那条（v4 新增）的指纹
+_RING_MARK = "QPushButton#PrimaryButton:focus {\n    border-color: $accent_ring;\n}"
+
+#: v6 分段选中段的终态 —— v2 的实心写法与 v5 的渐变写法都收敛到这一份。
+#: 刻意**不带注释**：注释一旦改字，幂等标记就认不出老盘文件里已经替换好的那份，
+#: STAMP 升版本时会再追加一遍。
+_SEG_CHECKED_NEW = (
+    "QPushButton#SegmentButton:checked {\n"
+    "    background: transparent;\n"
+    "    color: $liquid_text;\n"
+    "    border: 1px solid transparent;\n"
+    "    font-weight: 700;\n"
+    "}"
+)
+_SEG_PRESSED_NEW = (
+    "QPushButton#SegmentButton:checked:pressed {\n"
+    "    background: rgba(10, 20, 36, 30);\n"
+    "    color: $liquid_text;\n"
+    "}"
+)
+#: v5 在磁盘模板上留下的两段注释，v6 要把它们一并吃掉（内容已过时）
+_SEG_V5_CHECKED_OLD = (
+    "/* 选中段 = 一块浅蓝液态玻璃：竖向渐变（上端迎光更亮、下端有厚度）+\n"
+    "   1px 亮边。QSS 没有 box-shadow，纯色在这几十像素的小块上完全看不出\n"
+    '   "厚度"，所以必须靠渐变。 */\n'
+)
+_SEG_V5_PRESSED_OLD = (
+    "/* 选中的玻璃段按住：往深一档走（$liquid_bottom 是玻璃渐变的下端色），\n"
+    "   这样「按住」在浅蓝玻璃上也看得见变化。 */\n"
+)
+
+# 每条补丁是 `(旧写法, 新写法, 幂等标记)`：
+#   * 旧写法 —— 逐字命中才替换，用户改过的文件自然对不上；
+#   * 新写法 —— 替换成什么（空串 = 删掉这段）；
+#   * 幂等标记 —— 文件里已经出现它就跳过这条。传 None 表示"可以重复执行"
+#     （纯删除型补丁天然幂等）。
+# 为什么必须有第三项：STAMP 一升版本，整张表会对老盘文件重跑。增量型补丁
+# （把结尾换成"结尾 + 新规则"）重跑一次就会把新规则追加第二遍 —— 不报错、
+# 界面照常，只是文件里躺着一模一样的两份，属于最难查的那类污染。
+# 默认标记取"新写法"，但增量型补丁必须显式给一个**跨版本稳定**的指纹：
+# 新写法一变（哪怕只往里面多写一行注释）就认不出来了。
 _SKY_QSS_PATCHES = (
     # (1) 版本号：旧版是实心色块 + 4px 圆角，会盖住自绘玻璃
     (
@@ -876,7 +1088,8 @@ _SKY_QSS_PATCHES = (
         "    padding: 2px 9px;\n"
         "}",
     ),
-    # (2) 侧栏选中态：旧版自己刷 accent 底 + 描 accent 边，跟玻璃指示条抢地
+    # (2) 侧栏选中态：旧版自己刷 accent 底 + 描 accent 边，跟玻璃指示条抢地。
+    #     v5 起文字改深色 $liquid_text（指示条是浅蓝玻璃了）。
     (
         "QPushButton#SidebarButton:checked {\n"
         "    background: $accent_soft;\n"
@@ -887,9 +1100,120 @@ _SKY_QSS_PATCHES = (
         "QPushButton#SidebarButton:checked {\n"
         "    background: transparent;\n"
         "    border: 1px solid transparent;\n"
+        "    color: $liquid_text;\n"
+        "    font-weight: 700;\n"
+        "}",
+    ),
+    # (3) v3 主力补丁：把整份交互态（按下 + 键盘焦点）追加到模板末尾。
+    #     锚点是 v2 的结尾块，逐字命中才动手。标记用 INTERACTION_QSS 里
+    #     一条稳定指纹 —— 不能用"新写法"本身，因为 v4 又往里面加了一条规则。
+    (_V2_QSS_TAIL, _V2_QSS_TAIL + "\n" + INTERACTION_QSS, _INTERACTION_MARK),
+    # (6) v4：删掉遗留的按下规则（新的那条在 INTERACTION_QSS 里）。
+    #     new 为空串 = 删除该行；末尾多一个换行会变成空行，一并吃掉。
+    #     纯删除，标记传 None（重复执行也安全）。
+    (
+        "QPushButton#PrimaryButton:pressed { background: $accent; }\n",
+        "",
+        None,
+    ),
+    # (4) 分段按钮：v2 是 `border: none`，焦点环一描边就会把布局挤动 2px。
+    #     改成"1px 透明边框 + 内边距各减 1px"，总尺寸不变。
+    (
+        "QPushButton#SegmentButton {\n"
+        "    background: transparent;\n"
+        "    border: none;\n"
+        "    border-radius: 7px;\n"
+        "    padding: 6px 14px;\n"
+        "    color: $text_dim;\n"
+        "}",
+        "QPushButton#SegmentButton {\n"
+        "    background: transparent;\n"
+        "    border: 1px solid transparent;\n"
+        "    border-radius: 7px;\n"
+        "    padding: 5px 13px;\n"
+        "    color: $text_dim;\n"
+        "}",
+    ),
+    # (5) 标题负字距：字号越大，字面间距越显得散。大字收紧、正文留 0。
+    (
+        "QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; }",
+        "QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; "
+        "letter-spacing: -0.4px; }",
+    ),
+    (
+        "QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; "
+        "background: transparent; }",
+        "QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; "
+        "background: transparent; letter-spacing: -0.3px; }",
+    ),
+    # (7) v4：主要按钮的焦点环。v2 走补丁 (3) 已经拿到（整块里就带这条），
+    #     v3 老盘没有 —— 这里就地追加，位置在焦点组之后即可覆盖它。
+    #
+    #     背景：焦点组里那条是"只把 border-color 改成 $accent"，而主要按钮的
+    #     常态边框**就是** $accent → 在它身上 Δ=0，键盘用户根本看不出焦点。
+    #     换成推导出来的 $accent_ring（跟填充反着来）。
+    (
+        "QCheckBox:focus::indicator { border-color: $accent; }\n",
+        "QCheckBox:focus::indicator { border-color: $accent; }\n"
+        "\n"
+        "/* 主要按钮要单独一条：它的常态边框**就是** $accent，上面那条\"只改边框色\"\n"
+        "   的环在它身上等于什么都没改（实测 Δ=0，键盘用户根本看不到焦点）。\n"
+        "   换成推导出来的 $accent_ring（跟填充反着来），并放在整组之后 ——\n"
+        "   同 ID 选择器靠\"后写的赢\"覆盖掉上面那组的 border-color。 */\n"
+        "QPushButton#PrimaryButton:focus {\n"
+        "    border-color: $accent_ring;\n"
+        "}\n",
+        _RING_MARK,
+    ),
+    # (8) v5：v3/v4 老盘的侧栏选中文字色（中间态）→ 深色。
+    #     v2 老盘由补丁 (2) 一步到位；打过 v3 补丁的老盘停在 $accent_text 上。
+    #     两条补丁的 new 相同，所以幂等标记能兜住"先跑 (2) 再跑 (8)"的顺序。
+    (
+        "QPushButton#SidebarButton:checked {\n"
+        "    background: transparent;\n"
+        "    border: 1px solid transparent;\n"
         "    color: $accent_text;\n"
         "    font-weight: 700;\n"
         "}",
+        "QPushButton#SidebarButton:checked {\n"
+        "    background: transparent;\n"
+        "    border: 1px solid transparent;\n"
+        "    color: $liquid_text;\n"
+        "    font-weight: 700;\n"
+        "}",
+    ),
+    # (9) v5/v6：分段控件选中段 —— 实心 accent 蓝 → 透明（玻璃由 SegmentSlider 自绘）
+    (
+        "QPushButton#SegmentButton:checked { background: $accent; "
+        "color: $accent_text; font-weight: 700; }",
+        _SEG_CHECKED_NEW,
+    ),
+    # (10) v5/v6：选中段的按下色 —— 原来是 accent_pressed
+    (
+        "QPushButton#SegmentButton:checked:pressed { background: $accent_pressed; }",
+        _SEG_PRESSED_NEW,
+    ),
+    # (11) v6：v5 老盘停在"竖向渐变"上，这条把注释连规则一起换成透明写法。
+    (
+        _SEG_V5_CHECKED_OLD
+        + "QPushButton#SegmentButton:checked {\n"
+        "    background: qlineargradient(x1:0, y1:0, x2:0.25, y2:1,\n"
+        "        stop:0 $liquid_top, stop:0.55 $liquid_tint, stop:1 $liquid_bottom);\n"
+        "    color: $liquid_text;\n"
+        "    border: 1px solid $liquid_edge;\n"
+        "    font-weight: 700;\n"
+        "}",
+        _SEG_CHECKED_NEW,
+    ),
+    # (12) v6：同理处理 v5 的按下渐变。
+    (
+        _SEG_V5_PRESSED_OLD
+        + "QPushButton#SegmentButton:checked:pressed {\n"
+        "    background: qlineargradient(x1:0, y1:0, x2:0.25, y2:1,\n"
+        "        stop:0 $liquid_tint, stop:1 $liquid_bottom);\n"
+        "    color: $liquid_text;\n"
+        "}",
+        _SEG_PRESSED_NEW,
     ),
 )
 
@@ -902,6 +1226,9 @@ def upgrade_builtin_qss(path, stamp=QSS_STAMP, patches=_SKY_QSS_PATCHES):
       2. 至少有一条补丁的"旧写法"逐字命中；
       3. 读得到、写得动（任何 OSError 都静默放弃，皮肤写坏不该拖垮启动）。
     这样用户自己改过的 theme.qss 一律保持原样。
+
+    每条补丁自带幂等标记（详见 _SKY_QSS_PATCHES 的说明）：文件里已经出现
+    标记就跳过这条，所以 STAMP 升版本、整张表重跑也不会把增量规则追加两遍。
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -911,7 +1238,11 @@ def upgrade_builtin_qss(path, stamp=QSS_STAMP, patches=_SKY_QSS_PATCHES):
     if stamp in text:
         return False
     hit = False
-    for old, new in patches:
+    for item in patches:
+        old, new = item[0], item[1]
+        marker = item[2] if len(item) > 2 else new
+        if marker and marker in text:
+            continue                      # 这条已经打过了，别再来一遍
         if old in text:
             text = text.replace(old, new)
             hit = True

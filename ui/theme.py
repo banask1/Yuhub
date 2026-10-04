@@ -185,6 +185,134 @@ def glass_tile(color, radius=10, highlight=None):
     )
 
 
+def _parse_rgb(color):
+    """解析 `#rgb` / `#rrggbb` / `rgb()` / `rgba()`，返回 (rgb, alpha)。
+
+    解析不了返回 (None, None) —— 用户主题里可能写渐变、关键字色，
+    调用方必须能区分"解析失败"和"解析出来是黑色"。
+    """
+    if not color:
+        return None, None
+    s = str(color).strip()
+    if s.startswith("#"):
+        c = s[1:]
+        if len(c) == 3:
+            c = "".join(ch * 2 for ch in c)
+        if len(c) == 6:
+            try:
+                return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)), None
+            except ValueError:
+                return None, None
+    elif s.lower().startswith("rgba(") or s.lower().startswith("rgb("):
+        try:
+            inner = s[s.index("(") + 1:s.rindex(")")]
+            parts = [p.strip() for p in inner.split(",")]
+            alpha = parts[3] if len(parts) > 3 else None
+            return tuple(int(float(p)) for p in parts[:3]), alpha
+        except (ValueError, IndexError):
+            return None, None
+    return None, None
+
+
+def _shade(color, factor):
+    """把颜色整体压暗 / 提亮。支持 `#rrggbb` 与 `rgba(r,g,b,a)`。
+
+    解析不了（用户主题里写了渐变、关键字色之类）就原样返回 —— 调用方会
+    另想办法保证"按下"仍然看得出变化，不会因此崩掉整份 QSS。
+    """
+    if not color:
+        return color
+    rgb, alpha = _parse_rgb(color)
+    if rgb is None:
+        return color
+    out = tuple(max(0, min(255, int(round(v * factor)))) for v in rgb)
+    if alpha is None:
+        return "#%02x%02x%02x" % out
+    return "rgba(%d,%d,%d,%s)" % (out[0], out[1], out[2], alpha)
+
+
+def _mix(frm, to, t):
+    """把 `frm` 朝 `to` 混 `t`（0~1）。解析不了就原样返回 `frm`。"""
+    rgb, alpha = _parse_rgb(frm)
+    other, _ = _parse_rgb(to)
+    if rgb is None or other is None:
+        return frm
+    out = tuple(int(round(p + (q - p) * t)) for p, q in zip(rgb, other))
+    if alpha is None:
+        return "#%02x%02x%02x" % out
+    return "rgba(%d,%d,%d,%s)" % (out[0], out[1], out[2], alpha)
+
+
+def _luminance(color):
+    """0~1 的感知亮度（Rec.709 系数）；解析不了返回 None。"""
+    rgb, _ = _parse_rgb(color)
+    if rgb is None:
+        return None
+    r, g, b = (v / 255.0 for v in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _ring_color(fill, strength=0.72):
+    """键盘焦点环色：**跟填充色反着来**，保证任何色板下都看得见。
+
+    为什么不能统一用 `$accent`：主要按钮的常态边框**就是** accent，
+    而焦点规则只改边框颜色 → 在它身上 Δ=0（实测），键盘用户在这个按钮上
+    完全看不到焦点。所以按填充色的亮度挑方向 —— 暗填充配亮环、亮填充配暗环，
+    用户自制主题换个 accent 也自动成立。解析不了返回 None，调用方回退。
+    """
+    lum = _luminance(fill)
+    if lum is None:
+        return None
+    if lum < 0.62:
+        return _mix(fill, "#ffffff", strength)
+    return _mix(fill, "#000000", strength)
+
+
+def _pressed_shade(color, mode):
+    """"按住"用的深色档。
+
+    深色主题里 `accent_hover` 是**变亮**的（#3b82f6 → #5b98f8），亮色主题里
+    是变暗的。为了在两种模式下"按住"都比 hover 更进一步，这里统一往深处走：
+    深色主题压 14%（比 hover 的提亮明显区分开），亮色主题压 22%。
+    """
+    return _shade(color, 0.86 if mode == "dark" else 0.78)
+
+
+#: 液态玻璃上的文字往这个深色方向混、混多深。
+#: 实测：混 0.94 得到 #09172d 左右，压在深色主题下玻璃的实际呈色（约 #7e99c5，
+#: 由 tint #a1c3fb 以 alpha 196 压在侧栏底 #0e0e12 上）上是 4.51:1，
+#: 刚好过 WCAG AA 的正文线（4.5:1）。混 0.90 只有 4.27:1 —— 就差这一点，
+#: 13px 加粗在浅蓝上斜着看就会糊。
+_LIQUID_TEXT_DEEP = "#061020"
+_LIQUID_TEXT_T = 0.94
+
+
+def liquid_palette(palette=None):
+    """液态玻璃要用的 5 个色，推导规则与 `build_qss` 完全一致。
+
+    为什么单独开一个函数：`build_qss` 是往**色板副本**里注入这些键的
+    （和 accent_pressed / accent_ring 一样，避免污染 current()），所以
+    自绘的控件（侧栏指示条、开关轨道）从 `theme.current()` 里取不到它们。
+    两处各推一份的话迟早会不一致 —— 界面上就会出现"QSS 画的分段按钮"
+    和"自绘的侧栏指示条"不是同一种浅蓝。
+
+    返回 dict: tint / edge / text / top / bottom。
+    """
+    pal = current() if palette is None else palette
+    acc = pal.get("accent", "#3b82f6")
+    lift = 0.52 if _current_mode == "dark" else 0.34
+    tint = pal.get("liquid_tint") or _mix(acc, "#ffffff", lift)
+    return {
+        "tint": tint,
+        "edge": pal.get("liquid_edge") or _mix(acc, "#ffffff",
+                                                min(0.86, lift + 0.26)),
+        "text": pal.get("liquid_text") or _mix(acc, _LIQUID_TEXT_DEEP,
+                                               _LIQUID_TEXT_T),
+        "top": pal.get("liquid_top") or _mix(tint, "#ffffff", 0.36),
+        "bottom": pal.get("liquid_bottom") or _mix(tint, "#2a5c8f", 0.24),
+    }
+
+
 def resolve_theme(setting):
     """把 'system' 解析成实际的 'dark'/'light'（默认 dark）。"""
     if setting == "system":
@@ -294,22 +422,24 @@ QLabel#SidebarSection {
 
 QPushButton#SidebarButton {
     background: transparent;
-    border: none;
+    /* 1px 透明边框占位（内边距同步减 1px，总尺寸与原 `border: none` 一致）：
+       焦点环只需要换边框颜色就能生效，不会挤动布局。见 theme_packs.INTERACTION_QSS */
+    border: 1px solid transparent;
     border-radius: 5px;
     color: $text_dim;
     text-align: left;
-    padding: 10px 12px;
+    padding: 9px 11px;
     font-size: 13px;
     margin: 1px 10px;
 }
 QPushButton#SidebarButton:hover { background: $surface_hover; color: $text; }
-/* 选中态不画底：玻璃指示条（GlassPill）压在按钮下面，这里再刷底色
-   会把它糊掉。文字用 accent_text（白）——指示条本身是 accent 色的玻璃，
-   再用 accent 蓝字压上去会看不清（深色主题下实测几乎全糊）。 */
+/* 选中态不画底：液态玻璃指示条（GlassPill）压在按钮下面，这里再刷底色
+   会把它糊掉。文字要用**深色**（$liquid_text）——指示条已经改成浅蓝玻璃，
+   再压白字对比度只剩 1.9:1，基本读不清（深色主题下实测）。 */
 QPushButton#SidebarButton:checked {
     background: transparent;
-    border: none;
-    color: $accent_text;
+    border: 1px solid transparent;
+    color: $liquid_text;
     font-weight: 700;
 }
 
@@ -325,7 +455,10 @@ QFrame#Card[clickable="true"]:hover {
 }
 
 /* ---------- 文本 ---------- */
-QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; }
+/* 字距随字号走（大字收紧、小字放开）：21px 的标题按 0 字距会显得字与字之间
+   漏风；11px 的小字反而需要一点正字距才看得清。这是 emil 技能库里
+   apple-design 那节「tracking 是尺寸相关的、没有万能值」的落地。 */
+QLabel#PageTitle { font-size: 21px; font-weight: 800; color: $text; letter-spacing: -0.4px; }
 QLabel#PageSubtitle { font-size: 13px; color: $text_dim; }
 QLabel#CardTitle { font-size: 14px; font-weight: 700; color: $text; }
 QLabel#CardDesc { font-size: 12px; color: $text_dim; }
@@ -448,7 +581,10 @@ QPushButton#PrimaryButton {
     font-weight: 700;
 }
 QPushButton#PrimaryButton:hover { background: $accent_hover; border-color: $accent_hover; }
-QPushButton#PrimaryButton:pressed { background: $accent; }
+/* 按下态统一由文件末尾的 INTERACTION_QSS 定义，这里**不留**规则。
+   历史上一句 `:pressed { background: $accent }` 就写在这儿，和末尾那条
+   同优先级、只靠"后写的赢"兜底 —— 重排一次规则顺序就会静默失效
+   （按下跟常态一模一样），所以整条删掉。 */
 QPushButton#PrimaryButton:disabled {
     background: $surface_hover; border-color: $border_strong; color: $text_faint;
 }
@@ -629,13 +765,24 @@ QFrame#Segment {
 }
 QPushButton#SegmentButton {
     background: transparent;
-    border: none;
+    /* 同侧栏项：透明边框占位 + 内边距减 1px，给焦点环留位置而不改尺寸 */
+    border: 1px solid transparent;
     border-radius: 4px;
-    padding: 6px 14px;
+    padding: 5px 13px;
     color: $text_dim;
 }
 QPushButton#SegmentButton:hover { color: $text; background: $surface_hover; }
-QPushButton#SegmentButton:checked { background: $accent; color: $accent_text; font-weight: 700; }
+/* 选中段**自己不画底**：那块浅蓝液态玻璃由 ui/widgets.SegmentSlider 自绘，
+   并且会在切换时用弹簧从旧挡位滑到新挡位（qss 的 :checked 是瞬时换色，
+   既不能插值也做不出"滑块"）。这里只留文字色与字重，边框保持透明 ——
+   否则按钮的方角边框会压在玻璃片的圆角上，四个角露出直角。
+   （浅色主题里这块玻璃的对比度由 SegmentSlider.TINT_ALPHA 控制。） */
+QPushButton#SegmentButton:checked {
+    background: transparent;
+    color: $liquid_text;
+    border: 1px solid transparent;
+    font-weight: 700;
+}
 
 /* ---------- 弹窗 ---------- */
 QDialog {
@@ -649,7 +796,7 @@ QFrame#DialogFrame {
 }
 QFrame#DialogHeader { background: transparent; border: none; }
 QDialog QLabel { color: $text; background: transparent; }
-QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; background: transparent; }
+QLabel#DialogTitle { color: $text; font-size: 17px; font-weight: 800; background: transparent; letter-spacing: -0.3px; }
 QLabel#DialogSection {
     color: $text_dim;
     font-size: 11px;
@@ -723,6 +870,10 @@ QToolTip {
     padding: 6px 10px;
 }
 """
+    # 按下 / 键盘焦点态与 sky glass 模板**共用同一份文本**：
+    # 避免"内置那份补了、主题包那份忘了"的漏改（历史上侧栏选中态、
+    # 版本号贴片都是这么栽的）。见 theme_packs.INTERACTION_QSS。
+    + packs_mod.INTERACTION_QSS
 )
 
 
@@ -864,6 +1015,40 @@ def build_qss():
         pal.setdefault("arrow", "")
         pal.setdefault("arrow_hover", "")
         pal.setdefault("arrow_faint", "")
+
+    # "按住"色：色板里显式写了就用用户的，没写就按当前模式推导。
+    # 放在这里而不是写死进四套内置色板，是为了**用户自制主题也能自动拿到**
+    # 一档合理的按下色 —— 否则他们只改 accent 时，按下色会继承默认主题的蓝，
+    # 和他们的主色对不上（色板缺键会继承 DEFAULT_*，见 theme_packs.load_pack）。
+    mode = _current_mode
+    if not pal.get("accent_pressed"):
+        pal["accent_pressed"] = _pressed_shade(pal.get("accent", "#3b82f6"), mode)
+    if not pal.get("red_pressed"):
+        pal["red_pressed"] = _pressed_shade(pal.get("red", "#e5484d"), mode)
+    # 焦点环色：主要按钮的常态边框就是 accent，只用 accent 当环 = 看不见。
+    # 这里推导一个"跟填充反着来"的环色，用户自制主题也自动成立。
+    accent_ring = _ring_color(pal.get("accent", "#3b82f6"))
+    pal["accent_ring"] = accent_ring or pal.get("accent", "#3b82f6")
+
+    # ---- 液态玻璃色组（选中态） ----
+    # 用户的要求：选中效果"不要实心蓝，要浅蓝的液态玻璃"。所以底色从 accent
+    # 往白里提；**文字必须反过来往深里走** —— 浅蓝底（#a1c3fb 左右）上压白字
+    # 对比度只剩 1.9:1，基本读不清，而深藏蓝压上去有 4.5:1（AA 线）。
+    # 浅色主题混得少一些：底色本来就是浅灰，玻璃太淡会跟背景糊在一起。
+    _acc = pal.get("accent", "#3b82f6")
+    _lift = 0.52 if mode == "dark" else 0.34
+    if not pal.get("liquid_tint"):
+        pal["liquid_tint"] = _mix(_acc, "#ffffff", _lift)
+    if not pal.get("liquid_edge"):
+        pal["liquid_edge"] = _mix(_acc, "#ffffff", min(0.86, _lift + 0.26))
+    if not pal.get("liquid_text"):
+        pal["liquid_text"] = _mix(_acc, _LIQUID_TEXT_DEEP, _LIQUID_TEXT_T)
+    # 玻璃的竖向渐变两端：上端更亮（迎光），下端带一点深（厚度）
+    if not pal.get("liquid_top"):
+        pal["liquid_top"] = _mix(pal["liquid_tint"], "#ffffff", 0.36)
+    if not pal.get("liquid_bottom"):
+        pal["liquid_bottom"] = _mix(pal["liquid_tint"], "#2a5c8f", 0.24)
+
     if pk.qss:
         try:
             return Template(pk.qss).substitute(**pal)

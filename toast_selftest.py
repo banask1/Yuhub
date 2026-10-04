@@ -206,7 +206,12 @@ def _run_all(mark):
     W.show_toast(host2, "长命的底条", duration=FOREVER)
     pump(0.3)
     W.show_toast(host2, "短命的上条", duration=120)
-    pump(0.3)
+    # 这里只能等 50ms，不能等 300ms。原因：退场时长从 240ms 降到 170ms 之后，
+    # 一条 duration=120 的提示在 120+170=290ms 就已经彻底消失了 —— 等 300ms
+    # 再看，栈里只剩下那条长命的，本节想验的"两条同时在场 → 到期后补位"
+    # 就观测不到了（上一版正是这么挂的，报"另一窗口的栈里有 2 条 | 1"）。
+    # 注意这是**测试的时序假设**跟着实现变，不是实现出了问题。
+    pump(0.05)
     st2 = stack_of(host2)
     mark("另一窗口的栈里有 2 条", len(st2) == 2, len(st2))
     first_created = st2[1]
@@ -355,6 +360,100 @@ def _run_all(mark):
             len(stack_of(host3)) == W.TOAST_MAX, len(stack_of(host3)))
     finally:
         sys.excepthook = old_hook
+
+    # ================= I. 进出场：从下缘外面滑进来，沿同一条路回去 =================
+    # 改之前的行为：新提示**直接就位**，只有 opacity 从 0 到 1；而且进场 180ms、
+    # 退场 240ms —— 退场比进场慢，正好和"退出要快"反着来。两条都不抛异常、
+    # 不坏数据，只能靠几何断言守住。
+    from ui import motion
+
+    host4 = new_host()
+    calls = []
+    orig_slide = W._slide_to
+
+    def spy_slide(toast, target, ms=None, easing=None, start=None):
+        calls.append({
+            "target": (target.x(), target.y()),
+            "start": None if start is None else (start.x(), start.y()),
+            "ms": ms, "easing": easing,
+        })
+        return orig_slide(toast, target, ms=ms, easing=easing, start=start)
+
+    W._slide_to = spy_slide
+    try:
+        W.show_toast(host4, "进出场测试", duration=900)
+        pump(0.02)
+        st4 = stack_of(host4)
+        mark("进出场用例：提示已创建", len(st4) == 1, len(st4))
+        t4 = st4[0]
+        entry_start_y = calls[0]["start"][1] if (calls and calls[0]["start"]) else None
+        mark("★ 进场起点在窗口下缘之外（不再是瞬移到最终位置）",
+             entry_start_y is not None and entry_start_y >= HOST_H,
+             "起 y=%s 窗口高=%d" % (entry_start_y, HOST_H))
+        mark("★ 进场动画吃的是动效令牌里的时长（%d ms）" % motion.TOAST_IN,
+             bool(calls) and calls[0]["ms"] == motion.TOAST_IN,
+             calls[0]["ms"] if calls else "无")
+        mark("★ 进场用的是自定义贝塞尔曲线，不是内置枚举",
+             bool(calls) and calls[0]["easing"] in motion.curve_names(),
+             calls[0]["easing"] if calls else "无")
+
+        # 观测窗口必须落在"进场已结束"和"退场还没开始"之间：
+        # 进场 260ms、退场定时器 900ms，所以取 500ms。
+        # （第一版写成 duration=400 + pump(0.5)，量到的其实是**退场途中**的 y，
+        #   断言报 "y=700 期望=625" —— 一看就是把两段动画混在一起了。）
+        pump(0.5)
+        final_y = t4.y()
+        mark("进场结束后落到正常底部位",
+             abs(final_y - bottom_y(t4)) <= 1,
+             "y=%d 期望=%d" % (final_y, bottom_y(t4)))
+        mark("★ 进场确实位移了（起点 ≠ 落点）",
+             entry_start_y is not None and entry_start_y != final_y,
+             "%s -> %d" % (entry_start_y, final_y))
+
+        pump(0.85)      # 累加 ~1.37s > 900ms 退场定时器 + 170ms 退场动画
+        exits = [c for c in calls if c["ms"] == motion.TOAST_OUT]
+        mark("★ 退场动画吃的是令牌里的退场时长（%d ms）" % motion.TOAST_OUT,
+             bool(exits), [(c["ms"], c["easing"]) for c in calls[1:]])
+        if exits:
+            mark("★ 退场方向向下（与进场同一条边）",
+                 exits[0]["target"][1] > final_y,
+                 "落点 y=%d > 落点前 y=%d" % (exits[0]["target"][1], final_y))
+            mark("★ 退场落点 == 进场起点（进出严格对折，不是两条路线）",
+                 exits[0]["target"][1] == entry_start_y,
+                 "进场起 %s / 退场落 %s"
+                 % (entry_start_y, exits[0]["target"][1]))
+            mark("★ 退场水平位置不变（只往下走，不横移）",
+                 exits[0]["target"][0] == calls[0]["target"][0],
+                 (calls[0]["target"][0], exits[0]["target"][0]))
+        mark("★ 退场比进场快（慢的那一截留给用户决策，不留给系统收尾）",
+             motion.TOAST_OUT < motion.TOAST_IN,
+             "%d < %d" % (motion.TOAST_OUT, motion.TOAST_IN))
+        pump(0.4)
+    finally:
+        W._slide_to = orig_slide
+
+    # ---- 对照组：动效强度固定为「完整」—— 提示**永远**会滑入 ----
+    # v0.15beta 起不再有「减弱动效」档（用户要求"一直完整就行"），原先那套
+    # "减弱档下一个位移调用都没有"的对照组已经**没有对应的实现路径**了 ——
+    # 留着它就是一条永不执行的死断言（比没有更糟：它会一直亮着绿灯）。
+    # 改成守另一件事：不管什么时候问，reduced() 都必须是否，于是任何地方都
+    # 不会因为"读到减弱档"而静默跳过进场动画。
+    mark("★ 动效强度恒定：reduced() 永远为假（提示永远滑入）",
+         motion.reduced() is False, motion.reduced())
+    slide_calls = []
+    W._slide_to = lambda toast, target, ms=None, easing=None, start=None: (
+        slide_calls.append(target), orig_slide(toast, target, ms=ms,
+                                               easing=easing, start=start))[1]
+    try:
+        host5 = new_host()
+        W.show_toast(host5, "动效固定为完整", duration=FOREVER)
+        pump(0.35)
+        st5 = stack_of(host5)
+        mark("对照组：没有减弱档时提示照常出现", len(st5) == 1, len(st5))
+        mark("★ 对照组：进场确实走了一次位移（没有静默跳过的分支）",
+             bool(slide_calls), len(slide_calls))
+    finally:
+        W._slide_to = orig_slide
 
     w.close()
     flush()

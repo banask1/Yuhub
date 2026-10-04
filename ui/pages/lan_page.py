@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 import etier
 import lan_share
 import node_probe
+import screenshare
 from .. import theme
 from ..widgets import ghost_button, info_card, primary_button
 from .base_page import BasePage
@@ -586,8 +587,8 @@ class LanPage(BasePage):
         v.addWidget(self.members_box)
         return card
 
-    def _make_member_row(self, name, ip, is_self=False, game="", port=0):
-        """构造一行成员：色块 + 昵称 + IP + 游戏快连贴片 + 复制按钮。
+    def _make_member_row(self, name, ip, is_self=False, game="", port=0, ss=0):
+        """构造一行成员：色块 + 昵称 + IP + 游戏快连贴片 + 看屏幕 + 复制按钮。
 
         is_self 为真时高亮并标注"（我）"，方便用户一眼分清
         "哪个地址是我自己的"——填进游戏别填错了。
@@ -596,6 +597,9 @@ class LanPage(BasePage):
         当前下拉值，队友由昵称信标广播过来）。显示它是为了省掉"你玩的
         是哪个、端口多少"的来回问；点「复制」时也用他的端口拼地址，
         不再受我自己那个下拉的影响。
+
+        ss 是**这个人**在「屏幕共享」页开的服务端口（0 = 没在共享），
+        同样由信标广播过来。有它就有「看屏幕」按钮。
         """
         p = theme.current()
         row = QFrame()
@@ -650,6 +654,20 @@ class LanPage(BasePage):
 
         h.addStretch(1)
 
+        # 「看屏幕」：对方正在共享屏幕时才有。点击跳到屏幕共享页并直接连上
+        # ——地址用他的虚拟 IP，端口来自他广播的信标，观看码由房间码+密码
+        # 两边各自算，所以这里一个都不用用户输。
+        if ss and not is_self:
+            watch = QPushButton("看屏幕")
+            watch.setObjectName("MiniButton")
+            watch.setCursor(Qt.PointingHandCursor)
+            watch.setFixedHeight(26)
+            watch.setMinimumWidth(64)
+            watch.setToolTip("%s 正在共享屏幕，点这里看" % (name or ip))
+            watch.clicked.connect(
+                lambda _=False, a=ip, b=ss, c=name: self._watch_peer(a, b, c))
+            h.addWidget(watch)
+
         # 「复制」用标准 mini 尺寸：以前用 ghost_button + setFixedWidth(52)，
         # 而 ghost 样式自带 18px 左右内边距，52 宽留给文字的只有十几像素，
         # 两个字被挤成"显示不清楚"。MiniButton 的内边距是 2px 12px，够用。
@@ -671,7 +689,7 @@ class LanPage(BasePage):
     def _render_members(self, entries):
         """按 entries 重建成员行。
 
-        entries: [{"ip","name","self","game","port"}]。每次都整体重建而不是
+        entries: [{"ip","name","self","game","port","ss"}]。每次都整体重建而不是
         做差量更新：成员数量是个位数，重建几个小控件的开销可以忽略，
         换来的是"不会漏删/重影"。
         """
@@ -690,9 +708,49 @@ class LanPage(BasePage):
                 self._make_member_row(e.get("name", ""), e["ip"],
                                       is_self=bool(e.get("self")),
                                       game=e.get("game", ""),
-                                      port=int(e.get("port") or 0))
+                                      port=int(e.get("port") or 0),
+                                      ss=int(e.get("ss") or 0))
             )
         self.members_box.setVisible(bool(entries))
+
+    def _share_page(self):
+        """拿到屏幕共享页实例（两个页面是兄弟，都挂在主窗口的 _pages 上）。
+
+        用间接查找而不是互相持有引用：这两页在功能上没有从属关系，
+        为了一次跳转把它们绑死，会让任何一页的构造顺序都变成必须。
+        """
+        win = self.window()
+        pages = getattr(win, "_pages", None) if win is not None else None
+        return pages.get("share") if pages else None
+
+    def _watch_peer(self, ip, ss_port, name=""):
+        """跳到屏幕共享页并直接看某个成员的屏幕。
+
+        这一跳顺手把观看码也解决了：房间成员两边都用「房间码+密码」派生，
+        所以不用问用户要。拿不到屏幕共享页（不该发生）就如实说一声。
+        """
+        win = self.window()
+        page = self._share_page()
+        if page is None or not hasattr(page, "watch_peer"):
+            self.toast("屏幕共享页不可用")
+            return
+        switcher = getattr(win, "switch_page", None)
+        if callable(switcher):
+            switcher("share")
+        page.watch_peer(ip, ss_port,
+                        token=screenshare.room_view_token(),
+                        name=name)
+
+    def _publish_screenshare(self, port):
+        """屏幕共享页开/停共享时回调进来：把端口写进昵称信标广播出去。
+
+        队友收到这个键，成员行上就会多出/收起「看屏幕」按钮。
+        """
+        if self._beacon is not None:
+            try:
+                self._beacon.set_screenshare(port)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ 云盘
     def _build_share_card(self):
@@ -1713,6 +1771,10 @@ class LanPage(BasePage):
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        # 房间没了，屏幕共享那两个登记也一并撤掉（这个函数在换 IP 时也会走，
+        # 换完 IP 会在 _start_room_threads 末尾重新登记）。
+        screenshare.set_active_room()
+        screenshare.set_port_publisher(None)
 
     def _start_room_threads(self, ip):
         """按给定虚拟 IP 起「昵称信标 + 成员跟踪」这对后台线程。
@@ -1740,6 +1802,12 @@ class LanPage(BasePage):
         self._tracker.start()
         # 临时云盘与这一对同生共死（进房起、退房停、IP 变了重绑）
         self._ensure_share_hub(ip)
+        # 登记给屏幕共享：异地共享要绑虚拟 IP，观看码由「房间码+密码」派生。
+        # 放在这里而不是 _on_done，是因为虚拟 IP 变了也会重走这条路，
+        # 每次都要把最新的 IP 重新登记进去。
+        screenshare.set_active_room(self.code_edit.text().strip(),
+                                    self.pass_edit.text(), ip)
+        screenshare.set_port_publisher(self._publish_screenshare)
 
     def _on_stop(self):
         if self._etier_busy:
@@ -1776,6 +1844,16 @@ class LanPage(BasePage):
         # 先关云盘（此刻信标还在，能把"我关了云盘"广播出去），再停后台线程
         self._stop_share_hub()
         self._stop_room_threads()
+        # 异地共享是绑在虚拟网卡上的：房间一退，那张网卡就没了，共享也就
+        # 名存实亡。界面上却还显示"正在共享"，用户会以为队友还能看。
+        # 所以退房时顺手把它停掉（只在"共享的就是异地那条链路"时才停，
+        # 局域网共享不受影响）。
+        page = self._share_page()
+        if page is not None and hasattr(page, "stop_room_share"):
+            try:
+                page.stop_room_share()
+            except Exception:
+                pass
         self._set_running(False)
         self._set_status_note("")
         self._clear_members()
@@ -1924,7 +2002,8 @@ class LanPage(BasePage):
             # 自己永远排第一行——用户最常要复制的是自己的地址
             entries = [{"ip": ip,
                         "name": self._host_nick or self._current_nickname(),
-                        "self": True, "game": my_game, "port": my_port}]
+                        "self": True, "game": my_game, "port": my_port,
+                        "ss": 0}]          # 自己那行的「看屏幕」没有意义
             for m in members:
                 entries.append({
                     "ip": m["ip"],
@@ -1932,14 +2011,18 @@ class LanPage(BasePage):
                     "self": False,
                     "game": m.get("game") or "",
                     "port": int(m.get("port") or 0),
+                    "ss": int(m.get("ss") or 0),
                 })
             # 只在"行内容真的变了"时重建控件，否则每 800ms 重建一次会闪。
             # 签名必须带上昵称与游戏快连：队友中途换了游戏，他那行也得跟着
-            # 更新——只比 IP 的话，那一行会一直停在旧游戏上。
-            sig = [(e["ip"], e["name"], e.get("game", ""), int(e.get("port") or 0))
+            # 更新——只比 IP 的话，那一行会一直停在旧游戏上。ss 同理：
+            # 队友开始/停止共享屏幕，按钮得跟着出现/消失。
+            sig = [(e["ip"], e["name"], e.get("game", ""), int(e.get("port") or 0),
+                    int(e.get("ss") or 0))
                    for e in entries]
             old_sig = [(r.get("ip"), r.get("name"), r.get("game", ""),
-                        int(r.get("port") or 0)) for r in self._members_row]
+                        int(r.get("port") or 0), int(r.get("ss") or 0))
+                       for r in self._members_row]
             if sig != old_sig:
                 self._render_members(entries)
                 self._members_row = entries

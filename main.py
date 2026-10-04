@@ -18,16 +18,40 @@ import subprocess
 import sys
 import time
 
-from PySide6.QtCore import Qt, QLibraryInfo, QSettings, QTranslator
-from PySide6.QtGui import QIcon, QFont
-from PySide6.QtWidgets import QApplication
+# 启动耗时埋点：只在设了 YUHUB_BOOT_TRACE 时生效，写一行一条到
+# %TEMP%\yuhub_boot.txt。PyInstaller 单文件模式的解压发生在 Python 启动
+# **之前**，所以这里的时间轴是"解压完成之后"的；和外面 `time` 的差值
+# 就是解压本身的耗时。纯粹是排障用，不设环境变量时零开销。
+_T0 = time.time()
 
-from autostart import MINIMIZED_FLAG
-from single_instance import SingleInstance
-from ui import VERSION
-from ui import wheel_guard
-from ui.main_window import MainWindow, resource_path, init_theme_from_settings
-from ui.splash import SplashScreen
+
+def _bt(tag):
+    if not os.environ.get("YUHUB_BOOT_TRACE"):
+        return
+    try:
+        path = os.path.join(os.environ.get("TEMP", "."), "yuhub_boot.txt")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%7.2fs  %s\n" % (time.time() - _T0, tag))
+    except OSError:
+        pass
+
+
+_bt("main.py 开始执行")
+
+from PySide6.QtCore import Qt, QLibraryInfo, QSettings, QTranslator  # noqa: E402
+from PySide6.QtGui import QIcon, QFont  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_bt("PySide6 基础模块导入完成")
+
+from autostart import MINIMIZED_FLAG  # noqa: E402
+from single_instance import SingleInstance  # noqa: E402
+from ui import VERSION  # noqa: E402
+from ui import wheel_guard  # noqa: E402
+from ui.main_window import MainWindow, resource_path, init_theme_from_settings  # noqa: E402
+from ui.splash import SplashScreen  # noqa: E402
+
+_bt("全部顶层模块导入完成")
 
 # 装完的翻译对象必须留一个引用，否则会被 GC 掉、翻译当场失效
 _TRANSLATORS = []
@@ -468,6 +492,55 @@ def main():
         try:
             import toast_selftest
             sys.exit(toast_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- screenshare-selftest 模式：无窗口自检「屏幕共享」----
+    # 用法： Yuhub.exe --screenshare-selftest <结果json路径>
+    # 这一版屏幕共享是自研的轻量流（GDI 抓屏 + JPEG + TCP），随包**不带任何
+    # 额外二进制**，所以自检的重点也跟着换了：协议编解码与帧边界、观看码
+    # 校验、慢观看者丢旧帧、停止后端口/连接都收干净、窗口与显示器枚举，
+    # 以及「房间派生观看码」与 lan_share 口径一致（两处各写一遍哈希，
+    # 一旦有人改了其中一处，房间里的「看屏幕」就会静默连不上——这条断言
+    # 是那次事故的唯一防线）。
+    # 自检会在本地真的起一次服务并连一次自己（不联网、不要管理员权限）。
+    if "--screenshare-selftest" in sys.argv:
+        idx = sys.argv.index("--screenshare-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import screenshare_selftest
+            sys.exit(screenshare_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- hosts-elevated 模式：提权写 / 清 hosts（同样早返回） ----
+    # hostsaccel.run_elevated() 会用 ShellExecuteW("runas") 启动
+    # `Yuhub.exe --hosts-elevated <base64-json>`，在管理员权限下改完 hosts
+    # 把结果 JSON 原子写回。全程无窗口、不联网 —— 解析与测速都在普通进程。
+    if "--hosts-elevated" in sys.argv:
+        idx = sys.argv.index("--hosts-elevated")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import hostsaccel
+            sys.exit(hostsaccel.elevated_hosts_main(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- hosts-selftest 模式：无窗口自检「hosts 网络加速」----
+    # 用法： Yuhub.exe --hosts-selftest <结果json路径>
+    # 全部写盘断言都打在临时文件上，**绝不碰真实 hosts**、不联网、不弹 UAC。
+    if "--hosts-selftest" in sys.argv:
+        idx = sys.argv.index("--hosts-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import hostsaccel_selftest
+            sys.exit(hostsaccel_selftest.run(rest[0]))
         except Exception:
             sys.exit(5)
 

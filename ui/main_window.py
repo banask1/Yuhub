@@ -5,11 +5,11 @@ import sys
 import threading
 
 from PySide6.QtCore import (
-    Qt, QEvent, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect,
-    QRectF, QSettings, QTimer, Signal,
+    Qt, QEvent, QObject, QPoint, QPropertyAnimation, QRect,
+    QRectF, QSettings, QTimer, QVariantAnimation, QAbstractAnimation, Signal,
 )
 from PySide6.QtGui import (
-    QCursor, QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap,
+    QColor, QCursor, QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap,
 )
 from PySide6.QtWidgets import (
     QWidget,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QCheckBox,
     QStackedWidget,
     QApplication,
     QFrame,
@@ -24,17 +25,20 @@ from PySide6.QtWidgets import (
 )
 
 from . import glass
+from . import motion
 from . import theme
 from . import VERSION, VERSION_LABEL
 from .tray import TrayIcon, tray_available
-from .widgets import show_toast
+from .widgets import kb_focus, show_toast
 from .update_ui import UpdateChecker, UpdateAvailableDialog, UpdateProgressDialog
 from .pages.home_page import HomePage
 from .pages.cleaner_page import CleanerPage
 from .pages.memory_page import MemoryPage
 from .pages.download_page import DownloadPage
 from .pages.lan_page import LanPage
+from .pages.share_page import SharePage
 from .pages.uninstall_page import UninstallPage
+from .pages.accel_page import AccelPage
 from .pages.settings_page import SettingsPage
 
 RESIZE_MARGIN = 5
@@ -42,9 +46,42 @@ WINDOW_MARGIN = 6           # 圆角窗口四周的透明留白（极简风格�
 SIDEBAR_WIDTH = 216
 SIDEBAR_COLLAPSED = 76
 PILL_RADIUS = 8.0           # 侧栏选中指示条的圆角（玻璃片形状，见 GlassPill）
-PILL_BAR_WIDTH = 5          # 选中片左缘那道 accent 亮条的宽度
 PILL_INSET_X = 2            # 选中片距按钮左右各内缩多少（右多留 2px 给描边）
 PILL_INSET_Y = 1            # 选中片距按钮上下各内缩多少（越小越"厚"）
+
+# ---------------------------------------------------------------------------
+# 侧栏按钮的 hover 反馈（v0.15.4beta 起自绘）
+# ---------------------------------------------------------------------------
+# 为什么不用 QSS 的 `:hover`：**它在这个控件上根本不生效**。实测
+# `QStyleOptionButton.state & State_MouseOver` 恒为 False（鼠标确实在按钮上、
+# `underMouse()` 为 True、`WA_Hover` 也为 True，就是不给 MouseOver 位），
+# 真机截屏 hover 前后逐像素零差异 —— 也就是用户报的「鼠标移上去没有动画」。
+# 同一个窗口里，标题栏按钮只要不叫 `SidebarButton` 就是好的，改名成
+# `SidebarButton` 立刻变坏，属于 Qt QSS 侧的坑，不深挖。
+#
+# 于是 hover 反馈改成**自绘**：一层比选中片淡得多的浅蓝液态玻璃膜，
+# 从两侧"收着"弹簧铺开（果冻感），同时文字由 dim 提到正常亮度。
+#   HOVER_TINT_ALPHA —— 膜的实心度。选中片是 196，这里只给 92：
+#                       hover 是"鼠标在这里"，选中是"你在这页"，两者不能一样重。
+#   HOVER_RADIUS     —— 与选中片同半径，让两个片是同一套形状语言。
+#   HOVER_SPREAD     —— 起点比终点窄的像素数（弹簧铺开的行程）。
+HOVER_TINT_ALPHA = 92
+HOVER_RADIUS = 8.0
+HOVER_SPREAD = 7.0
+# 液态玻璃的两个观感参数（v0.15beta 起选中指示条改液态玻璃）：
+#   LIQUID_REFRACT    —— 背景快照放大倍率，做"透过厚玻璃看"的透镜位移。
+#                        1.05 在 200px 宽的指示条上是边缘偏 5px，看得出来但不
+#                        夸张；再大背后的纹理就会明显错位。
+#   LIQUID_TINT_ALPHA —— 浅蓝底的实心度。196(77%) 是"够亮、能压住深色侧栏，
+#                        又还剩 23% 背景透出来"的平衡点，也是文字对比度
+#                        能到 4.5:1 的前提（见 theme._LIQUID_TEXT_T 的说明）。
+LIQUID_REFRACT = 1.05
+LIQUID_TINT_ALPHA = 196
+
+#: 切页时页面从下方弹入的起始偏移（px）。给 12px 而不是 40px：侧栏导航是
+#: "一天几十次"的频次档，位移大了几十次之后就变烦。这一点位移只是让切换
+#: "有落点"，不是表演。
+PAGE_ENTER_DY = 12
 
 NAV_ITEMS = [
     ("home", "🏠", "首页"),
@@ -52,7 +89,9 @@ NAV_ITEMS = [
     ("memory", "🧠", "内存优化"),
     ("uninstall", "🗑️", "软件卸载"),
     ("download", "⬇️", "多线程下载"),
+    ("share", "📡", "屏幕共享"),
     ("lan", "🌐", "异地联机"),
+    ("accel", "🚀", "Steam加速"),
     ("settings", "⚙️", "设置中心"),
 ]
 
@@ -63,7 +102,9 @@ NAV_TINTS = {
     "memory": "tile_7",
     "uninstall": "tile_6",
     "download": "tile_5",
+    "share": "tile_8",
     "lan": "tile_2",
+    "accel": "tile_5",
     "settings": "tile_4",
 }
 
@@ -104,6 +145,29 @@ def init_theme_from_settings(settings):
     theme.set_theme(theme.resolve_theme(settings.value("theme", "dark")))
 
 
+def _mix_hex(a, b, t):
+    """在两个颜色之间线性插值（t=0 取 a、t=1 取 b），返回 #rrggbb。
+
+    用 QColor 解析是为了兼容主题包里可能写的 `rgba(...)` / 颜色名；
+    `a` 解析不出来时原样返回（宁可不动，也不要抛异常把绘制打断）。
+    """
+    ca = QColor(str(a))
+    if not ca.isValid():
+        return str(a)
+    cb = QColor(str(b))
+    if not cb.isValid():
+        cb = ca
+    try:
+        k = min(1.0, max(0.0, float(t)))
+    except (TypeError, ValueError):
+        k = 0.0
+    return QColor(
+        int(round(ca.red() + (cb.red() - ca.red()) * k)),
+        int(round(ca.green() + (cb.green() - ca.green()) * k)),
+        int(round(ca.blue() + (cb.blue() - ca.blue()) * k)),
+    ).name()
+
+
 class NavButton(QPushButton):
     """侧栏导航按钮：极简色块模式是纯色小方块；玻璃主题是拟物玻璃贴片。"""
 
@@ -115,10 +179,136 @@ class NavButton(QPushButton):
         self._icon = icon
         self._label = text
         self._tint_key = NAV_TINTS.get(key, "tile_1")
+        # hover 膜的进度（0=不显示，1=完全铺开）。QSS 的 :hover 在本控件上
+        # 无效（见 HOVER_TINT_ALPHA 上方的说明），反馈全靠这个值自绘。
+        self._hover_t = 0.0
+        # 上一次写进 QLabel 的提亮程度（-1 = 还没写过，保证首次一定生效）
+        self._label_tint_k = -1.0
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(motion.HOVER)
+        # 弹簧而不是直线：膜"冲过头一点再坐稳"才有果冻感（用户 2026-10-04
+        # 确认要 Q 弹手感，且不要强度档位）。用与侧栏选中片**同一条**曲线
+        # (CURVE_SPRING，16% 过冲)，两处动作才像同一个系统里的东西。
+        # 过冲只会让膜更宽：起点两侧各留 HOVER_SPREAD(7px)，16% 最坏也只吃掉
+        # 1.1px，绝不会冒出按钮边界（`_hover_rect` 还有一道最小尺寸兜底）。
+        self._hover_anim.setEasingCurve(motion.curve(motion.CURVE_SPRING))
+        self._hover_anim.valueChanged.connect(self._on_hover_value)
         theme.bus.changed.connect(lambda _: self._refresh())
         # 选中态变化时也要刷新（玻璃贴片选中时描边换成主题色）
         self.toggled.connect(lambda *_: self._refresh())
         self.set_expanded(True)
+
+    # -- hover 反馈（自绘） --------------------------------------------------
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._animate_hover(1.0)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._animate_hover(0.0)
+
+    def changeEvent(self, event):
+        """窗口失去焦点时把 hover 淡出。
+
+        不处理的话会残留一层膜：鼠标停在按钮上时 Alt+Tab 切走，Qt 不会再发
+        Leave（鼠标没动），回到窗口时鼠标早就不在按钮上了，膜就一直挂在
+        那一行上。
+        """
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.ActivationChange
+                and not self.isActiveWindow() and self._hover_t > 0.0):
+            self._animate_hover(0.0)
+
+    def _animate_hover(self, target):
+        running = (self._hover_anim.state()
+                   == QAbstractAnimation.State.Running)
+        if running:
+            # 已经在往同一个目标跑就别重启 —— 重启会让弹簧从当前位置
+            # 重新起步，连续进出时看着像"抖一下"。
+            try:
+                if abs(float(self._hover_anim.endValue()) - target) < 0.001:
+                    return
+            except (TypeError, ValueError):
+                pass
+        elif abs(self._hover_t - target) < 0.002:
+            return                        # 已经在位，别白跑一次动画
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(float(self._hover_t))
+        self._hover_anim.setEndValue(float(target))
+        self._hover_anim.start()
+
+    def _on_hover_value(self, value):
+        self._hover_t = float(value)
+        self._tint_labels()
+        self.update()
+
+    def _tint_labels(self):
+        """hover 时把文字从 dim 提到正常亮度。
+
+        文字是 QLabel 子控件，颜色只能自己给 —— QSS 的
+        `QPushButton#SidebarButton:hover { color: $text }` 改的是按钮自己的
+        文字（本控件 `setText("")`，没有文字），根本轮不到子控件。
+
+        k 回到 0 时**把 color 整个去掉**（而不是设成某个"接近原来的"颜色）：
+        不带 color 的样式表会让 QLabel 回落到调色板，跟没 hover 过一样，
+        不会出现"hover 一次之后文字颜色就永久变了"。
+        """
+        if not hasattr(self, "_text_lbl"):
+            return
+        k = min(1.0, max(0.0, self._hover_t))
+        # 变化太小就不重设样式表 —— setStyleSheet 会触发一次 repolish，
+        # 动画期间每帧都设一次纯属白烧。
+        if abs(k - self._label_tint_k) < 0.03 and not (
+                k <= 0.001 and self._label_tint_k > 0.0):
+            return
+        self._label_tint_k = k
+        base = "font-size: 13px; background: transparent;"
+        if k <= 0.001:
+            self._text_lbl.setStyleSheet(base)
+            return
+        cur = theme.current()
+        color = _mix_hex(cur.get("text_dim", "#8a90a0"),
+                         cur.get("text", "#f2f4f8"), k)
+        self._text_lbl.setStyleSheet(base + " color: %s;" % color)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        t = self._hover_t
+        # 选中项不画：那一行已经有液态玻璃选中片了，再叠一层是同色加重，
+        # 反而看不清"当前在哪一页"。
+        if t <= 0.004 or self.isChecked():
+            return
+        r = self._hover_rect(t)
+        if r is None:
+            return
+        liq = theme.liquid_palette()
+        # 弹簧曲线会过冲到 1.08：膜的位置可以让它冲，**透明度不能** ——
+        # alpha 超过 255 会被 rgba() 截断成奇怪的颜色。
+        k = min(1.0, t)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        glass.paint_liquid_glass(
+            p, r, radius=HOVER_RADIUS,
+            tint=liq["tint"], edge=liq["edge"],
+            tint_alpha=int(HOVER_TINT_ALPHA * k),
+            gloss_alpha=int(72 * k),
+            top_alpha=int(112 * k),
+            border_alpha=int(98 * k),
+            # 外发光 / 光晕一律给 0：那是"选中片"的重量，hover 只要一层薄膜。
+            glow_alpha=0, glow_thickness=0,
+            chroma_alpha=int(38 * k),
+            shade_alpha=int(24 * k), shade_thickness=8)
+        p.end()
+
+    def _hover_rect(self, t):
+        """hover 膜的形状：内缩与选中片一致，起点从两侧再收 HOVER_SPREAD。"""
+        g = QRectF(self.rect())
+        spread = HOVER_SPREAD * (1.0 - float(t))
+        r = g.adjusted(PILL_INSET_X + spread, PILL_INSET_Y,
+                       -(PILL_INSET_X + 2.0 + spread), -PILL_INSET_Y)
+        if r.width() <= 6.0 or r.height() <= 4.0:
+            return None
+        return r
 
     def _refresh(self):
         cur = theme.current()
@@ -139,6 +329,9 @@ class NavButton(QPushButton):
             self._dot.setStyleSheet(
                 f"background: {color}; border: none; border-radius: 3px;"
             )
+        # 主题换了 → 文字提亮的基准色也跟着换（`_tint_labels` 会重算）
+        self._label_tint_k = -1.0
+        self._tint_labels()
 
     def set_expanded(self, expanded):
         if self.layout() is None:
@@ -463,8 +656,13 @@ class GlassPill(QFrame):
         self._src = glass.BackdropSource()
         self._relayout = None
         self._anim = QPropertyAnimation(self, b"geometry", self)
-        self._anim.setDuration(230)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        # 面板在两个位置之间挪位 —— 用**弹簧曲线**：冲过目标 16%、弹回一点、
+        # 停稳。直线滑过去像"被搬过去"，弹簧才像"有质量的东西撞上去"（用户
+        # 要的"Q弹果冻感"）。过冲体现在 x 上：起点终点宽度相同，插值里
+        # width 恒定，只有 x 会短暂越过目标再回来。
+        # 时长见动效令牌（motion.PILL = 300ms，过冲峰值落在 147ms）。
+        self._anim.setDuration(motion.PILL)
+        self._anim.setEasingCurve(motion.curve(motion.CURVE_SPRING))
         if parent is not None:
             parent.installEventFilter(self)
         self.hide()
@@ -513,8 +711,10 @@ class GlassPill(QFrame):
         r = self.rect()
         if r.width() <= 2 or r.height() <= 2:
             return
-        cur = theme.current()
-        accent = cur.get("accent", "#3b82f6")
+        r = self.rect()
+        if r.width() <= 2 or r.height() <= 2:
+            return
+        liq = theme.liquid_palette()
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
 
@@ -523,45 +723,60 @@ class GlassPill(QFrame):
 
         # 0) 先把整块绘制裁到"圆角玻璃片"的形状里。
         #    血泪：这个控件原来不裁剪，而背景快照是**整块矩形** drawPixmap 上去的，
-        #    于是圆角之外那四个小三角没被玻璃面（accent 薄纱 + 反光）盖住，
-        #    露出的是"没染色的裸背板"——用户看到的就是
-        #    「选中效果蓝色四角周围没有毛玻璃」。裁进 path 之后，角上什么都不画，
-        #    底下侧栏自己的玻璃自然透出来，四角就接上了。
+        #    于是圆角之外那四个小三角没被玻璃面盖住，露出的是"没染色的裸背板"
+        #    ——用户看到的就是「选中效果蓝色四角周围没有毛玻璃」。裁进 path 之后，
+        #    角上什么都不画，底下侧栏自己的玻璃自然透出来，四角就接上了。
         p.setClipPath(face_path, Qt.IntersectClip)
 
-        # 1) 模糊背景
+        # 1) 背后纹理的模糊版 + 轻微折射（透镜）
         snap = None
         bd = self._backdrop()
         if bd is not None:
             tl = glass.widget_origin(self, bd)
             snap = self._src.snapshot(bd, QRect(tl, self.size()), radius=12,
                                       stamp=getattr(bd, "version", 0))
-        if snap is not None:
-            p.drawPixmap(0, 0, snap)
+        glass.draw_snapshot(p, r, snap, refract=LIQUID_REFRACT)
 
-        # 2) 玻璃面（accent 薄纱 + 对角反光 + 高光边）。
-        #    这一处的光泽是整窗最强的：选中项就得像一块被点亮的玻璃。
-        #    浅色主题底下是浅灰，玻璃要比底更亮 + accent 染色更实才看得清。
-        #    matte_alpha 比 v0.10beta 又提高了一档：用户反馈蓝色选中"太细"，
-        #    淡化会让它更接近周围的浅灰，观感上就是"很薄的一层"。
-        tint, gloss, _dim = glass.glass_params(cur)
-        light = not glass.is_dark(cur)
-        glass.paint_glass(p, face, radius=PILL_RADIUS,
-                          tint="#ffffff", tint_alpha=max(20, tint),
-                          gloss_alpha=max(112, gloss),
-                          top_alpha=176,
-                          border_alpha=120, inner_alpha=52,
-                          matte=accent, matte_alpha=205 if light else 188)
-        # 3) 左缘一道 accent 亮条，指示"当前所在"。
-        #    宽度原来只有 3px，在 216px 宽的侧栏上就是一根头发丝，用户报
-        #    「蓝色选中效果太细了」。现在给到 PILL_BAR_WIDTH(5px)，并且上下
-        #    留白同步收窄，让它看起来是"一条实心的色条"而不是一根细线。
-        bar = QRect(face.left() + 2, face.top() + 5, PILL_BAR_WIDTH,
-                    max(1, face.height() - 10))
-        p.setPen(Qt.NoPen)
-        p.setBrush(glass.rgba(accent, 245))
-        p.drawRoundedRect(bar, PILL_BAR_WIDTH / 2.0, PILL_BAR_WIDTH / 2.0)
+        # 2) 浅蓝液态玻璃面。
+        #    v0.15beta：用户要求「选中的特效不要蓝色，要浅蓝的液态玻璃」。
+        #    原来是往模糊背景上糊一层 accent 深蓝薄纱（matte=accent），现在整块
+        #    换成液态玻璃 —— 浅蓝底 + 强对角反光 + 14px 内侧光带 + 左右色散边。
+        #    可以理解为"毛玻璃换成了更厚、会掰光的那块玻璃"。
+        glass.paint_liquid_glass(
+            p, face, radius=PILL_RADIUS,
+            tint=liq["tint"], edge=liq["edge"],
+            tint_alpha=LIQUID_TINT_ALPHA,
+            gloss_alpha=128, top_alpha=200, border_alpha=152,
+            glow_alpha=120, glow_thickness=14,
+            chroma_alpha=88, shade_alpha=66, shade_thickness=10)
+        # 3) 左缘**不再**画实心 accent 条：浅蓝玻璃自己靠"上/左光带 + 左缘
+        #    青色散"指示方向，再压一根深蓝实心条就回到用户否掉的那个样子了。
         p.end()
+
+
+class _PageHost(QWidget):
+    """页面的包装层 —— 让「切页位移」能动起来。
+
+    为什么必须多这一层：`QStackedWidget` 用 `QStackedLayout` 管理子控件，
+    布局每次 activate 都会把当前页的 geometry 设回 (0, 0, w, h)。**直接动
+    页面自己的 pos，位移会被布局重置** —— 现象是"动画压根没跑"，而代码
+    看起来完全正确（这是本项目在毛玻璃那轮踩过的同类坑：Qt 里凡是"布局管着
+    的几何"，手动改都只活到下一次 activate）。
+
+    所以加一层：host 由 QStackedLayout 管（老老实实待在 0,0），页面放进 host
+    内部的布局里铺满。切页时动 **host 的 pos**，就绕开了布局那关。
+
+    `sizeHint` 不用转发：host 内部有真布局（QVBoxLayout），页面参与布局计算，
+    QStackedWidget 的最小尺寸自然会把它算进去。
+    """
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self.page = page
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(page)
 
 
 class MainWindow(QWidget):
@@ -593,6 +808,7 @@ class MainWindow(QWidget):
 
         self._override_cursor_active = False
         self._pages = {}
+        self._hosts = {}                # key -> _PageHost（页面外面那层包装）
         self._nav_buttons = {}
         self._sidebar_collapsed = False
 
@@ -910,7 +1126,9 @@ class MainWindow(QWidget):
             "memory": make(MemoryPage),
             "uninstall": make(UninstallPage),
             "download": make(DownloadPage),
+            "share": make(SharePage),
             "lan": make(LanPage),
+            "accel": make(AccelPage),
             "settings": SettingsPage(
                 notify=self.notify,
                 theme_setting=self.theme_setting,
@@ -925,10 +1143,30 @@ class MainWindow(QWidget):
                 tray_available=self.tray_available,
             ),
         }
-        for page in self._pages.values():
-            self.stack.addWidget(page)
+        # 每页套一层 host：切页时动 host 的 pos 做"弹入"。
+        # （为什么不能直接动页面自己的 pos，见 _PageHost 的说明。）
+        for key, page in self._pages.items():
+            host = _PageHost(page)
+            self._hosts[key] = host
+            self.stack.addWidget(host)
 
         self._pages["home"].navigate.connect(self.switch_page)
+        self._apply_keyboard_focus()
+
+    def _apply_keyboard_focus(self):
+        """全窗按钮 / 复选框统一改成「只有 Tab 进来才拿焦点」。
+
+        为键盘焦点环服务（见 theme_packs.INTERACTION_QSS 与 widgets.kb_focus）：
+        不加这一层的话，鼠标点过的按钮会一直亮着主题色描边，看起来像"选中了"。
+
+        放在窗口级做一次遍历，是因为各页面里还有大量就地 new 出来的按钮
+        （MiniButton、标题栏三个窗口按钮、设置页的一堆开关行……），
+        逐个改容易漏；这里一次全包住，新增页面也自动生效。
+        """
+        for w in self.findChildren(QPushButton):
+            kb_focus(w)
+        for w in self.findChildren(QCheckBox):
+            kb_focus(w)
 
     def _build_tray(self):
         """建立托盘图标。
@@ -1099,20 +1337,100 @@ class MainWindow(QWidget):
         if key not in self._pages:
             return
         page = self._pages[key]
-        self.stack.setCurrentWidget(page)
+        host = self._hosts.get(key)
+        if (key == getattr(self, "_current_nav", None)
+                and host is not None
+                and host is self.stack.currentWidget()):
+            # 重复点当前页：只补齐选中态，不重放动画（连点会闪）。
+            # 注意判据里必须带上 _current_nav —— 首次进入时 QStackedWidget
+            # 的 currentWidget() 已经是最先 addWidget 的那一页（首页），
+            # 只看 currentWidget() 会把启动这一次也吞掉，
+            # 结果是"首页按钮不高亮、首页的 on_shown 不触发"。
+            if key in self._nav_buttons:
+                self._nav_buttons[key].setChecked(True)
+            return
+        self.stack.setCurrentWidget(host if host is not None else page)
         self._current_nav = key
         if key in self._nav_buttons:
             self._nav_buttons[key].setChecked(True)
-        # 玻璃指示条滑到新位置（切换动画就发生在这里）
+        # 玻璃指示条弹到新位置（切换动画就发生在这里）
         pill = getattr(self, "_nav_pill", None)
         if pill is not None:
             pill.refresh_geometry(animate=True)
+        self._animate_page_in(host, page)
         # 通知页面已切到前台（用于惰性初始化 / 自动刷新）
         if hasattr(page, "on_shown"):
             try:
                 page.on_shown()
             except Exception:
                 pass
+
+    def _animate_page_in(self, host, page):
+        """页面切换：整体从下方弹入（轻弹）+ 页面淡入。
+
+        位移只给 PAGE_ENTER_DY(12px)、过冲只 8%（CURVE_SPRING_SOFT）：侧栏
+        导航是"一天几十次"的频次档，按 Emil 的动效决策框架应当克制。真正承担
+        "我现在在哪一页"这个空间信息的是侧栏那条**弹簧**指示条；内容再大幅晃动
+        就是重复表达，几十次之后就变烦了。这一点位移只是让切换"有落点"。
+
+        两个必须做对的点：
+          1) 淡入要在**同步**阶段就压到 0。否则 setCurrentWidget 之后那一帧
+             页面是全不透明的 —— 用户先看到它整个出现、再看到它淡入，像是闪了
+             一下。
+          2) 位移必须**延后一拍**再起。QStackedLayout 在 setCurrentWidget 时
+             投递了 LayoutRequest，它会在下一轮事件处理里把 host 的 geometry
+             设回 (0,0) —— 当场 move 出去的位移会被它覆盖掉。
+
+        一个必须收尾的细节：QGraphicsOpacityEffect 会让整棵子树每帧先渲染到
+        离屏缓冲，**装上去就一直在收费**。动画一结束必须摘掉，否则页面日常重绘
+        （内存页的曲线、联机页的日志）都会被白扣一笔。
+        """
+        if motion.reduced():
+            return
+        try:
+            motion.fade_effect(page).setOpacity(0.0)
+        except RuntimeError:
+            return
+        QTimer.singleShot(0, lambda: self._slide_page_in(host, page))
+
+    def _slide_page_in(self, host, page):
+        """延后一拍真正起动画（这时布局已经把 host 摆好了）。"""
+        if page is None or host is None:
+            return
+        try:
+            anim = motion.fade(page, 1.0, motion.NAV,
+                               easing=motion.CURVE_OUT)
+            slide = QPropertyAnimation(host, b"pos", host)
+            slide.setDuration(motion.PAGE_IN)
+            slide.setEasingCurve(motion.curve(motion.CURVE_SPRING_SOFT))
+            slide.setStartValue(QPoint(0, PAGE_ENTER_DY))
+            slide.setEndValue(QPoint(0, 0))
+            host.move(0, PAGE_ENTER_DY)
+            slide.start()
+            # 两个动画都要保引用：QPropertyAnimation 被 GC 会静默停在半路
+            self._page_fade = anim
+            self._page_slide = slide
+            anim.finished.connect(
+                lambda a=anim, p=page: QTimer.singleShot(
+                    0, lambda: self._end_page_fade(p, a)))
+        except RuntimeError:
+            return
+
+    def _end_page_fade(self, page, anim):
+        """淡入结束：先停掉并释放动画，再摘掉特效。
+
+        顺序不能反：动画的 target 就是那个特效对象，特效先被删的话，
+        动画下一次 tick 会碰到已析构的 C++ 对象（本项目在 Toast 上已经
+        抓过三次同类崩溃）。
+        """
+        try:
+            if anim is not None:
+                anim.stop()
+                anim.deleteLater()
+            if page is not None:
+                page.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
 
     def notify(self, text):
         show_toast(self, text)
