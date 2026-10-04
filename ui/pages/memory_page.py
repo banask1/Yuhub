@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import theme
-from ..widgets import ToggleSwitch, primary_button, usage_color
+from ..widgets import SegmentSlider, ToggleSwitch, primary_button, usage_color
 from .base_page import BasePage
 import memopt
 
@@ -193,6 +193,8 @@ class IntervalPicker(QFrame):
             "自己指定间隔（%d ~ %d 分钟）" % (MIN_MINUTES, MAX_MINUTES))
         self.btn_custom.clicked.connect(self._pick_custom)
         seg_lay.addWidget(self.btn_custom)
+        # 挡位切换的滑动选中片（浅蓝液态玻璃，弹簧滑过去）
+        self.slider = SegmentSlider(seg)
         row.addWidget(seg, 1)
 
         self.spin = QSpinBox()
@@ -226,9 +228,21 @@ class IntervalPicker(QFrame):
             self._custom = bool(custom)
             if self.spin.value() != m:
                 self.spin.setValue(m)
+            # ⚠️ 必须"先全清、再点亮唯一一个"：`QPushButton` 被点一下时是
+            # **先翻自己的 checked、再 emit clicked**（业务逻辑才在 clicked
+            # 里取消旧按钮），所以这里如果按"新按钮先 True、旧按钮后 False"
+            # 写，中间态会同时有两个 checked —— 滑动选中片据此算出的目标
+            # 是**旧的**那个框，动画就被"目标没变"判据吃掉了（用户反馈的
+            # 「点自定义要双击才出现切换动画」）。
             for value, btn in self._buttons:
-                btn.setChecked((not self._custom) and value == m)
-            self.btn_custom.setChecked(self._custom)
+                if btn.isChecked():
+                    btn.setChecked(False)
+            if self.btn_custom.isChecked() != self._custom:
+                self.btn_custom.setChecked(self._custom)
+            if not self._custom:
+                for value, btn in self._buttons:
+                    if value == m:
+                        btn.setChecked(True)
             self.spin.setEnabled(self._custom)
         finally:
             self._guard = False
@@ -290,6 +304,8 @@ class ThresholdPicker(QFrame):
                 lambda _=False, v=value: self.set_percent(v))
             seg_lay.addWidget(b)
             self._buttons.append((value, b))
+        # 过载阈值挡位同样用滑动选中片
+        self.slider = SegmentSlider(seg)
         row.addWidget(seg)
         row.addStretch(1)
 
@@ -310,8 +326,15 @@ class ThresholdPicker(QFrame):
         self._percent = p
         self._guard = True
         try:
+            # 先全部清掉、再点亮唯一那一个：互斥组不能有"两个同时选中"的
+            # 中间态，否则滑动选中片会拿旧的框当目标（详见 SegmentSlider
+            # ._target_rect 的说明）。
             for value, btn in self._buttons:
-                btn.setChecked(value == p)
+                if value != p:
+                    btn.setChecked(False)
+            for value, btn in self._buttons:
+                if value == p:
+                    btn.setChecked(True)
         finally:
             self._guard = False
         if emit:

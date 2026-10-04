@@ -62,6 +62,211 @@ def rgba(color, alpha):
     return c
 
 
+def mix(c1, c2, t):
+    """两色线性混合：t=0 取 c1，t=1 取 c2。解析不了就返回 c1。
+
+    用来从主题的 accent 推导"浅蓝"——直接写死一个浅蓝会在用户换主题包时
+    变成一块跟整体配色无关的色块。
+    """
+    a = qcolor(c1, "#3b82f6")
+    b = qcolor(c2, "#ffffff")
+    k = max(0.0, min(1.0, float(t)))
+    return QColor(
+        int(round(a.red() + (b.red() - a.red()) * k)),
+        int(round(a.green() + (b.green() - a.green()) * k)),
+        int(round(a.blue() + (b.blue() - a.blue()) * k)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 液态玻璃
+# ---------------------------------------------------------------------------
+# 与「毛玻璃」的区别在**光学层次**：毛玻璃的核心是"背后的东西被糊掉了"，
+# 液态玻璃的核心是**边缘**——一圈有厚度的光带 + 极淡的色散，看起来像一块
+# 能把光掰弯的实体。
+#
+# 参考实现 Kyant0/AndroidLiquidGlass 的 drawBackdrop 一共叠了这些东西：
+#   vibrancy()            提饱和     -> 本项目不做（逐像素，代价不值）
+#   blur(2dp)             轻模糊     -> 复用 blur_pixmap
+#   lens(12dp, 24dp)      边缘折射   -> 见 paint_liquid_refract
+#   Highlight.Ambient     环境高光   -> 对角反光 + 顶部高光线
+#   InnerShadow(4dp)      内阴影     -> 下/右内侧暗带（让玻璃"鼓"起来）
+#   chromaticAberration   色散       -> 青 / 品红各一条细边
+#
+# 缩放值（1.04 折射、13px 光带、54 色散）都是按本项目控件尺寸调的：侧栏
+# 指示条高 34px 左右，光带超过 15px 就会把整块染成一片白。
+
+LIQUID_TINT_FALLBACK = "#9ecbff"
+#: 色散用的两条边：左缘偏青、右缘偏品红。固定值 —— 色散是"白光被掰开"
+#: 的结果，跟主题色无关（换成绿色主题，玻璃边缘该有色散还是有）。
+CHROMA_COOL = QColor("#79e2ff")
+CHROMA_WARM = QColor("#ff9ad8")
+
+
+def liquid_colors(palette):
+    """液态玻璃的色组（浅蓝）。
+
+    用户的要求是"选中效果不要原来那种实心蓝，要浅蓝的液态玻璃"。所以这里
+    不直接用 accent 本色，而是把它往白里提两档：
+
+        tint   混 52% 白 —— 玻璃底色，浅蓝
+        edge   混 74% 白 —— 边缘光带色，接近白
+
+    这样用户换主题包时，选中效果仍然是"同一色系的浅色玻璃"，不会突然冒出
+    一块跟整体配色无关的蓝。
+
+    优先读色板里的 `liquid_tint` / `liquid_edge`（theme.build_qss 注入的
+    就是这一套，保证 QSS 画的分段按钮和自绘的指示条是同一种浅蓝）；
+    色板里没有才现推。
+
+    返回 (tint, edge, chroma_a, chroma_b)。
+    """
+    p = palette or {}
+    accent = p.get("accent") or "#3b82f6"
+
+    def _pick(key, t):
+        c = QColor(p.get(key)) if p.get(key) else QColor()
+        return c if c.isValid() else mix(accent, "#ffffff", t)
+
+    return (_pick("liquid_tint", 0.52),
+            _pick("liquid_edge", 0.74),
+            CHROMA_COOL, CHROMA_WARM)
+
+
+def _inner_band(painter, rect, thickness, side, color, alpha):
+    """在 rect 的某条**内缘**画一条渐隐色带（等效 CSS 的 inset shadow）。
+
+    side 取 top / bottom / left / right。色带从边缘向里渐隐，所以画在
+    边缘那一侧 alpha 最高。`color` 给白就是高光，给黑就是内阴影。
+    """
+    if alpha <= 0 or thickness <= 0:
+        return
+    x, y = float(rect.left()), float(rect.top())
+    w, h = float(rect.width()), float(rect.height())
+    if w <= 2 or h <= 2:
+        return
+    t = float(min(thickness, max(1.0, min(w, h) / 3.0)))
+
+    if side == "top":
+        g = QLinearGradient(x, y, x, y + t)
+        g.setColorAt(0.0, rgba(color, alpha))
+        g.setColorAt(1.0, rgba(color, 0))
+        box = QRectF(x, y, w, t)
+    elif side == "bottom":
+        g = QLinearGradient(x, y + h - t, x, y + h)
+        g.setColorAt(0.0, rgba(color, 0))
+        g.setColorAt(1.0, rgba(color, alpha))
+        box = QRectF(x, y + h - t, w, t)
+    elif side == "left":
+        g = QLinearGradient(x, y, x + t, y)
+        g.setColorAt(0.0, rgba(color, alpha))
+        g.setColorAt(1.0, rgba(color, 0))
+        box = QRectF(x, y, t, h)
+    else:                                   # right
+        g = QLinearGradient(x + w - t, y, x + w, y)
+        g.setColorAt(0.0, rgba(color, 0))
+        g.setColorAt(1.0, rgba(color, alpha))
+        box = QRectF(x + w - t, y, t, h)
+
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(g)
+    painter.drawRect(box)
+
+
+def paint_liquid_glass(painter, rect, radius=8.0,
+                       tint=LIQUID_TINT_FALLBACK, edge="#eaf4ff",
+                       tint_alpha=176, gloss_alpha=124, top_alpha=192,
+                       border_alpha=158, glow_alpha=112,
+                       glow_thickness=13, chroma_alpha=56,
+                       shade_alpha=62, shade_thickness=10):
+    """画一块「液态玻璃」面（**不含背景模糊**，那部分由调用方先铺好）。
+
+    层次自下而上：
+      1) 浅蓝底色
+      2) 45° 对角反光 —— 玻璃表面那道从左上扫到右下的大高光
+      3) 上 / 左内侧光带 —— **厚度感的主要来源**。1px 描边在大面积控件上
+         等于没有（本项目在毛玻璃那轮已经吃过这个亏）
+      4) 下 / 右内侧暗带（内阴影）—— 让玻璃"鼓"起来而不是像张贴纸
+      5) 顶部一条更亮的 1px 高光线
+      6) 色散：左缘偏青、右缘偏品红，做得极淡 —— 液态玻璃的签名
+      7) 外圈 1px 亮边
+
+    `rect` 与 `radius` 决定形状（胶囊传 radius = 高度一半）。
+    """
+    if rect.width() <= 0 or rect.height() <= 0:
+        return
+
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect), radius, radius)
+
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    # 必须 IntersectClip：调用方可能已经设了"裁掉窗口外角"的裁剪，
+    # 默认的 ReplaceClip 会把它整个丢掉（毛玻璃那轮踩过，见 paint_glass）。
+    painter.setClipPath(path, Qt.IntersectClip)
+
+    # 1) 底色
+    painter.fillPath(path, rgba(tint, tint_alpha))
+
+    # 2) 对角反光
+    g = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
+    g.setColorAt(0.0, rgba("#ffffff", gloss_alpha))
+    g.setColorAt(0.22, rgba("#ffffff", gloss_alpha // 4))
+    g.setColorAt(0.50, rgba("#ffffff", 0))
+    g.setColorAt(0.76, rgba("#ffffff", gloss_alpha // 10))
+    g.setColorAt(1.0, rgba("#ffffff", int(gloss_alpha * 0.66)))
+    painter.fillPath(path, g)
+
+    # 3) 内侧光带（上强、左次强）
+    _inner_band(painter, rect, glow_thickness, "top", edge, glow_alpha)
+    _inner_band(painter, rect, glow_thickness, "left", edge,
+                int(glow_alpha * 0.72))
+
+    # 4) 内阴影（下暗、右次暗）—— 让玻璃有"凸起"的体积
+    _inner_band(painter, rect, shade_thickness, "bottom", "#0b1b30",
+                shade_alpha)
+    _inner_band(painter, rect, shade_thickness, "right", "#0b1b30",
+                int(shade_alpha * 0.55))
+
+    # 5) 顶部高光线
+    if top_alpha > 0 and rect.height() > 6:
+        pen = QPen(rgba("#ffffff", top_alpha))
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        inset = int(min(radius * 1.2, rect.width() / 3))
+        painter.drawLine(
+            QPoint(int(rect.left() + inset), int(rect.top()) + 1),
+            QPoint(int(rect.right() - inset), int(rect.top()) + 1))
+
+    # 6) 色散：左青右品红。宽度给 1px、alpha 很低——它是"一眼觉得像玻璃"
+    #    的暗号，一旦看得清颜色就变成廉价滤镜了。
+    if chroma_alpha > 0 and rect.width() > 10 and rect.height() > 6:
+        top = int(rect.top() + radius * 0.55)
+        bot = int(rect.bottom() - radius * 0.55)
+        if bot > top:
+            pen = QPen(rgba(CHROMA_COOL, chroma_alpha))
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.drawLine(int(rect.left()) + 1, top,
+                             int(rect.left()) + 1, bot)
+            pen = QPen(rgba(CHROMA_WARM, chroma_alpha))
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.drawLine(int(rect.right()) - 2, top,
+                             int(rect.right()) - 2, bot)
+
+    painter.restore()
+
+    # 7) 外圈亮边
+    if border_alpha > 0:
+        pen = QPen(rgba(edge, border_alpha))
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(
+            QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+
+
 # ---------------------------------------------------------------------------
 # 背景模糊
 # ---------------------------------------------------------------------------
@@ -267,6 +472,29 @@ def paint_edge_glow(painter, rect, radius=8.0, thickness=14,
                                 rect.width(), thickness))
 
     painter.restore()
+
+
+def draw_snapshot(painter, rect, snap, refract=1.0):
+    """把背景快照贴到 rect 上；`refract > 1` 时轻微放大，做出透镜折射。
+
+    AndroidLiquidGlass 的 `lens(12dp, 24dp)` 会把玻璃边缘的背景"掰弯"——
+    玻璃下沿看到的是稍微偏外的内容。真折射要逐像素算，这里退一步用
+    **整体轻微放大 + 居中裁剪**等效：中心内容基本不动，越靠边缘位移越大，
+    看起来就是"透过一块厚玻璃"。1.03~1.05 足够，再大就露馅（文字会明显被拉）。
+    """
+    if snap is None or snap.isNull():
+        return
+    k = float(refract or 1.0)
+    tw, th = int(rect.width()), int(rect.height())
+    if abs(k - 1.0) < 1e-3 or tw <= 2 or th <= 2:
+        painter.drawPixmap(rect.topLeft(), snap)
+        return
+    sw = max(tw, int(round(tw * k)))
+    sh = max(th, int(round(th * k)))
+    scaled = snap.scaled(sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    # 放大后居中裁回去：这样位移量在中心为 0、边缘最大
+    src = QRect((sw - tw) // 2, (sh - th) // 2, tw, th)
+    painter.drawPixmap(rect, scaled, src)
 
 
 def rounded_path(rect, radius, corners=("tl", "tr", "br", "bl")):

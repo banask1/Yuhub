@@ -19,7 +19,15 @@ env/
 # ---- 自检输出 / 临时文件 ----
 *.json.tmp
 _*.json
-*.log
+_*.log
+_*.txt
+_*.png
+_*.gif
+_preview_*.png
+_shot_*.png
+
+# ---- 打包产物：exe 只作 Release 附件，不入库 ----
+Yuhub.exe
 
 # ---- 截图 / 预览图 ----
 预览_*.png

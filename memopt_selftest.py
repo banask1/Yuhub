@@ -94,20 +94,59 @@ def _snapshot_settings():
 
 
 def _restore_settings(saved):
+    """把设置还原成快照值，返回**没能还原**的键名列表（正常是空）。
+
+    为什么要"写 + 回读 + 补偿写"这一套：本项目里每个页面都自己 new 一个
+    `QSettings("Yuhub", "Yuhub")`（`MemoryPage._settings` 就是），而 Qt 的
+    全局缓存**只对通过 `QCoreApplication::setOrganizationName()` 建出来的
+    实例生效** —— 显式写死 org/app 名的实例各缓存各的，互相不知道对方改过
+    什么。于是自检期间被写脏的值，可能被那些**仍然存活**的页面实例稍后
+    回写，把这里的还原整个覆盖掉。
+
+    实测（2026-10-04）：自检中途抛异常的那一次，`mem_auto_enabled` 就残留
+    成了 true，下一次自检因此报「两个自动开关默认都是关的」失败 ——
+    而且因为它是**断言默认值**的那条，前一次是绿的，非常难查。
+    """
     from PySide6.QtCore import QSettings
-    s = QSettings("Yuhub", "Yuhub")
-    for k, v in (saved or {}).items():
+    if not saved:
+        return []
+    for _ in range(2):
+        s = QSettings("Yuhub", "Yuhub")
+        for k, v in saved.items():
+            try:
+                if v is None:
+                    s.remove(k)
+                else:
+                    s.setValue(k, v)
+            except Exception:                             # noqa: BLE001
+                pass
         try:
-            if v is None:
-                s.remove(k)
-            else:
-                s.setValue(k, v)
+            s.sync()
+        except Exception:                                 # noqa: BLE001
+            pass
+    # 回读校验：还有对不上的就补一次，并把键名交回去让上层记一笔
+    s = QSettings("Yuhub", "Yuhub")
+    bad = []
+    for k, v in saved.items():
+        try:
+            cur = s.value(k, None)
+        except Exception:                                 # noqa: BLE001
+            continue
+        same = ((cur is None and v is None)
+                or (cur is not None and v is not None
+                    and str(cur) == str(v)))
+        if same:
+            continue
+        bad.append(k)
+        try:
+            s.setValue(k, v)
         except Exception:                                 # noqa: BLE001
             pass
     try:
         s.sync()
     except Exception:                                     # noqa: BLE001
         pass
+    return bad
 
 
 def run(out_file):
@@ -129,7 +168,12 @@ def run(out_file):
         mark("自检过程未抛异常", False,
              "%s: %s" % (type(exc).__name__, exc))
     finally:
-        _restore_settings(saved_settings)
+        _left = _restore_settings(saved_settings)
+        if _left:
+            # 留一条断言而不是静默：设置没还原干净会污染**下一次**自检，
+            # 而且那条断言通常长成"默认值就该是 X"，症状毫无线索。
+            mark("自检结束后用户设置已完整还原", False,
+                 "这些键没能还原：%s" % (", ".join(_left),))
 
     result = {
         "ok": all(c["pass"] for c in checks),

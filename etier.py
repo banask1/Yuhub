@@ -730,12 +730,14 @@ class MemberTracker:
     def snapshot(self):
         """当前在线成员，按 IP 排序。UI 线程调用，零阻塞。
 
-        返回 [{"ip", "name", "game", "port", "share", "srev"}]。game / port 是对端在
+        返回 [{"ip", "name", "game", "port", "share", "srev", "ss"}]。game / port 是对端在
         「游戏快连」里选的那款游戏（由昵称信标一起广播过来），队友的
         成员行据此显示"他在玩什么"，复制按钮也用**他的**端口拼地址。
         share 是对端「临时云盘」的服务端口（0 = 没开 / 旧版本），拉文件
         清单时直接拿它拼地址，不用先猜再试；srev 是对端云盘清单的版本号，
         一变就说明对方增删了分享文件（见 NickBeacon.live_shares）。
+        ss 是对端「屏幕共享」的服务端口（0 = 没在共享），成员行据此决定
+        要不要显示「看屏幕」按钮。
         """
         with self._lock:
             return [{"ip": ip,
@@ -743,7 +745,8 @@ class MemberTracker:
                      "game": (p.get("game") or ""),
                      "port": int(p.get("port") or 0),
                      "share": int(p.get("share") or 0),
-                     "srev": int(p.get("srev") or 0)}
+                     "srev": int(p.get("srev") or 0),
+                     "ss": int(p.get("ss") or 0)}
                     for ip, p in sorted(self._peers.items())]
 
     # ------------------------------------------------ 后台线程主体
@@ -770,7 +773,7 @@ class MemberTracker:
                 p = self._peers.setdefault(
                     ip, {"confirmed": now, "ping_fail": 0,
                          "name": "", "game": "", "port": 0, "share": 0,
-                         "srev": 0})
+                         "srev": 0, "ss": 0})
                 p["confirmed"] = now
                 p["ping_fail"] = 0
         # ② 逐个 ping：保活 ARP + 主动确认活性
@@ -873,6 +876,16 @@ class MemberTracker:
                     # 免得把已知的版本号冲成 0 造成一次假的重拉。
                     if "srev" in info:
                         cur["srev"] = srev
+                try:
+                    ss = int(info.get("ss") or 0)
+                except (TypeError, ValueError):
+                    ss = 0
+                # 屏幕共享端口这里**直接赋值**，不像 share 那样"带键才更新"。
+                # 因为共享是可以停的：停掉之后 `_payload` 就不再带这个键，
+                # 对端必须据此把端口归零，否则成员行上的「看屏幕」按钮会
+                # 一直挂着，点过去必然连不上。旧版客户端从不发这个键，
+                # 归零对它们也是对的（它们确实没有屏幕共享）。
+                cur["ss"] = ss
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +922,11 @@ _NICK_SHARE = "share"
 # 版本号，对端一看数字变了就知道"对方刚动了文件"，立刻重拉一次清单，
 # 而不是傻等下一个 3 秒周期——"谁上传/取消分享，所有人都刷新一次"。
 _NICK_SHARE_REV = "srev"
+# 屏幕共享端口（0 = 没在共享）。有这个键，队友的成员行就会多一个
+# 「看屏幕」按钮——他知道该连哪个端口，不用来问。同样不升协议版本。
+# 不广播观看码：那东西由「房间码 + 密码」两边各自算，广播出去等于把
+# 准入凭证贴在广播包里，虚拟网里任何一台机器都能收到。
+_NICK_SS = "ss"
 
 
 class NickBeacon:
@@ -920,13 +938,14 @@ class NickBeacon:
     TCP_FAIL_BACKOFF = 30.0      # TCP 查询失败后的重试间隔（秒）
 
     def __init__(self, my_ip, nick, on_log=None, game="", port=0, share=0,
-                 share_rev=0):
+                 share_rev=0, ss=0):
         self._my_ip = my_ip
         self._nick = (nick or "").strip()[:32]
         self._game = (game or "").strip()[:24]
         self._port = int(port or 0)
         self._share = int(share or 0)
         self._share_rev = int(share_rev or 0)
+        self._ss = int(ss or 0)
         self._on_log = on_log or (lambda msg: None)
         self._stop_evt = threading.Event()
         self._wake = threading.Event()      # 打断广播间隔（切换游戏后立刻广播）
@@ -976,6 +995,17 @@ class NickBeacon:
             self._share = int(port or 0)
             if rev is not None:
                 self._share_rev = int(rev)
+        self._wake.set()
+
+    def set_screenshare(self, port):
+        """更新本机广播的「屏幕共享」端口（0 = 停了）。
+
+        立刻踢一次广播，队友最多 1 秒就看到成员行上的「看屏幕」按钮
+        出现或消失。只广播端口，不广播观看码——观看码由房间码+密码派生，
+        两边各自算，广播出去等于把准入凭证贴在广播包里。
+        """
+        with self._lock:
+            self._ss = int(port or 0)
         self._wake.set()
 
     def announce_now(self, times=2):
@@ -1029,7 +1059,7 @@ class NickBeacon:
         return out
 
     def get_info(self, ip, timeout=None):
-        """查某虚拟 IP 的 {"name","game","port"}。
+        """查某虚拟 IP 的 {"name","game","port","share","srev","ss"}。
 
         信标缓存 → TCP 查询 → 都没有返回 {}（不是 None，调用方直接 .get）。
         """
@@ -1063,6 +1093,7 @@ class NickBeacon:
         with self._lock:
             nick, game, port, share = self._nick, self._game, self._port, self._share
             srev = self._share_rev
+            ss = self._ss
         d = {_NICK_MAGIC: nick}
         if game:
             d[_NICK_GAME] = game
@@ -1073,6 +1104,8 @@ class NickBeacon:
             # 版本号只在开着云盘时有意义：关了就是"没有清单"，对端看键消失
             # 一样会当成"他关云盘了"，不必再传一个 0 去占字节。
             d[_NICK_SHARE_REV] = int(srev)
+        if ss:
+            d[_NICK_SS] = int(ss)
         return json.dumps(d, ensure_ascii=False).encode("utf-8")
 
     # ------------------------------------------------ 内部：三个小线程
@@ -1199,12 +1232,17 @@ class NickBeacon:
             srev = int(d.get(_NICK_SHARE_REV) or 0)
         except (TypeError, ValueError):
             srev = 0
+        try:
+            ss = int(d.get(_NICK_SS) or 0)
+        except (TypeError, ValueError):
+            ss = 0
         return {
             "name": str(d.get(_NICK_MAGIC) or "").strip()[:32],
             "game": str(d.get(_NICK_GAME) or "").strip()[:24],
             "port": port,
             "share": share,
             "srev": srev,
+            "ss": ss,
         }
 
 

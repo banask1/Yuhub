@@ -253,14 +253,16 @@ def _check_nick_beacon(etier_mod, ip, mark):
              "got=%r" % (got,))
 
         # 旧版本客户端只发昵称：新版本必须照常解析（混房间不炸）。
-        # 期望值要带上后来加的字段（share = 对方的临时云盘端口，0 = 没开；
-        # srev = 对方云盘清单的版本号），否则"新增字段"这件事本身会把这条
-        # 断言打红。
+        # 期望值要带上**后来新增的全部字段**，否则"新增字段"这件事本身就把
+        # 这条断言打红 —— 这正是 v0.13beta 加屏幕共享时踩到的：
+        # ss（对方屏幕共享的服务端口，0 = 没在共享）加进 _parse_info 之后
+        # 忘了同步这里，自检直接报「兼容旧版仅昵称报文」失败。
+        # 以后再加字段，这条断言要一起改（把它当成"报文字段清单"的哨兵）。
         legacy = etier_mod.NickBeacon._parse_info(
             b'{"yuhub-nick-v1":"OldPeer"}')
         mark("兼容旧版仅昵称报文",
              legacy == {"name": "OldPeer", "game": "", "port": 0,
-                        "share": 0, "srev": 0},
+                        "share": 0, "srev": 0, "ss": 0},
              "legacy=%r" % (legacy,))
 
         # 注入"收到 Bob 的广播"：get_info 应命中新鲜表
@@ -300,9 +302,94 @@ def _check_nick_beacon(etier_mod, ip, mark):
         mark("运行中切换游戏快连立即生效",
              sw.get("game") == "神力科莎" and sw.get("port") == 9600,
              "payload=%r" % (sw,))
+
+        _check_screenshare_beacon(etier_mod, beacon, mark)
+
         beacon.stop()
     except Exception as exc:
         mark("昵称信标 TCP 查询（本机回环实测）", False, repr(exc))
+
+
+def _check_screenshare_beacon(etier_mod, beacon, mark):
+    """屏幕共享端口在信标里的行为（v0.13beta）。
+
+    这一节守着「看屏幕」按钮能不能正确出现的唯一依据：
+
+      * 端口**只在开着共享时**才进报文 —— 停掉之后键必须消失；
+      * 对端收到"停掉"的报文后，跟踪器里的端口必须**归零**（不像 share
+        那样"带键才更新"），否则成员行上的「看屏幕」按钮会一直挂着，
+        点过去必然连不上；
+      * 旧版客户端从不发这个键，解析成 0 才是对的。
+
+    另外：广播的只有**端口**。观看码由「房间码 + 密码」两边各自派生，
+    绝不进广播包 —— 那等于把准入凭证贴在门上。这条也一并断言。
+    """
+    import json as _json
+
+    # ---- 报文层：开着才带键 ----
+    raw_off = _json.loads(beacon._payload().decode("utf-8"))
+    mark("未开屏幕共享时报文不带 ss 键（不发假端口）",
+         "ss" not in raw_off, sorted(raw_off))
+
+    beacon.set_screenshare(45890)
+    raw_on = _json.loads(beacon._payload().decode("utf-8"))
+    mark("开始共享后报文带上 ss 端口", raw_on.get("ss") == 45890, raw_on)
+
+    parsed = etier_mod.NickBeacon._parse_info(beacon._payload())
+    mark("ss 端口能被对端解析回来",
+         parsed.get("ss") == 45890, "parsed=%r" % (parsed,))
+
+    # 观看码绝不能出现在广播报文里（那是准入凭证）
+    mark("★ 广播报文里不含观看码（只广播端口）",
+         "token" not in raw_on and "code" not in raw_on, sorted(raw_on))
+
+    beacon.set_screenshare(0)
+    raw_back = _json.loads(beacon._payload().decode("utf-8"))
+    mark("★ 停掉共享后 ss 键又消失（对端据此撤下「看屏幕」按钮）",
+         "ss" not in raw_back, sorted(raw_back))
+
+    # ---- 缓存 → 跟踪器：停掉就归零 ----
+    peer = "10.126.126.201"
+    beacon._peers[peer] = {
+        "info": {"name": "Bob", "ss": 45890}, "until": time.monotonic() + 15}
+    hit = beacon.get_info(peer)
+    mark("信标缓存命中且带回共享端口", hit.get("ss") == 45890,
+         "get_info=%r" % (hit,))
+
+    def _tracker_for(info):
+        """造一个跟踪器，并把信标里那个 peer 的缓存换成 info。"""
+        beacon._peers[peer] = {"info": dict(info),
+                               "until": time.monotonic() + 15}
+        tr = etier_mod.MemberTracker("10.126.126.1",
+                                     name_lookup=beacon.get_info)
+        tr._peers[peer] = {"confirmed": time.monotonic(), "ping_fail": 0,
+                           "name": "", "game": "", "port": 0,
+                           "share": 0, "srev": 0, "ss": 45890}
+        tr._resolve_info()
+        return tr
+
+    # 对端停掉了共享：新报文里没有 ss 键
+    tr_off = _tracker_for({"name": "Bob"})
+    mark("★ 对端停掉共享后跟踪器把端口归零（按钮不会一直挂着）",
+         int(tr_off._peers[peer].get("ss") or 0) == 0,
+         "ss=%r" % (tr_off._peers[peer].get("ss"),))
+    snap_off = [m for m in tr_off.snapshot() if m["ip"] == peer]
+    mark("成员快照带上 ss 字段（成员行据此决定要不要显示按钮）",
+         bool(snap_off) and "ss" in snap_off[0] and snap_off[0]["ss"] == 0,
+         "snapshot=%r" % (snap_off,))
+
+    # 对端正在共享：端口要如实带出来
+    tr_on = _tracker_for({"name": "Bob", "ss": 45890})
+    mark("对端在共享时成员快照带出非零 ss（按钮会出现）",
+         int(tr_on._peers[peer].get("ss") or 0) == 45890,
+         "ss=%r" % (tr_on._peers[peer].get("ss"),))
+    snap_on = [m for m in tr_on.snapshot() if m["ip"] == peer]
+    mark("共享中的成员快照 ss = 45890",
+         bool(snap_on) and snap_on[0]["ss"] == 45890,
+         "snapshot=%r" % (snap_on,))
+
+    beacon._peers.pop(peer, None)
+    beacon.set_screenshare(0)
 
 
 def _check_ui_state(result, mark):
@@ -684,6 +771,47 @@ def _check_member_row_ui(page, mark):
     my_port = page._selected_game()[1]
     mark("对方无游戏信息时回退本机端口",
          ("10.126.126.8:%d" % my_port) in tip2, tip2)
+
+    # ⑤b 屏幕共享：队友在共享时，他的成员行要长出「看屏幕」按钮
+    #     （v0.13beta：借「异地联机」做屏幕共享，ss = 他的服务端口）
+    row_ss = page._make_member_row("Sharer", "10.126.126.7",
+                                   game="泰拉瑞亚", port=7777, ss=45890)
+    watch_btns = [b for b in row_ss.findChildren(QPushButton)
+                  if b.text() == "看屏幕"]
+    mark("★ 队友在共享屏幕时，他的成员行出现「看屏幕」按钮",
+         len(watch_btns) == 1,
+         [b.text() for b in row_ss.findChildren(QPushButton)])
+    mark("「看屏幕」按钮带说明性 tooltip",
+         bool(watch_btns) and "屏幕" in watch_btns[0].toolTip(),
+         watch_btns[0].toolTip() if watch_btns else None)
+
+    # 点它必须带着**这个人的** IP + 共享端口跳转（带错就连到别人/连不上）
+    got_watch = []
+    real_watch = page._watch_peer
+    page._watch_peer = lambda ip, port, name: got_watch.append((ip, port, name))
+    try:
+        if watch_btns:
+            watch_btns[0].click()
+    finally:
+        page._watch_peer = real_watch
+    mark("★ 点「看屏幕」带的是该行队友的 IP + 共享端口",
+         got_watch == [("10.126.126.7", 45890, "Sharer")], got_watch)
+
+    # 自己那行不给（看自己的屏幕没有意义）
+    row_me = page._make_member_row("Me", "10.126.126.7", is_self=True,
+                                   game="泰拉瑞亚", port=7777, ss=45890)
+    mark("自己那一行不出现「看屏幕」按钮",
+         not [b for b in row_me.findChildren(QPushButton)
+              if b.text() == "看屏幕"],
+         [b.text() for b in row_me.findChildren(QPushButton)])
+
+    # 对方没在共享（ss=0）时不能有按钮，否则会出现"点了连不上"
+    row_ns = page._make_member_row("NoShare", "10.126.126.8",
+                                   game="泰拉瑞亚", port=7777, ss=0)
+    mark("对方没在共享时成员行没有「看屏幕」按钮",
+         not [b for b in row_ns.findChildren(QPushButton)
+              if b.text() == "看屏幕"],
+         [b.text() for b in row_ns.findChildren(QPushButton)])
 
     # ⑥ 运行中 IP 变化：必须按新地址整对重建信标与成员跟踪
     #    （不重建就是"人在房间、列表永远空、别人也看不到我"）
