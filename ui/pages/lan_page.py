@@ -60,6 +60,9 @@ _NODE_COMBO_MAX_W = 360
 # 以撒的结合：⚠️ 官方明确不支持 LAN/局域网联机（只有同屏合作 + Steam 在线
 #           联机/远程同乐串流），虚拟局域网里没有可填的 IP:端口，列出来只为
 #           提醒，别让队友白找地址。
+# **其他游戏**：端口填 0 = "没有固定端口/用不上端口"（用户 2026-10-05 要求）。
+#           这类游戏（自建服、非标准端口的、或者只是想让队友拿到纯 IP 的）
+#           复制出来只给**纯 IP**，不拼 `:端口`，UI 里也不显示端口后缀。
 GAME_PORTS = (
     ("Minecraft 服务器", 25565),
     ("泰拉瑞亚", 7777),
@@ -69,7 +72,27 @@ GAME_PORTS = (
     ("CS 2 / 起源引擎", 27015),
     ("以撒的结合（无局域网联机）", 27015),
     ("七日杀", 26900),
+    ("其他游戏", 0),
 )
+
+
+def game_label(name, port):
+    """游戏下拉的显示文案：有端口才带「（端口）」后缀。
+
+    port=0 是「其他游戏」，显示成纯名字，不能出现刺眼的"（0）"。
+    """
+    return "%s（%d）" % (name, port) if port else str(name)
+
+
+def game_addr(ip, port):
+    """拼游戏直连地址：有端口 → `IP:端口`；无端口 → **纯 IP**。
+
+    这是全局唯一出口 —— 三个复制入口（成员行「复制」、本机「复制 IP:端口」、
+    成员行 tooltip）都走它，避免某处漏判又拼出 `10.x.x.x:None` 这种事。
+    """
+    if not ip:
+        return ""
+    return "%s:%s" % (ip, port) if port else str(ip)
 
 
 def random_room_code():
@@ -492,12 +515,13 @@ class LanPage(BasePage):
         self.game_combo = QComboBox()
         self.game_combo.setMaximumWidth(220)
         for i, (name, port) in enumerate(GAME_PORTS):
-            self.game_combo.addItem("%s（%d）" % (name, port), port)
+            self.game_combo.addItem(game_label(name, port), port)
             # 纯游戏名单独存一份（纯展示用：成员行里的贴片 + 广播给队友）
             self.game_combo.setItemData(i, name, Qt.UserRole + 1)
         self.game_combo.setToolTip(
             "选你这次要玩的游戏：会广播给队友（成员行显示贴片），\n"
-            "每行的「复制」也给那个人的「IP:端口」。进房间后也能改。")
+            "每行的「复制」也给那个人的「IP:端口」。\n"
+            "选「其他游戏」时不带端口，复制的是纯 IP。进房间后也能改。")
         qk.addWidget(self.game_combo)
         self.btn_copy_addr = ghost_button("复制 IP:端口")
         self.btn_copy_addr.setEnabled(False)
@@ -677,10 +701,19 @@ class LanPage(BasePage):
         btn.setFixedHeight(26)
         btn.setMinimumWidth(56)
         # 复制「IP:端口」而不是裸 IP：游戏里要填的就是带端口的直连地址
-        # （「IP:端口」缺一不可）。端口优先用**这个人的**游戏快连；
-        # 他还没广播过来时退回我自己选的那个，至少能用。
-        use_port = port or (self.game_combo.currentData() or 0)
-        addr = "%s:%s" % (ip, use_port) if use_port else ip
+        # （「IP:端口」缺一不可）。端口优先用**这个人的**游戏快连。
+        #
+        # ⚠️ 这里不能用 `port or 我的端口`：他明确选了「其他游戏」（game 有值、
+        # port=0）时，`port or …` 会退回**我的**端口，复制出
+        # `10.x.x.x:25565` —— 这正是用户报的"选了其他游戏还是带端口"。
+        # 判据看 game 字段而不是 port：
+        #   game 非空 + port=0  → 他选了无端口游戏 → 纯 IP
+        #   game 为空           → 他还没广播过     → 退回我自己选的，至少能用
+        if game:
+            use_port = port
+        else:
+            use_port = port or (self.game_combo.currentData() or 0)
+        addr = game_addr(ip, use_port)
         btn.setToolTip("复制直连地址 %s" % addr)
         btn.clicked.connect(lambda _=False, v=addr: self._copy_text(v, "直连地址"))
         h.addWidget(btn)
@@ -1369,7 +1402,8 @@ class LanPage(BasePage):
             "虚拟 IP 由 EasyTier 自动分配，重启或卡死重进后可能变——变了本页会\n"
             "提示，拿不准就点「在线成员」右上角的「刷新」，不用重进房间。\n"
             "「游戏快连」选你这次要玩的游戏，会广播给队友；每行的「复制」拿到的\n"
-            "是**那个人的**「IP:端口」，填进游戏即可。中继节点一般保持「自动」——\n"
+            "是**那个人的**「IP:端口」，填进游戏即可。选「其他游戏」时不带端口，\n"
+            "复制的是纯 IP。中继节点一般保持「自动」——\n"
             "下拉里各节点的毫秒是本机实测、按快慢排序，每 90 秒自动重测；\n"
             "想手动指定更快/更稳的那个，点「测速」看清延迟再选。\n"
             "\n"
@@ -1603,20 +1637,29 @@ class LanPage(BasePage):
                 self._beacon.set_game(name, port)
             except Exception:
                 pass
+        # 「其他游戏」没端口：按钮文案也跟着改，别让用户以为复制出来带端口
+        try:
+            self.btn_copy_addr.setText("复制 IP:端口" if port else "复制 IP")
+        except (AttributeError, RuntimeError):
+            pass
         if self._running:
             self._members_row = []          # 强制重建：贴片与复制端口都变了
             self._update_ip()
-            self._append_log("游戏快连已切换为 %s（%d），已广播给队友"
-                             % (name, port))
+            if port:
+                self._append_log("游戏快连已切换为 %s（%d），已广播给队友"
+                                 % (name, port))
+            else:
+                self._append_log("游戏快连已切换为 %s（无端口），已广播给队友"
+                                 % name)
 
     def _on_copy_game_addr(self):
-        """游戏快连：复制「虚拟 IP:端口」直连地址。"""
+        """游戏快连：复制「虚拟 IP:端口」直连地址（无端口游戏只给纯 IP）。"""
         ip = self._my_ip or etier.virtual_adapter_ip()
         if not ip:
             self.toast("当前没有虚拟 IP 可复制")
             return
-        port = self.game_combo.currentData()
-        addr = "%s:%s" % (ip, port)
+        port = self.game_combo.currentData() or 0
+        addr = game_addr(ip, port)
         self._copy_text(addr, "直连地址")
         self._append_log("已复制游戏直连地址 %s" % addr)
 
@@ -2038,7 +2081,7 @@ class LanPage(BasePage):
             if others:
                 self.members_hint.setText(
                     "点每行的「复制」，复制到的是那个人的「IP:端口」"
-                    "（端口取自他自己选的游戏）。"
+                    "（端口取自他自己选的游戏；选「其他游戏」则只给纯 IP）。"
                 )
                 self._set_status_note(normal_note)
             else:

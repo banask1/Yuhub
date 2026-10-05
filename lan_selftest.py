@@ -1120,6 +1120,82 @@ def _check_member_rows(page, mark):
          copied == [("直连地址", "10.126.126.11:%d" % my_port)],
          "复制结果=%r" % (copied,))
 
+    # ---- 「其他游戏」（无端口）：复制出来必须是**纯 IP**，不带冒号 ----
+    # 用户 2026-10-05 要求：「其他游戏的选项，然后无端口，复制 ip 的时候
+    # 直接就是 ip 没有端口」。两条路径都要验：成员行复制 + 本机复制按钮。
+    from ui.pages.lan_page import GAME_PORTS, game_addr, game_label
+    other = [(n, p) for n, p in GAME_PORTS if p == 0]
+    mark("游戏列表里有「其他游戏」且端口为 0",
+         any(n == "其他游戏" for n, _ in GAME_PORTS) and bool(other),
+         "GAME_PORTS=%r" % (GAME_PORTS,))
+    mark("无端口游戏的下拉文案不带「（0）」",
+         game_label("其他游戏", 0) == "其他游戏"
+         and game_label("泰拉瑞亚", 7777) == "泰拉瑞亚（7777）",
+         "%r / %r" % (game_label("其他游戏", 0), game_label("泰拉瑞亚", 7777)))
+    mark("game_addr：有端口给 IP:端口、无端口只给纯 IP",
+         game_addr("10.126.126.23", 7777) == "10.126.126.23:7777"
+         and game_addr("10.126.126.23", 0) == "10.126.126.23"
+         and game_addr("", 7777) == "",
+         "%r / %r" % (game_addr("10.126.126.23", 7777),
+                      game_addr("10.126.126.23", 0)))
+
+    # 切到「其他游戏」，成员行复制应变纯 IP
+    idx_other = next((i for i, (n, _p) in enumerate(GAME_PORTS)
+                      if n == "其他游戏"), -1)
+    old_idx = page.game_combo.currentIndex()
+    page.game_combo.setCurrentIndex(idx_other)
+    mark("切到「其他游戏」后本机端口读数为 0",
+         (page.game_combo.currentData() or 0) == 0,
+         "currentData=%r" % (page.game_combo.currentData(),))
+    # 队友明确选了「其他游戏」：game 非空、port=0，复现"他选无端口游戏"这条路径
+    page._render_members([
+        {"ip": "10.126.126.11", "name": "SelfNick", "self": True,
+         "game": "其他游戏", "port": 0},
+        {"ip": "10.126.126.23", "name": "Teammate", "self": False,
+         "game": "其他游戏", "port": 0},
+    ])
+    rows = [page.members_layout.itemAt(i).widget()
+            for i in range(page.members_layout.count())]
+    copied.clear()
+    if len(rows) == 2:
+        [b for b in rows[1].findChildren(QPushButton)
+         if b.text() == "复制"][0].click()
+    mark("「其他游戏」下成员行复制的是纯 IP（无端口）",
+         copied == [("直连地址", "10.126.126.23")],
+         "复制结果=%r" % (copied,))
+    mark("「其他游戏」下复制按钮文案改为「复制 IP」",
+         page.btn_copy_addr.text() == "复制 IP",
+         "btn_copy_addr=%r" % page.btn_copy_addr.text())
+
+    # 反例：队友**没广播过**游戏（game 为空）→ 退回我自己选的端口，至少能用。
+    # 这条守住"不能因为新增无端口选项，把老的退回逻辑一起搞坏"。
+    page.game_combo.setCurrentIndex(
+        next((i for i, (n, _p) in enumerate(GAME_PORTS) if n == "泰拉瑞亚"), 0))
+    page._render_members([
+        {"ip": "10.126.126.11", "name": "SelfNick", "self": True},
+        {"ip": "10.126.126.23", "name": "Teammate", "self": False},
+    ])
+    rows = [page.members_layout.itemAt(i).widget()
+            for i in range(page.members_layout.count())]
+    copied.clear()
+    if len(rows) == 2:
+        [b for b in rows[1].findChildren(QPushButton)
+         if b.text() == "复制"][0].click()
+    mark("队友未广播游戏时退回我选的端口（不是纯 IP）",
+         copied == [("直连地址", "10.126.126.23:7777")],
+         "复制结果=%r" % (copied,))
+    page.game_combo.setCurrentIndex(idx_other)
+
+    # 本机「复制 IP:端口」按钮在无端口时同样只给纯 IP
+    page._my_ip = "10.126.126.11"
+    copied.clear()
+    page._on_copy_game_addr()
+    mark("「其他游戏」下本机复制按钮给的是纯 IP",
+         copied == [("直连地址", "10.126.126.11")],
+         "复制结果=%r" % (copied,))
+
+    page.game_combo.setCurrentIndex(old_idx)     # 复位，别污染后续断言
+
     # 「复制全部」已按需求移除：方法与按钮都不该存在
     no_all = (not hasattr(page, "_on_copy_all_ips")
               and not hasattr(page, "btn_copy_all")

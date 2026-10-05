@@ -1773,6 +1773,28 @@ def _clear_readonly(path):
         return False
 
 
+def _is_permission_error(exc):
+    """判断一个 OSError 是不是"权限不足"（而不是"被占用"）。
+
+    为什么要分：MoveFileExW 对**被占用**的文件真能生效（重启后删），
+    但对**权限不足**的文件也会返回成功、却在重启后照样删不掉 —— 用它
+    兜底会把"权限失败"伪装成"已处理"，用户看到的就是"说删了其实还在"。
+    所以权限类失败必须如实上报，交给提权重试。
+
+    Windows 的 errno 编码：13=EACCES、5=ERROR_ACCESS_DENIED（经
+    winerror 暴露）；Python 在 Windows 上 os.remove 的 PermissionError
+    通常 errno=13 / winerror=5。
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, PermissionError):
+        return True
+    winerr = getattr(exc, "winerror", None)
+    if winerr in (5, 32, 33):            # 拒绝访问 / 共享冲突 / 区域被锁
+        return winerr == 5
+    return getattr(exc, "errno", None) in (13, 1)   # EACCES / EPERM
+
+
 def _dir_tree_clear_readonly(path):
     """把整棵树的只读/隐藏/系统属性都摘掉（topdown=False 才好逐层处理）。"""
     _clear_readonly(path)
@@ -1820,12 +1842,15 @@ def _delete_dir(path):
 
     # 逐项删（从最深层往上）
     failed = 0
+    perm_blocked = False          # 是否遇到"权限不足"（区别于"被占用"）
     reasons = []
     pending = 0
     for root, dirs, files in os.walk(path, topdown=False):
         for f in files:
             fp = os.path.join(root, f)
             err = ""
+            last_exc = None
+            _clear_readonly(fp)          # 先摘只读：只读文件谁都删不掉
             for attempt in range(2):
                 try:
                     os.remove(fp)
@@ -1833,11 +1858,16 @@ def _delete_dir(path):
                     break
                 except OSError as e:
                     err = str(e)
+                    last_exc = e
                     if attempt == 0:
                         _clear_readonly(fp)
                         time.sleep(0.12)
             if err:
-                if _move_file_delayed(fp):
+                if _is_permission_error(last_exc):
+                    # 权限不足：MoveFileEx 会假装成功，绝不能当兜底
+                    perm_blocked = True
+                    failed += 1
+                elif _move_file_delayed(fp):
                     pending += 1          # 已登记重启后删，但仍不算"已删净"
                 else:
                     failed += 1
@@ -1848,7 +1878,10 @@ def _delete_dir(path):
             try:
                 os.rmdir(dp)
             except OSError as e:
-                if _move_file_delayed(dp):
+                if _is_permission_error(e):
+                    perm_blocked = True
+                    failed += 1
+                elif _move_file_delayed(dp):
                     pending += 1
                 else:
                     failed += 1
@@ -1857,7 +1890,10 @@ def _delete_dir(path):
     try:
         os.rmdir(path)
     except OSError as e:
-        if _move_file_delayed(path):
+        if _is_permission_error(e):
+            perm_blocked = True
+            failed += 1
+        elif _move_file_delayed(path):
             pending += 1
         else:
             failed += 1
@@ -1868,6 +1904,9 @@ def _delete_dir(path):
     if not gone:
         # 目录还在：把"待重启删除"的也计入未完成，否则会被误判成"已处理"
         failed += pending
+    # 权限受阻时给一句明确的话，让 UI 能识别"这不是占用，是权限"
+    if perm_blocked and not gone:
+        reasons.append("权限不足（需要管理员）")
     return gone, (size if gone else 0), failed, "; ".join(reasons)
 
 
@@ -1959,7 +1998,9 @@ def clean_leftovers(items, on_progress=None):
                 res.failed += max(1, failed)
                 # 目录没删净 = 这一项还没完成，登记下来给 UI 做提权重试。
                 res.retryable.append(it.path)
-                if failed == 0:
+                if "权限不足" in why:
+                    res.messages.append(f"权限不足，需要管理员权限才能删除 {it.path}")
+                elif failed == 0:
                     res.messages.append(f"未能删除（被占用或权限受限）{it.path}")
                 else:
                     res.messages.append(
@@ -1976,8 +2017,21 @@ def clean_leftovers(items, on_progress=None):
             else:
                 res.failed += 1
                 res.retryable.append(it.path)
-                res.messages.append(f"删除失败 {it.path}" + (f"（{why}）" if why else ""))
+                if _looks_like_permission(why):
+                    res.messages.append(f"权限不足，需要管理员权限才能删除 {it.path}")
+                else:
+                    res.messages.append(f"删除失败 {it.path}"
+                                        + (f"（{why}）" if why else ""))
     return res
+
+
+def _looks_like_permission(text):
+    """错误串里是否含权限语义（提权进程回传的是字符串，没法带异常对象）。"""
+    if not text:
+        return False
+    low = str(text).lower()
+    return ("denied" in low or "permission" in low
+            or "拒绝" in str(text) or "权限" in str(text))
 
 
 def _delete_file(path):
@@ -1985,17 +2039,32 @@ def _delete_file(path):
 
     与 `_delete_dir` 同一套策略：先摘只读属性（否则管理员也删不掉），
     失败短暂重试，最后才用 MoveFileEx 兜底标记重启后删除。
+
+    ⚠️ 这里区分两种失败，别混为一谈：
+      * **权限不足** —— 摘掉只读属性后仍然报拒绝访问，说明是 ACL 收紧，
+        必须提权才能删。此时**不能**走 MoveFileEx 兜底（它对权限问题会
+        "登记成功却永远删不掉"，把失败伪装成成功），直接如实返回失败，
+        让上层升级到管理员重试。
+      * **被占用** —— 文件被别的进程打开着。MoveFileEx 真能生效，
+        标记重启后删除是合理的降级。
     """
     err = ""
+    last_exc = None
+    # 第一遍之前就先摘只读：只读文件 os.remove 必然失败，先摘能少一次无用重试
+    _clear_readonly(path)
     for attempt in range(2):
         try:
             os.remove(path)
             return True, ""
         except OSError as e:
             err = str(e)
+            last_exc = e
             if attempt == 0:
                 _clear_readonly(path)
                 time.sleep(0.12)
+    if _is_permission_error(last_exc):
+        # 权限问题：MoveFileEx 会假装成功，这里必须如实报失败
+        return False, err
     if _move_file_delayed(path):
         # 登记成功 != 马上消失，但重启后会被系统清掉，算处理完成
         return True, "已标记重启后删除"
