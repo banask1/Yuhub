@@ -11,6 +11,7 @@
 import json
 import os
 import sys
+import textwrap
 from string import Template
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +47,9 @@ def run_once(tag, suite="theme"):
     if suite == "hosts":
         import hostsaccel_selftest
         mod = hostsaccel_selftest
+    elif suite == "uninstall":
+        import uninstaller_selftest
+        mod = uninstaller_selftest
     else:
         mod = theme_selftest
     try:
@@ -783,6 +787,132 @@ CASES.append(("ipmaploose", "缓存拒绝 127.0.0.1（代理映射必须是真�
               m_maploose, r_maploose, "hosts"))
 
 
+# ---- 31) 下拉弹出区：去掉 topLevelAt 守卫（v1.0.2 问题 1 的回归）----
+# 变异点落在断言真正读取的那个对象上：theme_selftest 通过 win._edge_at
+# 判边，而 _edge_at 是 MainWindow 的**绑定方法**。直接在类上换成"没有
+# topLevelAt 守卫"的旧实现，就能把那条新断言打红。
+#
+# ⚠️ 不能去改 main_window.py 的源码再 import —— 一个用例一个进程，
+# restore 无处落脚；改类属性最干净。
+
+def m_edgeguard():
+    from PySide6.QtWidgets import QApplication as _QA
+    from PySide6.QtCore import Qt as _Qt
+    import ui.main_window as _mw
+
+    def _old_edge_at(self, global_pos):
+        if self.isMaximized():
+            return _Qt.Edges()
+        g = self.frameGeometry()
+        m = _mw.RESIZE_MARGIN
+        edges = _Qt.Edges()
+        if global_pos.x() <= g.left() + m:
+            edges |= _Qt.Edge.LeftEdge
+        if global_pos.x() >= g.right() - m:
+            edges |= _Qt.Edge.RightEdge
+        if global_pos.y() >= g.bottom() - m:
+            edges |= _Qt.Edge.BottomEdge
+        return edges
+
+    _mw._m_orig_edge_at = _mw.MainWindow._edge_at
+    _mw.MainWindow._edge_at = _old_edge_at
+
+
+def r_edgeguard():
+    import ui.main_window as _mw
+    if hasattr(_mw, "_m_orig_edge_at"):
+        _mw.MainWindow._edge_at = _mw._m_orig_edge_at
+        del _mw._m_orig_edge_at
+
+
+CASES.append(("edgeguard", "主窗口外（模拟下拉弹出区）不判为缩放边缘",
+              m_edgeguard, r_edgeguard))
+
+
+# ---- 32) 占用被误判成权限：把 _is_permission_error 改回"先判异常类型" ----
+# v1.0.2 问题 3 的第二个根因：Python 把 WinError 32（共享冲突）也包成
+# PermissionError，旧实现 isinstance 先命中 → 占用被当成权限，MoveFileEx
+# 兜底永远走不到。变异成旧写法，断言 ⑥ 必须红。
+
+def m_permorder():
+    import uninstaller as _un
+
+    def _old(exc):
+        if exc is None:
+            return False
+        if isinstance(exc, PermissionError):
+            return True
+        return getattr(exc, "errno", None) in (13, 1)
+
+    _un._m_orig_is_perm = _un._is_permission_error
+    _un._is_permission_error = _old
+
+
+def r_permorder():
+    import uninstaller as _un
+    if hasattr(_un, "_m_orig_is_perm"):
+        _un._is_permission_error = _un._m_orig_is_perm
+        del _un._m_orig_is_perm
+
+
+CASES.append(("permorder", "被占用文件被判定为「非权限问题」",
+              m_permorder, r_permorder, "uninstall"))
+
+
+# ---- 33) 夺取所有权分支被删除：_delete_dir 退回"只有摘只读 + 逐项删" ----
+# v1.0.2 问题 3 的第一个根因：ACL 受阻时连管理员也删不掉，解药是
+# takeown + icacls /reset。最直接的"变坏"就是把这道分支拿掉。
+#
+# ⚠️ 不能用 is_admin 当变异点：自检 ⑩ 也有 is_admin 前置，两者会**同步**
+#    变成"非管理员"，于是自洽通过、表面全绿（这正是"它绿了"和"它测到了"
+#    的区别）。所以这里直接给 _delete_dir 换一个**删掉了 takeown 分支**
+#    的替身 —— 从真实源码里切掉那一段再 exec，保证与线上实现只差这一处。
+
+def m_takeown():
+    import inspect
+    import uninstaller as _un
+
+    src = inspect.getsource(_un._delete_dir)
+    # 去掉函数体的缩进（def 行本身无缩进）
+    lines = src.splitlines(True)
+    body = "".join(lines[1:])
+    body = textwrap.dedent(body)
+    # 精确切除 takeown 分支（从注释到该 if 块结束）。
+    # 注意：后面的代码仍会读 acl_reset（在"权限受阻"分支里用来决定
+    # 提示措辞），所以切除处必须补回它的定义，否则变异版会 NameError、
+    # 整个检查函数抛异常，反而把真正要验的断言掩盖成"聚合兜底失败"。
+    # dedent 会把函数体整体拉到 0 缩进（docstring 行本身就是 0 缩进，
+    # 公共前缀因此是空），所以标记串**不能**带前导空格。
+    start = body.find("# 第二道关键修复：ACL 受阻时夺取所有权")
+    marker = "# 逐项删（从最深层往上）"
+    end = body.find(marker)
+    assert start != -1 and end != -1 and start < end, \
+        "找不到 takeown 分支，变异用例失效（实现改了）"
+    stripped = body[:start] + "acl_reset = False\n" + body[end:]
+    ns = {"os": _un.os, "shutil": _un.shutil, "time": _un.time,
+          "IS_WIN": _un.IS_WIN, "is_admin": _un.is_admin,
+          "_take_ownership": _un._take_ownership,
+          "_dir_tree_clear_readonly": _un._dir_tree_clear_readonly,
+          "_dir_size": _un._dir_size, "_clear_readonly": _un._clear_readonly,
+          "_is_permission_error": _un._is_permission_error,
+          "_move_file_delayed": _un._move_file_delayed}
+    exec(compile("def _delete_dir(path):\n" + textwrap.indent(stripped, "    "),
+                 "<mutation>", "exec"), ns)
+    _un._m_orig_delete_dir = _un._delete_dir
+    _un._delete_dir = ns["_delete_dir"]
+
+
+def r_takeown():
+    import uninstaller as _un
+    if hasattr(_un, "_m_orig_delete_dir"):
+        _un._delete_dir = _un._m_orig_delete_dir
+        del _un._m_orig_delete_dir
+
+
+CASES.append(("takeown", "ACL 受阻时 _delete_dir 走 takeown 夺权分支",
+              m_takeown, r_takeown, "uninstall"))
+
+
 # ⚠️ 标题**不在这里**打印：`--list` 的输出会被 _run_mutation.ps1 逐行当用例名
 # 用，多出一行标题就会去跑一个不存在的用例、退出码非 0，最后被判成"这些断言
 # 没抓住"。标题挪进 main() 的非 --list 分支了。
@@ -825,6 +955,14 @@ def do_one(tag):
         say("!! 没有这个用例：%s（可用：%s）"
             % (tag, ", ".join(c[0] for c in CASES)))
         return 2
+    # 先落一个保守的 MISSED：万一进程在判定前就崩了（MainWindow 相关用例
+    # 偶发无栈退出），脚本能读到"崩了"而不是"没有文件"，不会把它当成
+    # 两边都不算的灰区。
+    try:
+        with open("_mut_verdict_%s.txt" % tag, "w", encoding="ascii") as f:
+            f.write("MISSED\nreason=process-died-before-judging\n")
+    except OSError:
+        pass
     suite = item[4] if len(item) > 4 else "theme"
     _, expect, mutate, restore = item[:4]
     mutate()
@@ -844,6 +982,26 @@ def do_one(tag):
     extra = got - {expect}
     if extra:
         say("        ⚠ 除了期望的那条，还有别的红了：%s" % sorted(extra))
+    # 判定结果单独落一个文件，供 _run_mutation.ps1 读取。
+    #
+    # 为什么不让脚本看退出码：本进程会起 MainWindow，它的后台监视线程
+    # 有时往 stderr 抛 "RuntimeError: Signal source has been deleted"，
+    # 而 PowerShell 的 `$out = & $py ... 2>&1` 在遇到 native 命令写 stderr
+    # 时会抛 NativeCommandError —— **$out 与 $LASTEXITCODE 都会失真**。
+    # 症状：用例其实抓住了，脚本却记成 "NOT CAUGHT" 且报告里没有它的输出
+    #（v1.0.2 时 hoverqss / hoverleak / hoverchk / edgeguard 四个用例
+    # 就这么被冤枉过，单独跑全是 rc=0 抓住 ✓）。用文件判定彻底绕开噪音。
+    try:
+        # 纯 ASCII + 无 BOM：PowerShell 5.1 的 Get-Content 按 ANSI 读 UTF-8，
+        # 带 BOM 时首行会变成 "\ufeffCAUGHT" 而比较失败（本项目的老坑）。
+        # expect/got 里有中文、不能原样写进 ascii 文件，所以只留判定 + 计数
+        #（详情看 _mutation_report.txt，那是 utf-8 的）。
+        txt = "%s\nexpect_len=%d\ngot_count=%d\n" % (
+            "CAUGHT" if hit else "MISSED", len(expect), len(got))
+        with open("_mut_verdict_%s.txt" % tag, "w", encoding="ascii") as f:
+            f.write(txt)
+    except OSError:
+        pass
     return 0 if hit else 1
 
 

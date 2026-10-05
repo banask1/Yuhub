@@ -504,6 +504,89 @@ def _check_delete_permissions(checks):
         "detail": "存在=%s" % hasattr(un, "_take_ownership"),
     })
 
+    # ⑩ ACL 受阻时 _delete_dir 必须走 takeown 分支（v1.0.2 问题 3 的回归）。
+    #
+    #    为什么用**打桩**而不是造一个真的"管理员也删不掉"的目录：
+    #    实测在本机（管理员 + SeBackupPrivilege）下，无论把所有者改成
+    #    SYSTEM、还是挂 (D)/(DC) 拒绝 ACE，os.remove 都照样成功 —— 真实
+    #    故障现场（杀软 minifilter 拦截 / 特殊 ACL）无法在自检里复现。
+    #    硬造一条"永远跳过"的断言等于装饰品。这里改成桩测试：把
+    #    shutil.rmtree / os.remove 换成抛 WinError 5 的假实现，断言
+    #    _take_ownership 被调用过、且最终报告"权限受阻"而不是"占用"。
+    #
+    #    两个前提必须成立，否则断言无意义：
+    #      a) un.is_admin() 为真（_delete_dir 只在管理员下做 takeown）；
+    #      b) 打桩的删除确实抛 WinError 5（真·权限）。
+    #
+    #    ⚠️ 非管理员时**不把断言算作通过**：那会让"前提缺失"伪装成"验证
+    #    过了"（本项目在"读不到源码 → 通过"上栽过）。这里单列一条环境
+    #    前置断言，把"没跑"和"跑过了"分开报。
+    checks.append({
+        "name": "[前置] ACL 回归需要管理员环境（否则该断言只是空转）",
+        "pass": bool(un.IS_WIN and un.is_admin()),
+        "detail": "IS_WIN=%s is_admin=%s（非管理员时下面两条 takeown 断言无法验证）"
+                  % (un.IS_WIN, un.is_admin()),
+    })
+    if un.IS_WIN and un.is_admin():
+        acl_dir = os.path.join(tempfile.gettempdir(),
+                               "YuhubSelfTestAcl_%d" % os.getpid())
+        shutil.rmtree(acl_dir, ignore_errors=True)
+        os.makedirs(acl_dir)
+        victim = os.path.join(acl_dir, "victim.bin")
+        with open(victim, "wb") as fh:
+            fh.write(b"q" * 1024)
+
+        real_rmtree = shutil.rmtree
+        real_remove = os.remove
+        real_rmdir = os.rmdir
+        real_take = un._take_ownership
+
+        calls = {"takeown": 0, "remove": 0}
+
+        def _fake_rmtree(path, ignore_errors=False, **kw):
+            # 假装清不掉，让 _delete_dir 往下走
+            return None
+
+        def _fake_remove(path, **kw):
+            calls["remove"] += 1
+            e = OSError(13, "Access is denied")
+            e.winerror = 5          # 真·权限拒绝（不是占用）
+            raise e
+
+        def _fake_rmdir(path, **kw):
+            e = OSError(13, "Access is denied")
+            e.winerror = 5
+            raise e
+
+        def _fake_take(path):
+            calls["takeown"] += 1
+            return False            # 夺权也失败（场景：连 takeown 都被拦）
+
+        shutil.rmtree = _fake_rmtree
+        os.remove = _fake_remove
+        os.rmdir = _fake_rmdir
+        un._take_ownership = _fake_take
+        try:
+            r = un._delete_dir(acl_dir)
+        finally:
+            shutil.rmtree = real_rmtree
+            os.remove = real_remove
+            os.rmdir = real_rmdir
+            un._take_ownership = real_take
+        why = str(r[3])
+        checks.append({
+            "name": "ACL 受阻时 _delete_dir 走 takeown 夺权分支",
+            "pass": calls["takeown"] >= 1,
+            "detail": "takeown 调用次数=%d remove 尝试=%d"
+                      % (calls["takeown"], calls["remove"]),
+        })
+        checks.append({
+            "name": "ACL 受阻的失败原因报「权限」而非「占用」",
+            "pass": ("权限" in why) and ("占用" not in why.replace("可能仍被进程占用", "")),
+            "detail": "why=%r" % why[:160],
+        })
+        shutil.rmtree(acl_dir, ignore_errors=True)
+
 
 def _runtime_flags():
     """顺带记录运行时关键能力，用于排查"打包后某能力丢失"。"""

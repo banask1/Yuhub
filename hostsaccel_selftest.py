@@ -395,18 +395,48 @@ def _elevated_checks(tmp_root):
     def payload(obj):
         return b64mod.b64encode(json.dumps(obj).encode("utf-8")).decode("ascii")
 
+    # ⚠️ 整个提权入口检查都在**临时 hosts** 上跑。elevated_hosts_main 是
+    #    提权入口，它内部直接调 hosts_path()，**不看 is_admin** —— 只要
+    #    有一个用例忘了打桩、而校验又被破坏（变异测试就会这么干），
+    #    写盘就会落到真实 hosts 上。v1.0.2 真实踩过：变异抹掉 proxy 标记后
+    #    "代理模式带真实公网 IP" 那条断言（当时用 result_file="x" 且没打桩）
+    #    真的把 store.steampowered.com 写进了系统 hosts，项目根还多出个 x。
+    #    这里在函数入口统一钉住临时路径，函数出口还原。
+    _tmp_hosts = os.path.join(tmp_root, "g_elev_hosts")
+    _tmp_bak = os.path.join(tmp_root, "g_elev_bak")
+    os.makedirs(_tmp_bak, exist_ok=True)
+    with open(_tmp_hosts, "w", encoding="utf-8", newline="") as fh:
+        fh.write("127.0.0.1 localhost\r\n")
+    _rp, _rb = ha.hosts_path, ha.backup_dir
+    ha.hosts_path = lambda: _tmp_hosts
+    ha.backup_dir = lambda: _tmp_bak
+
+    # 结果文件一律走临时目录：这些断言预期返回 3，但"预期"不是保障 ——
+    # 真被写上也不能落到项目根（曾经凭空出现一个名为 x 的文件）。
+    def _rf(name):
+        return os.path.join(tmp_root, name)
+
+    try:
+        return _elevated_checks_inner(tmp_root, payload, _rf)
+    finally:
+        ha.hosts_path, ha.backup_dir = _rp, _rb
+
+
+def _elevated_checks_inner(tmp_root, payload, _rf):
     chk("非 base64 载荷 → 2", ha.elevated_hosts_main("!!bad!!") == 2, "")
     chk("缺 result_file → 3", ha.elevated_hosts_main(payload(
         {"mode": "clean", "service": "steam", "result_file": ""})) == 3, "")
     chk("非法 mode → 3", ha.elevated_hosts_main(payload(
-        {"mode": "kill", "service": "steam", "result_file": "x"})) == 3, "")
+        {"mode": "kill", "service": "steam",
+         "result_file": _rf("r_kill.json")})) == 3, "")
     chk("未知服务 → 3", ha.elevated_hosts_main(payload(
-        {"mode": "clean", "service": "bilibili", "result_file": "x"})) == 3, "")
+        {"mode": "clean", "service": "bilibili",
+         "result_file": _rf("r_unk.json")})) == 3, "")
     chk("私网 IP 拒绝写入 → 3", ha.elevated_hosts_main(payload(
-        {"mode": "write", "service": "steam", "result_file": "x",
+        {"mode": "write", "service": "steam", "result_file": _rf("r_priv.json"),
          "entries": [["192.168.1.1", "store.steampowered.com"]]})) == 3, "")
     chk("清单外域名拒绝写入 → 3", ha.elevated_hosts_main(payload(
-        {"mode": "write", "service": "steam", "result_file": "x",
+        {"mode": "write", "service": "steam", "result_file": _rf("r_off.json"),
          "entries": [["8.8.8.8", "evil.example.com"]]})) == 3, "")
 
     # 代理模式的载荷校验。会真正走到写盘的用例必须先把 hosts_path /
@@ -442,19 +472,43 @@ def _elevated_checks(tmp_root):
             ha.entries_mode(ha.current_entries("steam", path=tmp3)) == "proxy", "")
     finally:
         ha.hosts_path, ha.backup_dir = real_path3, real_bak3
-    # 模式与地址不一致 / 清单外 —— 校验在写盘之前就拒绝（真实路径安全）
-    chk("代理模式带真实公网 IP → 3（模式与地址必须一致）",
-        ha.elevated_hosts_main(payload(
-            {"mode": "write", "service": "steam", "result_file": "x",
-             "proxy": True,
-             "entries": [["23.15.142.182", "store.steampowered.com"]]})) == 3, "")
-    chk("直连模式带 127.0.0.1 → 3（不能绕过公网校验）",
-        ha.elevated_hosts_main(payload(
-            {"mode": "write", "service": "steam", "result_file": "x",
-             "entries": [["127.0.0.1", "store.steampowered.com"]]})) == 3, "")
-    chk("代理模式 + 清单外域名 → 3", ha.elevated_hosts_main(payload(
-        {"mode": "write", "service": "steam", "result_file": "x", "proxy": True,
-         "entries": [["127.0.0.1", "evil.example.com"]]})) == 3, "")
+    # 模式与地址不一致 / 清单外 —— 这几种**理论上**在写盘之前就被拒绝，
+    # 但绝不能依赖"理论上"：
+    #   ⚠️ v1.0.2 真实踩过。变异测试把 proxy 标记抹掉后，这三条里
+    #   "代理模式带真实公网 IP" 的校验会退化成直连分支 → 公网 IP 合法 →
+    #   **真的写进了真实 hosts**（因为这里当时没打桩 hosts_path，
+    #   `result_file` 还写成了字面量 "x"，项目根目录凭空多出一个 x 文件）。
+    #   铁律：凡真调 elevated_hosts_main 的地方，无论是否预期被拒，
+    #   hosts_path / backup_dir 一律打桩到临时位置，result_file 也走临时目录。
+    tmp4 = os.path.join(tmp_root, "hosts4")
+    bak4 = os.path.join(tmp_root, "bak4")
+    os.makedirs(bak4, exist_ok=True)
+    with open(tmp4, "w", encoding="utf-8", newline="") as fh:
+        fh.write("127.0.0.1 localhost\r\n")
+    real_path4, real_bak4 = ha.hosts_path, ha.backup_dir
+    ha.hosts_path = lambda: tmp4
+    ha.backup_dir = lambda: bak4
+    try:
+        chk("代理模式带真实公网 IP → 3（模式与地址必须一致）",
+            ha.elevated_hosts_main(payload(
+                {"mode": "write", "service": "steam",
+                 "result_file": os.path.join(tmp_root, "res_rej1.json"),
+                 "proxy": True,
+                 "entries": [["23.15.142.182", "store.steampowered.com"]]})) == 3, "")
+        chk("直连模式带 127.0.0.1 → 3（不能绕过公网校验）",
+            ha.elevated_hosts_main(payload(
+                {"mode": "write", "service": "steam",
+                 "result_file": os.path.join(tmp_root, "res_rej2.json"),
+                 "entries": [["127.0.0.1", "store.steampowered.com"]]})) == 3, "")
+        chk("代理模式 + 清单外域名 → 3", ha.elevated_hosts_main(payload(
+            {"mode": "write", "service": "steam",
+             "result_file": os.path.join(tmp_root, "res_rej3.json"), "proxy": True,
+             "entries": [["127.0.0.1", "evil.example.com"]]})) == 3, "")
+    finally:
+        ha.hosts_path, ha.backup_dir = real_path4, real_bak4
+    # 这几条本该被拒 → 临时 hosts 不该有任何改动（顺带证明"拒绝发生在写盘前"）
+    chk("被拒的写入没有改动 hosts（拒绝必须发生在写盘之前）",
+        "store.steampowered.com" not in open(tmp4, encoding="utf-8").read(), "")
 
     # clean 全流程：hosts_path / backup_dir 都指到临时位置，绝不碰真实文件
     tmp = os.path.join(tmp_root, "hosts2")
@@ -529,8 +583,11 @@ def _net_logic_checks():
 
 
 def _misc_checks():
-    chk("hosts_path 指向真实存在的系统 hosts", os.path.isfile(ha.hosts_path()),
-        ha.hosts_path())
+    # ⚠️ 必须用 _REAL_HOSTS_PATH：自检期间 ha.hosts_path() 已被 guard 钉到
+    #    哨兵路径，直接用它会看到哨兵（这条断言就红过）。这里要验的是
+    #    "程序默认指向真实系统 hosts"，与自检期间的打桩无关。
+    _hp = _REAL_HOSTS_PATH or ha.hosts_path()
+    chk("hosts_path 指向真实存在的系统 hosts", os.path.isfile(_hp), _hp)
     res = ha.flush_dns_cache()
     chk("flush_dns_cache 返回布尔且不抛异常", isinstance(res, bool), res)
     chk("提权开关与 main.py 分发一致", ha._ELEVATED_FLAG == "--hosts-elevated",
@@ -1048,25 +1105,76 @@ def _ui_checks():
 def _guard_real_hosts():
     """把"真写系统 hosts"这条路上锁死 —— 自检第一红线。
 
-    血泪（2026-10-05）：测试机本身是管理员时，`try_write_direct` 会因
-    `is_admin()==True` 直接放行，绕过打桩的 `run_elevated`，**真的把
-    `store.steampowered.com -> 127.0.0.1` 写进 C:\\Windows\\...\\hosts**。
-    自检跑完还在里面留了区块，用户的真实网络会被影响。
+    血泪（2026-10-05，踩过两次）：
+      第一次：测试机是管理员时，`try_write_direct` 因 `is_admin()==True`
+        直接放行，绕过打桩的 `run_elevated`，**真的把
+        `store.steampowered.com -> 127.0.0.1` 写进 C:\\Windows\\...\\hosts**。
+      第二次（v1.0.2 变异测试）：`elevated_hosts_main` 是**提权入口**，
+        它内部直接调 `hosts_path()`，**根本不看 is_admin**。自检里三条
+        "预期被拒绝"的断言按当时的设计没打桩 hosts_path（因为"反正会被
+        拒、不会写盘"）；变异抹掉 proxy 标记后校验退化成直连分支 →
+        公网 IP 合法 → 真的落到了真实 hosts。
 
-    这里在自检开始时就把 `is_admin` 钉成 False（让所有路径都必须走
-    打桩的提权分支），并且把 `hosts_path` 指到一个不存在的哨兵路径 ——
-    双保险：即使将来有人忘了打桩 is_admin，写盘也只会打到一个空路径上。
-    跑完 before/after 对比真实 hosts 的 mtime + 内容，确认一个字节都没动。
+    所以只钉 is_admin 是**不够的**。这里改成**双保险**：
+      1. `is_admin` 钉成 False（所有路径都必须走打桩的提权分支）；
+      2. `hosts_path` / `backup_dir` 直接钉到**哨兵路径**（一个临时目录下的
+         不存在文件）—— 这样即使某个用例忘了打桩、或者提权入口被直接
+         调用，写盘也只会打到一个临时哨兵上。
+    用例里的显式打桩（`ha.hosts_path = lambda: tmp`）在 guard 之后执行，
+    会正常覆盖哨兵；其 finally 还原到哨兵（而不是真实路径），依旧安全。
+
+    返回 (real_is_admin, real_hosts_path, real_backup_dir) 供收尾还原；
+    真实 hosts 的路径另存在 `_REAL_HOSTS_PATH` 供快照函数读取。
     """
+    global _REAL_HOSTS_PATH, _REAL_BACKUP_DIR, _REAL_HOSTS_BYTES
     real_is_admin = ha.is_admin
+    _REAL_HOSTS_PATH = ha.hosts_path()
+    _REAL_BACKUP_DIR = ha.backup_dir()
+    # 留存原始字节：万一自检还是污染了真实 hosts（绕过所有打桩），
+    # 收尾时用它原样还原。这是最后一道保险，不留污染给用户。
+    try:
+        with open(_REAL_HOSTS_PATH, "rb") as _fh:
+            _REAL_HOSTS_BYTES = _fh.read()
+    except OSError:
+        _REAL_HOSTS_BYTES = None
     ha.is_admin = lambda: False
+    sentinel = os.path.join(tempfile.gettempdir(), "yuhub_selftest_sentinel")
+    try:
+        os.makedirs(sentinel, exist_ok=True)
+    except OSError:
+        pass
+    ha.hosts_path = lambda: os.path.join(sentinel, "hosts_SENTINEL_DO_NOT_USE")
+    ha.backup_dir = lambda: sentinel
     return real_is_admin
+
+
+# 真实 hosts / 备份目录的路径，只在 _guard_real_hosts 里记一次。
+# 快照函数必须用它 —— guard 之后 ha.hosts_path() 已经指向哨兵了。
+_REAL_HOSTS_PATH = None
+_REAL_BACKUP_DIR = None
+# 真实 hosts 的原始字节（最后一道保险用）。
+_REAL_HOSTS_BYTES = None
+
+
+def _restore_real_hosts():
+    """把真实 hosts 还原成自检开始前的内容。成功返回 True。"""
+    if _REAL_HOSTS_BYTES is None or not _REAL_HOSTS_PATH:
+        return False
+    try:
+        with open(_REAL_HOSTS_PATH, "wb") as fh:
+            fh.write(_REAL_HOSTS_BYTES)
+        import hashlib
+        with open(_REAL_HOSTS_PATH, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest() == \
+                hashlib.sha256(_REAL_HOSTS_BYTES).hexdigest()
+    except OSError:
+        return False
 
 
 def _real_hosts_snapshot():
     """记一份真实 hosts 的快照（内容 sha256），用于自检前后比对。"""
     import hashlib
-    p = ha.hosts_path()
+    p = _REAL_HOSTS_PATH or ha.hosts_path()
     try:
         with open(p, "rb") as fh:
             data = fh.read()
@@ -1181,7 +1289,8 @@ def run(out_file):
     _result["info"]["is_admin"] = ha.is_admin()
     _result["info"]["frozen"] = bool(getattr(sys, "frozen", False))
 
-    # 自检开始前：钉住 is_admin=False + 记录真实 hosts 快照（见 _guard_real_hosts）
+    # 自检开始前：钉住 is_admin=False + hosts_path/backup_dir 指向哨兵
+    # + 记录真实 hosts 快照（见 _guard_real_hosts）
     real_is_admin = _guard_real_hosts()
     before = _real_hosts_snapshot()
 
@@ -1202,11 +1311,24 @@ def run(out_file):
     _ui_checks()
 
     # 自检结束后：真实 hosts 必须一个字节都没变
+    # ⚠️ 还要把 guard 钉的哨兵还原回真实路径 —— 否则后续在同一进程里跑的
+    #    代码（比如变异脚本的同进程步骤）会继续往哨兵上写。
     ha.is_admin = real_is_admin
+    if _REAL_HOSTS_PATH:
+        ha.hosts_path = lambda p=_REAL_HOSTS_PATH: p
+    if _REAL_BACKUP_DIR:
+        ha.backup_dir = lambda p=_REAL_BACKUP_DIR: p
     after = _real_hosts_snapshot()
+    intact = before["sha"] == after["sha"] and before["size"] == after["size"]
     chk("自检全程未改动真实 hosts（内容 sha256 前后一致）",
-        before["sha"] == after["sha"] and before["size"] == after["size"],
-        {"before": before, "after": after})
+        intact, {"before": before, "after": after})
+    # 最后一道保险：万一真的被写了（比如将来又有人绕过所有打桩），
+    # 这里用 guard 阶段留存的原始字节**原样还原**，并如实报错 ——
+    # 宁可自检红，也绝不能给用户留下污染。
+    if not intact:
+        restored = _restore_real_hosts()
+        chk("真实 hosts 被改动后已自动还原", restored,
+            "自检污染了真实 hosts！%s" % before["path"])
 
     _result["checks"].append({
         "name": "自检全程未写真实 hosts（写盘断言全在临时文件）",
