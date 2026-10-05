@@ -11,10 +11,14 @@
     把测速最优的公网 IP 直接写进 hosts。最简单，但对 DNS 之外的问题
     （SNI 阻断等）无能为力。
 
-工作流：
-  打开开关 → 后台 DoH 解析 + TCP443 测速 → 写 hosts（反代模式先把代理跑起来）
-           → 刷新 DNS 缓存 → 开关停在"开"
-  关闭开关 → 停对应链路 + 清掉本服务条目（直连模式不占端口）
+**秒加速（v1.0.3）**：Steam++ 点一下就能用的原因，是它的启用路径上
+**没有任何网络测量** —— hosts 只写 127.0.0.1，真实 IP 交给本地代理按
+SNI 现场解析。这一版照做：
+
+  打开开关（反向代理）→ 启动本地代理 → 立刻写 127.0.0.1（不测速）
+                      → 后台预热"域名→IP"映射缓存（不挡启用）
+  打开开关（直连）    → 上次优选缓存齐全时直接秒写；不齐才退化为先测速
+  关闭开关            → 作废在途任务 → 立即清理（永不被"忙碌"挡住）
 
 线程纪律（本项目硬规则）：引擎回调一律来自后台线程，回调里**只 emit 信号**，
 所有界面改动都留在主线程槽函数里。代理解析回调发生在代理工作线程，
@@ -61,12 +65,13 @@ class AccelPage(BasePage):
     _measure_finished = Signal(str, bool, str, list)
     _write_finished = Signal(str, bool, str)
     _clean_finished = Signal(str, bool, str)
+    _prefetch_finished = Signal(str, list)
 
     def __init__(self, notify=None, parent=None):
         super().__init__(
             "Steam / GitHub 加速",
-            "与 Steam++（Watt Toolkit）同形态的本地加速：DoH 防污染解析 + TCP 443 测速，"
-            "配合本地反向代理按 SNI 转发到最优节点，免代理直连。",
+            "与 Steam++（Watt Toolkit）同形态的本地加速：开启即写 hosts、立刻生效；"
+            "本地反向代理按 SNI 把流量转发到最优节点，免代理直连。",
             icon="🚀",
             notify=notify,
             parent=parent,
@@ -74,6 +79,15 @@ class AccelPage(BasePage):
         # 每个服务独立的忙碌标记与最近一次优选结果
         self._busy = {ha.SERVICE_STEAM: False, ha.SERVICE_GITHUB: False}
         self._pending = {ha.SERVICE_STEAM: [], ha.SERVICE_GITHUB: []}
+        # 取消事件（每个服务一份，每次"打开"换一个新的）。
+        # 作用：用户把开关拨回"关"时 set 一下，在途的测速/预热线程看到就
+        # 丢弃结果 —— 这是 v1.0.3 修「关不掉」的关键：关闭动作不再被
+        # "正在测速"的忙碌状态挡住。
+        self._cancel = {s: threading.Event() for s in ha.SERVICES}
+        # 是否有提权写盘正在进行（决定"关闭"是直接清还是等写盘收尾再清）
+        self._writing = {s: False for s in ha.SERVICES}
+        # 后台预热映射缓存的状态（同一服务不并发跑两次）
+        self._prefetch_running = {s: False for s in ha.SERVICES}
         # 优选映射缓存（domain -> 真实 IP），代理 resolver 的数据源
         self._ipmap = ha.load_map_cache()
         self._ipmap_lock = threading.Lock()
@@ -83,6 +97,7 @@ class AccelPage(BasePage):
         self._measure_finished.connect(self._on_measure_finished)
         self._write_finished.connect(self._on_write_finished)
         self._clean_finished.connect(self._on_clean_finished)
+        self._prefetch_finished.connect(self._on_prefetch_finished)
 
         self._build_content()
 
@@ -107,15 +122,168 @@ class AccelPage(BasePage):
         sw.blockSignals(blocked)
 
     def _toggled(self, svc, on):
-        """开关被用户点动：开 → 加速，关 → 恢复默认。"""
-        if self._busy[svc]:
-            # 忙碌中不许改取向：把开关拨回真实状态，避免"点了没反应"的错觉
-            self._sync_switch(svc)
-            return
+        """开关被用户点动：开 → 加速，关 → 恢复默认。
+
+        ⚠️ **关闭动作永远不被忙碑挡住**。v1.0.2 的写法是"忙碌中一律把开关
+        弹回真实状态"，配上"打开开关要跑十几秒测速"，就变成了用户报的
+        「关不掉」：点关 → 开关弹回去 → 什么都不发生，得干等测速跑完。
+        现在关闭会直接作废在途任务（见 _start_disable）。
+        """
         if on:
-            self._start_optimize(svc)
+            if self._busy[svc]:
+                self._sync_switch(svc)       # 打开动作仍防重入
+                return
+            self._start_enable(svc)
         else:
-            self._start_clean(svc)
+            self._start_disable(svc)
+
+    def _abort_job(self, svc):
+        """作废该服务在途的测速/预热任务（线程看到事件就丢弃结果）。"""
+        ev = self._cancel.get(svc)
+        if ev is not None:
+            ev.set()
+
+    def _start_disable(self, svc):
+        """关闭加速 —— 立即生效，不等任何在途任务。
+
+        先 set 取消事件（在途测速线程会在回调前看到并闭嘴），再走清理。
+        若此刻正在提权写盘（多半是卡在 UAC 弹窗上），先不抢着清理：
+        让 _on_write_finished 以"关"为准补一刀，避免出现"开关显示关着、
+        hosts 里却还留着条目"的错位。
+        """
+        self._abort_job(svc)
+        self._busy[svc] = False
+        if self._writing.get(svc):
+            self._prefetch_running[svc] = False
+            self._refresh_status()
+            return
+        self._start_clean(svc)
+
+    # ------------------------------------------------------------ 秒加速
+    def _start_enable(self, svc):
+        """打开加速 —— **秒加速**入口（Steam++ 同形态）。
+
+        代理模式（默认、也是推荐）
+            不做**任何**测速：直接写 127.0.0.1 + 确保本地代理在跑，真实 IP
+            由代理按 SNI 现场解析（缓存命中用缓存，未命中才 DoH+测速兜底）。
+            启用路径上只有一次"改 hosts"，所以点一下立刻生效。
+            映射缓存的预热放到**后台**，不挡启用。
+        直连模式
+            必须知道真实 IP，所以先看上次优选缓存：齐全就秒写；不齐只能
+            退化为"先测速"（这一步躲不掉，但可以随时关掉取消）。
+
+        另外：如果 hosts 里已经是我们要写的那套内容，连提权都省掉 ——
+        重复拨开关是瞬时的，也不会反复弹 UAC。
+        """
+        if self._busy[svc]:
+            return
+        mode = self._current_mode()
+        ev = threading.Event()
+        self._cancel[svc] = ev
+        self._busy[svc] = True
+        card = self._cards[svc]
+
+        if mode == _MODE_PROXY:
+            ok, why = self._ensure_proxy()       # 代理必须先监听，再写 hosts
+            if not ok:
+                self._busy[svc] = False
+                self._sync_switch(svc)
+                self.toast("本地代理启动失败：%s。可切到「直连 hosts」模式" % why)
+                self._refresh_status()
+                return
+            entries = [(ha.PROXY_IP, d) for d in ha.DOMAINS[svc]]
+            self._pending[svc] = entries
+            card._progress.setVisible(True)
+            card._progress.setText("正在写入 hosts（%d 个域名，无需测速）…"
+                                   % len(entries))
+            self._write_entries(svc, entries, True, ev)
+            self._prefetch_map(svc)
+            return
+
+        # ---- 直连模式：缓存齐全 → 秒写；不齐 → 只能先测速 ----
+        entries, missing = ha.instant_entries(svc, _MODE_DIRECT, self._ipmap)
+        if not missing and entries:
+            self._pending[svc] = entries
+            card._progress.setVisible(True)
+            card._progress.setText("正在写入 hosts（%d 个域名，来自上次优选缓存）…"
+                                   % len(entries))
+            self._write_entries(svc, entries, False, ev)
+            self._prefetch_map(svc)
+            return
+        self._busy[svc] = False
+        self._start_optimize(svc)
+
+    def _write_entries(self, svc, entries, proxy_mode, cancel):
+        """把条目落盘：已在管理员 → 直写；否则提权。
+
+        提权要等 UAC，一律放后台线程里轮询，绝不阻塞主线程。
+        """
+        card = self._cards[svc]
+        # 内容已经一致 → 不写盘、不弹 UAC（重复拨开关因此也是瞬时的）
+        if ha.entries_match(ha.current_entries(svc), entries):
+            ha.flush_dns_cache()
+            self._on_write_finished(svc, True, "")
+            return
+        if ha.is_admin():
+            res = ha.try_write_direct("write", svc, entries, proxy=proxy_mode)[1]
+            if res and res.get("ok"):
+                ha.flush_dns_cache()
+                self._on_write_finished(svc, True, "")
+            else:
+                self._on_write_finished(
+                    svc, False, (res or {}).get("error") or "写入 hosts 失败")
+            return
+
+        card._progress.setText("正在写入系统 hosts（请在 UAC 弹窗中确认）…")
+        self._writing[svc] = True
+
+        def work():
+            # 引擎/提权都在后台线程：只 emit 信号，界面改动全在主线程槽
+            res = ha.run_elevated("write", svc, entries, proxy=proxy_mode)
+            if res is None:
+                self._write_finished.emit(svc, False, "未完成写入（取消了 UAC 或超时）")
+                return
+            if res.get("ok"):
+                ha.flush_dns_cache()
+                self._write_finished.emit(svc, True, "")
+            else:
+                self._write_finished.emit(
+                    svc, False, res.get("error") or "写入 hosts 失败")
+
+        threading.Thread(target=work, name="YuhubHostsWrite", daemon=True).start()
+
+    def _prefetch_map(self, svc):
+        """后台预热"域名 → 真实 IP"映射缓存（代理按 SNI 查的就是它）。
+
+        纯后台、不需提权、失败也无所谓 —— 代理未命中缓存时会现场解析。
+        缓存又新又全时直接跳过，免得每次拨开关都白跑一遍测速。
+        """
+        if self._prefetch_running.get(svc):
+            return
+        with self._ipmap_lock:
+            complete = all(self._ipmap.get(d) for d in ha.DOMAINS[svc])
+        if complete and ha.map_cache_fresh():
+            return
+        self._prefetch_running[svc] = True
+
+        def work():
+            try:
+                pairs = [(ip, d) for d, ip in ha.optimize_service_map(svc).items()]
+            except Exception:
+                pairs = []
+            self._prefetch_finished.emit(svc, pairs)
+
+        threading.Thread(target=work, name="YuhubHostsPrefetch",
+                         daemon=True).start()
+
+    def _on_prefetch_finished(self, svc, pairs):
+        self._prefetch_running[svc] = False
+        if pairs:
+            with self._ipmap_lock:
+                for ip, d in pairs:
+                    self._ipmap[d] = ip
+            ha.save_map_cache(self._ipmap)
+            self._refresh_status()
 
     # ---------------------------------------------------------------- 代理
     def _proxy_resolver(self, domain):
@@ -195,14 +363,15 @@ class AccelPage(BasePage):
 
         self.add(info_card(
             "这是怎么工作的",
-            "国内运营商的 UDP 53 端口 DNS 可能返回被污染的假 IP。本功能改用 DoH"
-            "（DNS-over-HTTPS，加密传输）查询真实记录，再对每个候选节点做 TCP 443"
-            " 握手测速。反向代理模式下，hosts 把域名指向 127.0.0.1，本机代理按"
-            " SNI 把流量转发到最快的真实节点（同 Steam++ 的做法，不解密流量、"
-            "无需证书）；直连模式则把真实 IP 直接写进 hosts。写 hosts 前自动备份到"
-            " %LOCALAPPDATA%\\Yuhub\\hosts_backup，写后自动刷新 DNS 缓存。"
-            "修改 hosts 需要管理员权限，打开开关时会弹一次 UAC 确认；"
-            "如果 Yuhub 本身就以管理员身份运行，则不再重复弹窗。",
+            "国内运营商的 UDP 53 端口 DNS 可能返回被污染的假 IP。反向代理模式下，"
+            "hosts 把域名指向 127.0.0.1，本机代理按 SNI 把流量转发到最优真实节点"
+            "（同 Steam++ 的做法，不解密流量、无需证书）。因为启用时不需要先测速，"
+            "开关是点一下就生效的；真实 IP 由代理现场用 DoH（加密 DNS）解析并做 "
+            "TCP 443 握手测速，结果缓存下来复用。直连模式则把真实 IP 直接写进 hosts，"
+            "有缓存时同样秒开。写 hosts 前自动备份到 %LOCALAPPDATA%\\Yuhub\\hosts_backup，"
+            "写后自动刷新 DNS 缓存。修改 hosts 需要管理员权限，打开开关时会弹一次 "
+            "UAC 确认；如果 Yuhub 本身就以管理员身份运行，则不再重复弹窗；"
+            "hosts 内容已经是目标状态时也不会重复写入。",
         ))
         self.add(info_card(
             "能力边界（先说清楚，免得误会）",
@@ -212,8 +381,8 @@ class AccelPage(BasePage):
             " IP，TLS 握手也会被重置，透传代理不装证书不解密，绕不过这一层，"
             "完全访问仍需专业代理工具。② 反向代理模式会占用本机 443/80 端口："
             "与 Steam++ 等同类工具同时开加速会冲突，二选一即可。③ 退出 Yuhub"
-            " 时会自动停代理并提示恢复 hosts。测速结果随网络实时变化，觉得变慢"
-            "了把开关关掉再打开就是一次重新优选。",
+            " 时会自动停代理并提示恢复 hosts。测速结果缓存在本地，觉得变慢了"
+            "把开关关掉再打开就是一次重新优选。",
         ))
         self.add_stretch()
         self._refresh_status()
@@ -296,11 +465,12 @@ class AccelPage(BasePage):
         if self._current_mode() == _MODE_PROXY:
             self._mode_desc.setText(
                 "hosts 指向 127.0.0.1，本机监听 443/80，按 SNI 转发到最优节点"
-                "（同 Steam++）。接管 DNS，社区等站点也能访问；不解密流量、无需证书。")
+                "（同 Steam++）。开启即时生效：不预先测速，真实 IP 由本地"
+                "代理现场解析。接管 DNS，社区等站点也能访问；不解密流量、无需证书。")
         else:
             self._mode_desc.setText(
-                "把测速最优的公网 IP 直接写进 hosts。最简单、不占端口，但对 DNS"
-                " 污染之外的阻断无能为力。")
+                "把测速最优的公网 IP 直接写进 hosts。最简单、不占端口；"
+                "有上次优选缓存时开启是即时的，否则需要先测量一次。")
 
     # ------------------------------------------------------------ 状态展示
     def _refresh_status(self):
@@ -357,28 +527,32 @@ class AccelPage(BasePage):
 
     # ------------------------------------------------------------ 优选流程
     def _start_optimize(self, svc):
+        """直连模式且缓存不全时的兜底：先测速，测完再写真实 IP。
+
+        直连模式必须知道真实 IP，所以没有缓存时躲不掉这一步 —— 但整个流程
+        **可取消**：用户把开关拨回"关"时 cancel 事件会被 set，回调里直接
+        丢弃结果，同时进度行也不再刷（避免"关了还在滚"的错觉）。
+        """
         if self._busy[svc]:
             return
-        mode = self._current_mode()
-        # 反代模式：写 hosts 前代理必须已经在跑（顺序错了会有一段断网窗口）
-        if mode == _MODE_PROXY:
-            ok, why = self._ensure_proxy()
-            if not ok:
-                self.toast("本地代理启动失败：%s。可切到「直连 hosts」模式" % why)
-                self._refresh_status()
-                return
         self._busy[svc] = True
         self._pending[svc] = []
+        self._cancel.setdefault(svc, threading.Event())
+        ev = self._cancel[svc]
         card = self._cards[svc]
         card._progress.setVisible(True)
         card._progress.setText("正在解析与测速（0/%d）…" % len(ha.DOMAINS[svc]))
 
         def on_domain(done, total, domain, ip, ms, error):
             # 引擎回调在工作线程：只发信号，绝不碰界面
+            if ev.is_set():
+                return
             self._domain_done.emit(svc, done, total, domain, ip, ms, error)
 
         def work():
             entries = ha.optimize_service(svc, on_domain=on_domain)
+            if ev.is_set():
+                return                       # 用户已经关掉了，结果作废
             ok = bool(entries)
             msg = "" if ok else "未能测出任何可用节点，请检查网络连接"
             self._measure_finished.emit(svc, ok, msg, entries)
@@ -415,50 +589,32 @@ class AccelPage(BasePage):
                            "可切到「直连 hosts」模式" % why2)
                 self._refresh_status()
                 return
-        self._pending[svc] = [(ip, d) for ip, d, _ms in entries]
         if proxy_mode:
             # 真实 IP 进映射缓存（代理按 SNI 查的就是它）
             with self._ipmap_lock:
                 for ip, d, _ms in entries:
                     self._ipmap[d] = ip
             ha.save_map_cache(self._ipmap)
-            write_entries = [(ha.PROXY_IP, d) for _ip, d in self._pending[svc]]
+            write_entries = [(ha.PROXY_IP, d) for _ip, d, _ms in entries]
         else:
-            write_entries = self._pending[svc]
-
-        # 已经是管理员 → 不必再弹 UAC（这就是"明明有权限却总提示权限不够"的修法）
-        can_elev, _why = ha.elevation_capable()
-        if can_elev and ha.is_admin():
-            card._progress.setText("优选完成，正在写入系统 hosts…")
-            res = ha.try_write_direct("write", svc, write_entries, proxy=proxy_mode)[1]
-            if res and res.get("ok"):
-                ha.flush_dns_cache()
-                self._on_write_finished(svc, True, "")
-            else:
-                self._on_write_finished(svc, False,
-                                        (res or {}).get("error") or "写入 hosts 失败")
-            return
-
-        card._progress.setText("优选完成，正在写入系统 hosts（请在 UAC 弹窗中确认）…")
-
-        def work():
-            res = ha.run_elevated("write", svc, write_entries, proxy=proxy_mode)
-            if res is None:
-                self._write_finished.emit(svc, False, "未完成写入（取消了 UAC 或超时）")
-                return
-            if res.get("ok"):
-                ha.flush_dns_cache()
-                self._write_finished.emit(svc, True, "")
-            else:
-                self._write_finished.emit(svc, False,
-                                          res.get("error") or "写入 hosts 失败")
-
-        threading.Thread(target=work, name="YuhubHostsWrite", daemon=True).start()
+            write_entries = [(ip, d) for ip, d, _ms in entries]
+        self._pending[svc] = write_entries
+        card._progress.setText("优选完成，正在写入系统 hosts…")
+        self._cancel.setdefault(svc, threading.Event())
+        self._write_entries(svc, write_entries, proxy_mode, self._cancel[svc])
 
     def _on_write_finished(self, svc, ok, msg):
-        self._busy[svc] = False
         card = self._cards[svc]
         card._progress.setVisible(False)
+        self._writing[svc] = False
+        ev = self._cancel.get(svc)
+        if ev is not None and ev.is_set():
+            # 写入途中用户把开关拨到"关"了：以"关"为准，立刻补一刀清理 ——
+            # 否则会出现"开关显示关着、hosts 里还留着条目"的错位。
+            self._busy[svc] = False
+            self._start_clean(svc, quiet=True)
+            return
+        self._busy[svc] = False
         if ok:
             n = len(self._pending[svc])
             mode_txt = ("本地反向代理" if self._current_mode() == _MODE_PROXY
@@ -471,13 +627,19 @@ class AccelPage(BasePage):
         self._refresh_status()
 
     # ------------------------------------------------------------ 恢复默认
-    def _start_clean(self, svc):
+    def _start_clean(self, svc, quiet=False):
+        """关掉加速：清掉本服务的 hosts 条目 + 不再需要时停代理。
+
+        quiet=True 用于"写入途中被用户关掉"的补刀场景 —— 这时不该再弹
+        "已是默认状态"这种提示，用户只关心"关掉了没有"。
+        """
         if self._busy[svc]:
             return
         entries = ha.current_entries(svc)
         if not entries:
             # 本来就没有条目：不需要任何权限，直接报成功（旧版这里被提权入口挡住了）
-            self.toast("本服务当前没有加速条目，已是默认状态")
+            if not quiet:
+                self.toast("本服务当前没有加速条目，已是默认状态")
             self._refresh_status()
             return
         self._busy[svc] = True

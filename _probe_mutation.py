@@ -939,6 +939,82 @@ def do_base():
     return 0
 
 
+# ---- 33) 「秒加速」被改回"先测速再写盘"（Steam++ 之前的老行为）----
+def m_fastaccel():
+    """把 _start_enable 换回"无论什么模式都先跑一遍测速"。
+
+    这正是用户报的"不像 Steam++ 那样秒开"的根因，所以必须有断言逮住它：
+    代理模式拨开开关时应该**零测速**、直接写全量 127.0.0.1。
+    """
+    import ui.pages.accel_page as _ap
+    _ap.AccelPage._m_orig_enable = _ap.AccelPage._start_enable
+    _ap.AccelPage._start_enable = lambda self, svc: self._start_optimize(svc)
+
+
+def r_fastaccel():
+    import ui.pages.accel_page as _ap
+    _ap.AccelPage._start_enable = _ap.AccelPage._m_orig_enable
+
+
+CASES.append(("fastaccel", "秒加速：同步启用路径上一次测速都没有（快就快在这里）",
+              m_fastaccel, r_fastaccel, "hosts"))
+
+# ---- 34) 「关闭动作被忙碌挡住」被放回来（v1.0.2 的「关不掉」）----
+def m_canceloff():
+    """把 _start_disable 换回旧实现：忙碌中一律把开关弹回、什么都不做。
+
+    这就是用户报的「关不掉」——点关没反应，得干等测速跑完。断言逮不住它
+    的话，这个 bug 会静悄悄地回来。
+    """
+    import ui.pages.accel_page as _ap
+
+    def old_disable(self, svc):
+        if self._busy[svc]:
+            self._sync_switch(svc)
+            return
+        self._start_clean(svc)
+
+    _ap.AccelPage._m_orig_disable = _ap.AccelPage._start_disable
+    _ap.AccelPage._start_disable = old_disable
+
+
+def r_canceloff():
+    import ui.pages.accel_page as _ap
+    _ap.AccelPage._start_disable = _ap.AccelPage._m_orig_disable
+
+
+CASES.append(("canceloff", "忙碌中拨到关 → 立刻清理，不被 busy 挡住",
+              m_canceloff, r_canceloff, "hosts"))
+
+# ---- 35) 回调纪律扫描名单被写窄（新函数成了扫描盲区）----
+def m_astscan():
+    """把 accel_page 里的 _start_enable 改名，模拟"名单没跟上重构"。
+
+    这种漏最阴：断言照样全绿，但那段代码其实**根本没被扫到**
+   （"它绿了"≠"它测到了"）。所以专门有一条断言盯着"名单覆盖全部后台入口"。
+    """
+    import hostsaccel_selftest as _hst
+    orig = _hst._module_source
+    src = orig("accel_page.py")
+    assert src and "def _start_enable" in src, "锚点没命中"
+    mutated = src.replace("def _start_enable", "def _start_enable_RENAMED", 1)
+
+    def fake(filename, _orig=orig, _mut=mutated):
+        return _mut if filename == "accel_page.py" else _orig(filename)
+
+    _hst._m_orig_ms2 = orig
+    _hst._module_source = fake
+
+
+def r_astscan():
+    import hostsaccel_selftest as _hst
+    _hst._module_source = _hst._m_orig_ms2
+
+
+CASES.append(("astscan", "回调纪律扫描覆盖全部后台入口（名单不能漏）",
+              m_astscan, r_astscan, "hosts"))
+
+
 def do_one(tag):
     """只跑一个用例。
 

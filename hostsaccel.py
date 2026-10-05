@@ -112,6 +112,10 @@ DOMAINS = {
 # 反向代理模式下写进 hosts 的固定地址（本机）。域名仍必须在 DOMAINS 清单里。
 PROXY_IP = "127.0.0.1"
 
+# 优选结果（accel_map.json）的有效期。超过这个时间就当"不新鲜"，打开开关
+# 时顺带在后台重测一遍；没超过就直接用缓存秒开，一次网络请求都不发。
+CACHE_TTL = 6 * 3600
+
 # 加密 DoH 解析源（HTTPS 443 传输，避开 UDP 53 的 DNS 投毒）。
 # 前两个在国内直连稳定，后两个国际源做交叉验证。
 DOH_ENDPOINTS = [
@@ -789,6 +793,39 @@ def _map_cache_path():
     return os.path.join(d, "accel_map.json")
 
 
+def _clean_mapping(mapping):
+    """把任意映射清洗成 {已知域名: 合法公网 IP}（纯函数，自检直接覆盖）。"""
+    out = {}
+    for domain, ip in dict(mapping or {}).items():
+        try:
+            d, ip = str(domain), str(ip)
+        except Exception:
+            continue
+        # 只收已知域名 + 合法 IP（代理模式缓存里不会有 127.0.0.1，但防手改）
+        if any(d in DOMAINS[s] for s in SERVICES) and is_valid_public_ipv4(ip):
+            out[d] = ip
+    return out
+
+
+def _map_cache_envelope(data):
+    """兼容两种落盘格式，取出 (mapping, ts)。
+
+    新格式: {"ts": 1759..., "map": {domain: ip}}
+    旧格式: {domain: ip}            （v1.0.2 及以前写的，必须还能读）
+    v1.0.3 起带时间戳 —— 有它才能判断"这份缓存还新不新"，进而决定
+    打开开关时是直接秒写（缓存新鲜）还是顺带后台重测。
+    """
+    if not isinstance(data, dict):
+        return {}, None
+    if isinstance(data.get("map"), dict):
+        try:
+            ts = float(data.get("ts"))
+        except (TypeError, ValueError):
+            ts = None
+        return _clean_mapping(data["map"]), ts
+    return _clean_mapping(data), None
+
+
 def load_map_cache():
     """读出上次的优选映射 {domain: ip}；坏文件/不存在返回 {}。
 
@@ -803,39 +840,107 @@ def load_map_cache():
             data = json.load(fp)
     except (OSError, ValueError):
         return {}
-    if not isinstance(data, dict):
-        return {}
-    out = {}
-    for domain, ip in data.items():
-        try:
-            d, ip = str(domain), str(ip)
-        except Exception:
-            continue
-        # 只收已知域名 + 合法 IP（代理模式缓存里不会有 127.0.0.1，但防手改）
-        known = any(d in DOMAINS[s] for s in SERVICES)
-        if known and is_valid_public_ipv4(ip):
-            out[d] = ip
-    return out
+    return _map_cache_envelope(data)[0]
 
 
-def save_map_cache(mapping):
-    """原子写回优选映射。失败返回 False（代理仍有现场解析兜底，不致命）。"""
+def map_cache_age():
+    """缓存写了多久（秒）；没有缓存 / 旧格式无时间戳 / 读不出来 → None。
+
+    None 表示"不知道新不新"，调用方一律当**不新鲜**处理（宁可重测一次，
+    也不要拿着一份来历不明的 IP 表去写 hosts）。
+    """
+    p = _map_cache_path()
+    if not p:
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return None
+    _mapping, ts = _map_cache_envelope(data)
+    if ts is None:
+        return None
+    age = time.time() - ts
+    return age if age >= 0 else None
+
+
+def map_cache_fresh(max_age=None):
+    """缓存是否还在有效期内（默认 CACHE_TTL）。"""
+    age = map_cache_age()
+    if age is None:
+        return False
+    return age <= (CACHE_TTL if max_age is None else float(max_age))
+
+
+def save_map_cache(mapping, ts=None):
+    """原子写回优选映射。失败返回 False（代理仍有现场解析兜底，不致命）。
+
+    ts 省略时用当前时间 —— 时间戳就是"这份优选结果什么时候测的"。
+    """
     p = _map_cache_path()
     if not p:
         return False
-    clean = {}
-    for domain, ip in dict(mapping).items():
-        try:
-            d, ip = str(domain), str(ip)
-        except Exception:
-            continue
-        if is_valid_public_ipv4(ip) and any(d in DOMAINS[s] for s in SERVICES):
-            clean[d] = ip
+    clean = _clean_mapping(mapping)
+    payload = {"ts": float(time.time() if ts is None else ts), "map": clean}
     try:
         tmp = p + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fp:
-            json.dump(clean, fp, ensure_ascii=False, indent=1)
+            json.dump(payload, fp, ensure_ascii=False, indent=1)
         os.replace(tmp, p)
         return True
     except OSError:
+        return False
+
+
+def instant_entries(service, mode, mapping=None):
+    """**秒加速**的核心：不联网，立刻给出可以写进 hosts 的条目。
+
+    返回 (entries, missing)：
+      entries —— [(ip, domain), ...]，可直接交给 write_service_block
+      missing —— 直连模式下"既没缓存也没有兜底 IP"的域名（代理模式恒为空）
+
+    mode == "proxy"
+        全部域名都写 127.0.0.1。**一个域名都不用测速** —— 真实 IP 由本地
+        代理按 SNI 现场解析（缓存命中就用缓存，未命中就 DoH+测速兜底）。
+        这正是 Steam++ 能做到"点一下立刻生效"的原因：启用路径上没有任何
+        网络测量，只有一次"改 hosts"。
+    mode == "direct"
+        先查上次优选缓存，缺失的用内置兜底池补；仍凑不出来的进 missing。
+        直连模式必须知道真实 IP，所以缓存为空时无法做到真·秒开 —— 这个
+        时候由调用方决定要不要退化成"先测速"（本函数自己绝不联网）。
+    """
+    if service not in DOMAINS:
+        return [], []
+    if mode == "proxy":
+        return [(PROXY_IP, d) for d in DOMAINS[service]], []
+    cached = _clean_mapping(mapping or {})
+    entries, missing = [], []
+    for d in DOMAINS[service]:
+        ip = cached.get(d)
+        if not ip:
+            pool = _fallback_for(d, service)
+            ip = pool[0] if pool else ""
+        if ip:
+            entries.append((ip, d))
+        else:
+            missing.append(d)
+    return entries, missing
+
+
+def optimize_service_map(service, on_domain=None):
+    """同 optimize_service，但直接返回 {domain: ip}（后台预热缓存的入口）。"""
+    return {d: ip for ip, d, _ms in optimize_service(service, on_domain=on_domain)}
+
+
+def entries_match(current, wanted):
+    """两组条目是否"实质相同"（顺序无关，只在 ip+域名 集合上比）。
+
+    用途：打开开关时若 hosts 里已经是我们要写的那套内容，就**完全不用
+    提权、不弹 UAC、不写盘** —— 只刷一下 DNS 缓存即可。重复拨开关因此
+    也是瞬时的。
+    """
+    try:
+        return (sorted(tuple(x) for x in (current or []))
+                == sorted(tuple(x) for x in (wanted or [])))
+    except Exception:
         return False

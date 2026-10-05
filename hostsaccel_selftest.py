@@ -159,18 +159,25 @@ def _ast_checks():
 
 
 def _page_callback_check():
-    """accel_page 的引擎回调（后台线程）只允许 emit。"""
+    """accel_page 的引擎回调（后台线程）只允许 emit。
+
+    ⚠️ v1.0.3：启用流程被拆成 _start_enable / _write_entries / _prefetch_map，
+    这份名单必须同步扩上 —— 否则新抽出来的函数就成了"静态扫描盲区"：
+    在盲区里写 setText 不会红，等于这道防线凭空消失（"它绿了"≠"它测到了"）。
+    """
     src = _module_source("accel_page.py")
     if src is None:
         chk("accel_page 源码随包可读（回调纪律扫描前提）", False, "读不到 accel_page.py")
         return
     tree = ast.parse(src)
     bad = []
+    scanned = []
     for node in ast.walk(tree):
-        # 找 _start_optimize / _start_clean / _proxy_resolver 里的嵌套函数
-        #（on_domain / work 等）以及 _proxy_resolver 自身
+        # 找所有可能开后台线程的函数里的嵌套函数（on_domain / work 等）
         if isinstance(node, ast.FunctionDef) and node.name in (
-                "_start_optimize", "_start_clean", "_proxy_resolver"):
+                "_start_optimize", "_start_clean", "_proxy_resolver",
+                "_start_enable", "_write_entries", "_prefetch_map"):
+            scanned.append(node.name)
             for sub in ast.walk(node):
                 if isinstance(sub, ast.FunctionDef) and sub is not node:
                     for stmt in ast.walk(sub):
@@ -185,6 +192,11 @@ def _page_callback_check():
                             bad.append("%s:%s" % (sub.name, stmt.func.attr))
     chk("后台线程回调只 emit、绝不直接改界面（硬规则 3 的静态防线）",
         not bad, bad)
+    # 六条入口必须**都被真的扫到**，否则上面的"绿"只是名单写错了
+    need = {"_start_optimize", "_start_clean", "_proxy_resolver",
+            "_start_enable", "_write_entries", "_prefetch_map"}
+    chk("回调纪律扫描覆盖全部后台入口（名单不能漏）",
+        need <= set(scanned), sorted(need - set(scanned)))
 
 
 def _proxy_ast_checks():
@@ -286,6 +298,117 @@ def _doh_checks():
     chk("None 安全", ha.parse_doh_answer(None) == [], "")
     chk("非 dict 安全", ha.parse_doh_answer("oops") == [], "")
     chk("缺 Answer 键安全", ha.parse_doh_answer({"Status": 0}) == [], "")
+
+
+# ---------------------------------------------------------------------------
+# ②b 秒加速原语（instant_entries / 缓存时间戳 / entries_match）
+# ---------------------------------------------------------------------------
+def _fast_path_checks():
+    """v1.0.3「秒加速」的引擎侧支撑，逐条钉住。
+
+    用户要的是"和 Steam++ 一样点一下就用"。Steam++ 快的根因是**启用路径上
+    没有任何网络测量**：hosts 只写 127.0.0.1，真实 IP 交给本地代理按 SNI
+    现场解析。所以 instant_entries 必须做到"不联网就能给出完整条目"——
+    下面这几条就是"它真的没联网、也真的给全了"的证据。
+    """
+    steam_domains = ha.DOMAINS[ha.SERVICE_STEAM]
+
+    # ---- 反向代理模式：全量覆盖，零测速 ----
+    e, m = ha.instant_entries(ha.SERVICE_STEAM, "proxy")
+    chk("秒加速(proxy)：条目数等于域名清单长度",
+        len(e) == len(steam_domains), (len(e), len(steam_domains)))
+    chk("秒加速(proxy)：全部写 127.0.0.1",
+        bool(e) and all(ip == ha.PROXY_IP for ip, _d in e), e[:2])
+    chk("秒加速(proxy)：没有缺失域名（不测速也能写全）", m == [], m)
+    chk("秒加速(proxy)：域名顺序与清单一致",
+        [d for _i, d in e] == steam_domains, "")
+    e_g, m_g = ha.instant_entries(ha.SERVICE_GITHUB, "proxy")
+    chk("秒加速(proxy)：github 同样全量",
+        len(e_g) == len(ha.DOMAINS[ha.SERVICE_GITHUB]) and m_g == [], len(e_g))
+
+    # ---- 直连模式：缓存 + 内置兜底池 ----
+    e2, m2 = ha.instant_entries(ha.SERVICE_STEAM, "direct", {})
+    chk("秒加速(direct)：无缓存时用内置兜底池，且如实报出缺失",
+        bool(e2) and bool(m2) and len(e2) + len(m2) == len(steam_domains),
+        (len(e2), len(m2)))
+    chk("秒加速(direct)：兜底给出的都是合法公网 IP",
+        all(ha.is_valid_public_ipv4(ip) for ip, _d in e2), e2)
+    full = {d: "23.15.142.182" for d in steam_domains}
+    e3, m3 = ha.instant_entries(ha.SERVICE_STEAM, "direct", full)
+    chk("秒加速(direct)：缓存齐全时零缺失（可以秒开）",
+        m3 == [] and len(e3) == len(full), (len(e3), m3))
+    dirty = dict(full)
+    dirty["store.steampowered.com"] = "127.0.0.1"
+    e4, _m4 = ha.instant_entries(ha.SERVICE_STEAM, "direct", dirty)
+    chk("秒加速(direct)：缓存里的 127.0.0.1 被拒（回落到兜底池）",
+        all(ip != "127.0.0.1" for ip, _d in e4), e4[:2])
+    e5, _m5 = ha.instant_entries(ha.SERVICE_STEAM, "direct",
+                                 {"evil.example.com": "8.8.8.8"})
+    chk("秒加速(direct)：清单外域名不进条目",
+        all(d in steam_domains for _i, d in e5), e5)
+    chk("未知服务 → 空结果不抛异常",
+        ha.instant_entries("bilibili", "proxy") == ([], []), "")
+
+    # ---- entries_match：内容一致就不写盘（重复拨开关也是瞬时的） ----
+    chk("entries_match：同集合不同顺序算一致",
+        ha.entries_match([("a", "x"), ("b", "y")], [("b", "y"), ("a", "x")]), "")
+    chk("entries_match：内容不同判不一致",
+        not ha.entries_match([("a", "x")], [("b", "y")]), "")
+    chk("entries_match：空 vs 空算一致", ha.entries_match([], []), "")
+    chk("entries_match：空 vs 非空判不一致",
+        not ha.entries_match([], [("a", "x")]), "")
+    chk("entries_match：脏输入不抛异常", ha.entries_match(None, "oops") is False, "")
+
+    # ---- 缓存时间戳 / 新鲜度 / 新旧格式兼容 ----
+    real_path = ha._map_cache_path
+    p = os.path.join(tempfile.gettempdir(),
+                     "yuhub_fastpath_map_%d.json" % os.getpid())
+    probe_domain = ha.DOMAINS[ha.SERVICE_GITHUB][0]
+    ha._map_cache_path = lambda: p
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+        chk("无缓存 → age=None（当作不新鲜）", ha.map_cache_age() is None, "")
+        chk("无缓存 → 不新鲜", ha.map_cache_fresh() is False, "")
+        ha.save_map_cache({probe_domain: "140.82.112.3"})
+        age = ha.map_cache_age()
+        chk("刚写的缓存 age 很小", age is not None and age < 60.0, age)
+        chk("刚写的缓存算新鲜", ha.map_cache_fresh(), "")
+        chk("TTL 收成 0 时不新鲜（新鲜度判定真的在看时间）",
+            ha.map_cache_fresh(0) is False, "")
+        chk("落盘格式带 ts 与 map 两个键",
+            set(json.load(open(p, encoding="utf-8"))) == {"ts", "map"}, "")
+        chk("CACHE_TTL 是正数秒", isinstance(ha.CACHE_TTL, int)
+            and ha.CACHE_TTL > 0, ha.CACHE_TTL)
+        # 旧格式（v1.0.2 及以前的纯 dict）必须还能读
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({probe_domain: "140.82.112.3"}, fh)
+        chk("旧格式仍能读出映射",
+            ha.load_map_cache() == {probe_domain: "140.82.112.3"},
+            ha.load_map_cache())
+        chk("旧格式没有时间戳 → age=None（不敢当新鲜用）",
+            ha.map_cache_age() is None, "")
+        os.remove(p)
+    finally:
+        ha._map_cache_path = real_path
+
+    # ---- optimize_service_map：后台预热用的 {domain: ip} ----
+    real_opt = ha.optimize_service
+
+    def _stub_one(svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None):
+        return [("1.1.1.1", ha.DOMAINS[svc][0], 12.0)]
+
+    try:
+        ha.optimize_service = _stub_one
+        mp = ha.optimize_service_map(ha.SERVICE_STEAM)
+        chk("optimize_service_map 返回 {domain: ip}",
+            mp == {steam_domains[0]: "1.1.1.1"}, mp)
+        ha.optimize_service = (
+            lambda svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None: [])
+        chk("optimize_service_map 全失败 → 空 dict",
+            ha.optimize_service_map(ha.SERVICE_STEAM) == {}, "")
+    finally:
+        ha.optimize_service = real_opt
 
 
 # ---------------------------------------------------------------------------
@@ -1034,26 +1157,108 @@ def _ui_checks():
         ha.optimize_service = real_opt
         page._busy["steam"] = False
 
-    # ---- 开关驱动：拨开 → 开始优选；拨回 → 恢复默认；忙碌时拨动被回弹 ----
-    real_opt2 = ha.optimize_service
-    real_entries_sw = ha.current_entries
-    switched = []
+    # ---- 秒加速：反向代理模式拨开开关 → 不测速，直接写全量 127.0.0.1 ----
+    real_opt_fast = ha.optimize_service
+    real_optmap_fast = ha.optimize_service_map
+    real_entries_fast = ha.current_entries
+    real_admin_fast = ha.is_admin
+    real_run_fast = ha.run_elevated
+    measured, writes = [], []
     ha.optimize_service = lambda svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None: (
-        switched.append(svc) or [])
-    # 打桩成"没有条目"，拨开才不会被短路
+        measured.append(svc) or [])
+    # 预热走 optimize_service_map：单独打桩，才能把"同步测速"和"后台预热"
+    # 分开断言（否则预热线程会污染 measured，判定变成掷骰子）
+    ha.optimize_service_map = lambda svc, on_domain=None: (
+        measured.append("map:" + svc) or {})
     ha.current_entries = lambda svc, path=None: []
+    ha.is_admin = lambda: False
+    ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
+        writes.append((mode, svc, list(entries or []), proxy)) or {"ok": True})
     try:
         page._switch_for("steam").setChecked(True)
-        chk("开关拨开触发一次优选", switched == ["steam"], switched)
+        ok = pump_until(lambda: not page._busy["steam"])
+        # 条件里必须带上 bool(writes)：只看"busy 归零"的话，走老路子
+        #（先测速、测不到就放弃）也能满足 —— 那样这条断言就名不副实了。
+        chk("秒加速：代理模式拨开开关立刻就写完（不等测速）",
+            ok and bool(writes), (ok, writes[-1:]))
+        chk("秒加速：写的是全部域名的 127.0.0.1",
+            bool(writes) and writes[-1][0] == "write" and writes[-1][3] is True
+            and len(writes[-1][2]) == len(ha.DOMAINS["steam"])
+            and all(ip == ha.PROXY_IP for ip, _d in writes[-1][2]),
+            writes[-1:] and (writes[-1][0], writes[-1][3], len(writes[-1][2])))
+        chk("秒加速：同步启用路径上一次测速都没有（快就快在这里）",
+            "steam" not in measured, measured)
     finally:
-        ha.optimize_service = real_opt2
-        ha.current_entries = real_entries_sw
+        ha.optimize_service = real_opt_fast
+        ha.optimize_service_map = real_optmap_fast
+        ha.current_entries = real_entries_fast
+        ha.is_admin = real_admin_fast
+        ha.run_elevated = real_run_fast
         page._busy["steam"] = False
-        # 复位到"关"，避免污染后面的断言
         sws = page._switch_for("steam")
         blk = sws.blockSignals(True)
         sws.setChecked(False)
         sws.blockSignals(blk)
+
+    # ---- 关闭永不被"忙碌"挡住（v1.0.2「关不掉」的根因） ----
+    real_entries_c = ha.current_entries
+    real_admin_c = ha.is_admin
+    real_run_c = ha.run_elevated
+    cleans = []
+    try:
+        ha.current_entries = lambda svc, path=None: (
+            [("127.0.0.1", "github.com")] if svc == "github" else [])
+        ha.is_admin = lambda: False
+        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
+            cleans.append((mode, svc)) or {"ok": True})
+        # 模拟"正在测速"：busy=True 且有一个在途任务
+        page._busy["github"] = True
+        page._cancel["github"] = threading.Event()
+        sws = page._switch_for("github")
+        blk = sws.blockSignals(True)
+        sws.setChecked(True)
+        sws.blockSignals(blk)
+        sws.setChecked(False)              # 用户在测速途中把开关拨到"关"
+        pump_until(lambda: ("clean", "github") in cleans)
+        chk("忙碌中拨到关 → 立刻清理，不被 busy 挡住",
+            ("clean", "github") in cleans, cleans)
+        chk("关闭会作废在途任务（cancel 事件被 set）",
+            page._cancel["github"].is_set(), "")
+        # 注意：此刻 busy 还是 True —— 但那是在跑**清理**（正当工作），
+        # 不再是那份被作废的测速任务。等清理收尾后才该归零。
+        pump_until(lambda: not page._busy["github"])
+        chk("关闭全流程收尾后 busy 归零", not page._busy["github"], page._busy)
+    finally:
+        ha.current_entries = real_entries_c
+        ha.is_admin = real_admin_c
+        ha.run_elevated = real_run_c
+        page._busy["github"] = False
+
+    # 写入途中被关：以"关"为准，收尾补一次清理（不留"开关关着 hosts 还在"）
+    real_entries_w = ha.current_entries
+    real_admin_w = ha.is_admin
+    real_run_w = ha.run_elevated
+    late_clean = []
+    try:
+        ha.current_entries = lambda svc, path=None: (
+            [("127.0.0.1", "github.com")] if svc == "github" else [])
+        ha.is_admin = lambda: False
+        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
+            late_clean.append((mode, svc)) or {"ok": True})
+        page._busy["github"] = True
+        page._cancel["github"] = threading.Event()
+        page._cancel["github"].set()       # 用户已改成"关"
+        page._writing["github"] = True     # 写盘还在路上（多半卡在 UAC）
+        page._on_write_finished("github", True, "")
+        pump_until(lambda: ("clean", "github") in late_clean)
+        chk("写入途中被关 → 收尾补一次清理（最终状态一定是关）",
+            ("clean", "github") in late_clean, late_clean)
+    finally:
+        ha.current_entries = real_entries_w
+        ha.is_admin = real_admin_w
+        ha.run_elevated = real_run_w
+        page._busy["github"] = False
+        page._writing["github"] = False
 
     real_elev = ha.run_elevated
     real_entries_sw2 = ha.current_entries
@@ -1075,20 +1280,19 @@ def _ui_checks():
     finally:
         ha.current_entries, ha.run_elevated = real_entries_sw2, real_elev
 
-    # 忙碌时拨动开关 → 被回弹到真实状态（不能"点了没反应"）
+    # 忙碌时"拨开"仍被回弹（打开动作防重入；关闭动作不受限，上面已验）
     real_entries = ha.current_entries
     try:
-        ha.current_entries = lambda svc, path=None: (
-            [("127.0.0.1", "github.com")] if svc == "github" else [])
+        ha.current_entries = lambda svc, path=None: []
         page._busy["github"] = True
         sws = page._switch_for("github")
         blk = sws.blockSignals(True)
-        sws.setChecked(False)          # 假装用户拨到"关"
-        sws.blockSignals(blk)
         sws.setChecked(False)
+        sws.blockSignals(blk)
+        sws.setChecked(True)           # 忙碌中还想再拨开 → 忽略并回弹
         page._refresh_status()
-        chk("忙碌时拨开关会被回弹到真实状态",
-            page._switch_for("github").isChecked(), "")
+        chk("忙碌时拨开不重复开工（开关回到 hosts 真实状态）",
+            not page._switch_for("github").isChecked(), "")
     finally:
         ha.current_entries = real_entries
         page._busy["github"] = False
@@ -1300,6 +1504,7 @@ def run(out_file):
     _domain_checks()
     _ip_checks()
     _doh_checks()
+    _fast_path_checks()
     with tempfile.TemporaryDirectory(prefix="yuhub_hosts_selftest_") as tmp_root:
         _clean_checks()
         _write_checks(tmp_root)
