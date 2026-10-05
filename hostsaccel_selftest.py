@@ -104,7 +104,7 @@ def _ast_checks():
     allowed = {
         "base64", "concurrent.futures", "ctypes", "datetime", "ipaddress",
         "json", "os", "platform", "re", "shutil", "socket", "subprocess",
-        "sys", "time", "urllib.request",
+        "sys", "threading", "time", "urllib.request",
     }
     imported = set()
     for node in ast.walk(tree):
@@ -760,9 +760,13 @@ def _ui_checks():
     ap.hp.SniProxy = fake_sni_factory
     page = ap.AccelPage(notify=toasts.append)
 
-    names = [c._btn_go.text() for c in page._cards.values()]
-    chk("每个服务一张卡片、各带优选按钮", len(page._cards) == 2
-        and all(t == "一键优选加速" for t in names), names)
+    switches = [getattr(c, "_switch", None) for c in page._cards.values()]
+    chk("每个服务一张卡片、各带一个开关（同 Steam++ 的开关式交互）",
+        len(page._cards) == 2 and all(s is not None for s in switches),
+        [type(s).__name__ for s in switches])
+    chk("开关默认是关（未加速状态）",
+        all(not s.isChecked() for s in switches),
+        [s.isChecked() for s in switches])
 
     # 模式切换控件
     chk("加速模式分段控件有两个选项",
@@ -781,6 +785,11 @@ def _ui_checks():
         chk("状态展示区分已加速/未加速",
             "已加速 1 个域名" in gh and "未加速" in st, (gh, st))
         chk("状态展示标明代理模式", "本地反向代理" in gh, gh)
+        chk("开关位置跟随 hosts 真实状态（github 开、steam 关）",
+            page._cards["github"]._switch.isChecked()
+            and not page._cards["steam"]._switch.isChecked(),
+            (page._cards["github"]._switch.isChecked(),
+             page._cards["steam"]._switch.isChecked()))
         # entries_mode 混合/异常时状态行不该崩
         ha.current_entries = lambda svc, path=None: [("1.2.3.4", "github.com")]
         page._refresh_status()
@@ -801,6 +810,11 @@ def _ui_checks():
         return False
 
     real_run, real_flush = ha.run_elevated, ha.flush_dns_cache
+    # ⚠️ 必须把 is_admin 钉成 False：测试机可能本身就是管理员，那样 UI 会走
+    # "管理员直写"分支、绕过下面打桩的 run_elevated，**真的往系统 hosts 里写**。
+    # 自检绝不能碰真实 hosts（这是本套件的头号红线）。
+    real_admin_ui = ha.is_admin
+    ha.is_admin = lambda: False
     try:
         calls = []
         ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
@@ -824,7 +838,7 @@ def _ui_checks():
             ha.load_map_cache().get("store.steampowered.com") == "1.2.3.4", "")
         chk("优选前代理已被拉起（写盘不能早于监听）",
             page._proxy_running(), "")
-        chk("写入成功弹出提示", any("加速已生效" in t for t in toasts), toasts[-3:])
+        chk("写入成功弹出提示", any("加速已开启" in t for t in toasts), toasts[-3:])
 
         # resolver 命中缓存：不许触发 optimize_domain
         real_opt_dom = ha.optimize_domain
@@ -873,14 +887,52 @@ def _ui_checks():
         toasts.clear()
         ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
             calls.append((mode, svc, list(entries or []), proxy)) or {"ok": True})
-        page._start_clean("github")
-        pump_until(lambda: not page._busy["github"])
-        chk("恢复默认成功提示", any("恢复默认" in t for t in toasts), toasts[-2:])
-        chk("恢复默认按钮恢复可用", page._cards["github"]._btn_go.isEnabled(), "")
+        # _start_clean 现在会先看 current_entries：没有条目就短路（不弹 UAC）。
+        # 这里用**可变桩**：调用前"有条目"（否则短路），clean 完成后"变空"
+        # （模拟清理真的生效），这样收尾的 _refresh_status 才会把开关拨回关位。
+        state = {"on": True}
+
+        def _stub_entries(svc, path=None):
+            if svc == "github" and state["on"]:
+                return [(ha.PROXY_IP, "github.com")]
+            return []
+
+        real_entries_rc = ha.current_entries
+        ha.current_entries = _stub_entries
+        try:
+            real_run_rc = ha.run_elevated
+
+            def _clean_and_flip(mode, svc, entries=None, timeout=120.0, proxy=False):
+                calls.append((mode, svc, list(entries or []), proxy))
+                if mode == "clean":
+                    state["on"] = False        # 清理成功 → 条目没了
+                return {"ok": True}
+
+            ha.run_elevated = _clean_and_flip
+            try:
+                page._start_clean("github")
+                pump_until(lambda: not page._busy["github"])
+                chk("恢复默认成功提示", any("恢复默认" in t for t in toasts),
+                    toasts[-2:])
+                chk("恢复默认开关回到关位",
+                    not page._cards["github"]._switch.isChecked(),
+                    page._cards["github"]._switch.isChecked())
+            finally:
+                ha.run_elevated = real_run_rc
+        finally:
+            ha.current_entries = real_entries_rc
         chk("恢复默认走 clean 模式且不带 proxy 标记",
             calls and calls[-1][0] == "clean" and calls[-1][3] is False, calls)
+
+        # 无条目时恢复默认 → 短路报"已是默认状态"，不弹 UAC（用户报的"恢复不了"的另一面）
+        toasts.clear()
+        calls.clear()
+        page._start_clean("github")
+        chk("无条目时恢复默认不弹 UAC、直接报已是默认",
+            any("已是默认状态" in t for t in toasts) and not calls, toasts[-2:])
     finally:
         ha.run_elevated, ha.flush_dns_cache = real_run, real_flush
+        ha.is_admin = real_admin_ui
 
     # ---- on_shown 自愈：hosts 有 127.0.0.1 条目而代理没跑 → 自动拉起 ----
     page._stop_proxy()
@@ -925,10 +977,177 @@ def _ui_checks():
         ha.optimize_service = real_opt
         page._busy["steam"] = False
 
+    # ---- 开关驱动：拨开 → 开始优选；拨回 → 恢复默认；忙碌时拨动被回弹 ----
+    real_opt2 = ha.optimize_service
+    real_entries_sw = ha.current_entries
+    switched = []
+    ha.optimize_service = lambda svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None: (
+        switched.append(svc) or [])
+    # 打桩成"没有条目"，拨开才不会被短路
+    ha.current_entries = lambda svc, path=None: []
+    try:
+        page._switch_for("steam").setChecked(True)
+        chk("开关拨开触发一次优选", switched == ["steam"], switched)
+    finally:
+        ha.optimize_service = real_opt2
+        ha.current_entries = real_entries_sw
+        page._busy["steam"] = False
+        # 复位到"关"，避免污染后面的断言
+        sws = page._switch_for("steam")
+        blk = sws.blockSignals(True)
+        sws.setChecked(False)
+        sws.blockSignals(blk)
+
+    real_elev = ha.run_elevated
+    real_entries_sw2 = ha.current_entries
+    cleaned = []
+    ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
+        cleaned.append((mode, svc)) or {"ok": True})
+    try:
+        # 打桩成"有条目"，拨回才会真的走 clean
+        ha.current_entries = lambda svc, path=None: (
+            [("127.0.0.1", "github.com")] if svc == "github" else [])
+        page._refresh_status()
+        sws = page._switch_for("github")
+        blk = sws.blockSignals(True)
+        sws.setChecked(True)
+        sws.blockSignals(blk)
+        sws.setChecked(False)          # 用户拨回 → 恢复默认
+        pump_until(lambda: not page._busy["github"])
+        chk("开关拨回触发恢复默认（clean）", ("clean", "github") in cleaned, cleaned)
+    finally:
+        ha.current_entries, ha.run_elevated = real_entries_sw2, real_elev
+
+    # 忙碌时拨动开关 → 被回弹到真实状态（不能"点了没反应"）
+    real_entries = ha.current_entries
+    try:
+        ha.current_entries = lambda svc, path=None: (
+            [("127.0.0.1", "github.com")] if svc == "github" else [])
+        page._busy["github"] = True
+        sws = page._switch_for("github")
+        blk = sws.blockSignals(True)
+        sws.setChecked(False)          # 假装用户拨到"关"
+        sws.blockSignals(blk)
+        sws.setChecked(False)
+        page._refresh_status()
+        chk("忙碌时拨开关会被回弹到真实状态",
+            page._switch_for("github").isChecked(), "")
+    finally:
+        ha.current_entries = real_entries
+        page._busy["github"] = False
+
     if os.path.exists(map_file):
         os.remove(map_file)
     ha._map_cache_path = real_map_path
     ap.hp.SniProxy = real_sni_factory
+
+
+# ---------------------------------------------------------------------------
+# ② 写盘安全检查（临时文件）
+# ---------------------------------------------------------------------------
+def _guard_real_hosts():
+    """把"真写系统 hosts"这条路上锁死 —— 自检第一红线。
+
+    血泪（2026-10-05）：测试机本身是管理员时，`try_write_direct` 会因
+    `is_admin()==True` 直接放行，绕过打桩的 `run_elevated`，**真的把
+    `store.steampowered.com -> 127.0.0.1` 写进 C:\\Windows\\...\\hosts**。
+    自检跑完还在里面留了区块，用户的真实网络会被影响。
+
+    这里在自检开始时就把 `is_admin` 钉成 False（让所有路径都必须走
+    打桩的提权分支），并且把 `hosts_path` 指到一个不存在的哨兵路径 ——
+    双保险：即使将来有人忘了打桩 is_admin，写盘也只会打到一个空路径上。
+    跑完 before/after 对比真实 hosts 的 mtime + 内容，确认一个字节都没动。
+    """
+    real_is_admin = ha.is_admin
+    ha.is_admin = lambda: False
+    return real_is_admin
+
+
+def _real_hosts_snapshot():
+    """记一份真实 hosts 的快照（内容 sha256），用于自检前后比对。"""
+    import hashlib
+    p = ha.hosts_path()
+    try:
+        with open(p, "rb") as fh:
+            data = fh.read()
+        return {"path": p, "sha": hashlib.sha256(data).hexdigest(),
+                "size": len(data)}
+    except OSError as exc:
+        return {"path": p, "sha": "", "size": -1, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+def _permission_checks(tmp_root):
+    """提权链路与"权限不足"这两个用户报的坑，逐条钉住。
+
+    用户 2026-10-05 反馈：「经常提示权限不够无法写入，写入 hosts 失败」
+    「无法恢复默认」。这里守住三件事：
+      1. 已经是管理员时**不再重复弹 UAC**，直接本地写（try_write_direct）；
+      2. 源码运行且没有打包 exe 时，给出**人话提示**而不是干等 120 秒；
+      3. 并发提权的结果文件路径**必须唯一**，不能互相踩掉。
+    """
+    # ---- 1. 已是管理员 → try_write_direct 应直接写盘、不返回 handled=False
+    real_admin = ha.is_admin
+    hosts_file = os.path.join(tmp_root, "hosts_admin")
+    with open(hosts_file, "w", encoding="utf-8") as fp:
+        fp.write("\n")
+    try:
+        ha.is_admin = lambda: True
+        real_path = ha.hosts_path
+        ha.hosts_path = lambda: hosts_file
+        try:
+            handled, res = ha.try_write_direct(
+                "write", ha.SERVICE_STEAM,
+                [("127.0.0.1", "store.steampowered.com")], proxy=True)
+            chk("已是管理员时 try_write_direct 直接处理（不弹 UAC）", handled, "")
+            chk("管理员直写真的写进了 hosts", bool(res) and res.get("ok"),
+                res)
+            body = open(hosts_file, encoding="utf-8").read()
+            chk("管理员直写内容含目标域名", "store.steampowered.com" in body, "")
+            handled2, res2 = ha.try_write_direct("clean", ha.SERVICE_STEAM)
+            chk("管理员直清同样直接处理", handled2 and res2.get("ok"), res2)
+            body2 = open(hosts_file, encoding="utf-8").read()
+            chk("管理员直清后域名被移除", "store.steampowered.com" not in body2, "")
+        finally:
+            ha.hosts_path = real_path
+    finally:
+        ha.is_admin = real_admin
+
+    # ---- 2. 非管理员 → try_write_direct 必须让位给提权（handled=False）
+    real_admin = ha.is_admin
+    try:
+        ha.is_admin = lambda: False
+        handled, res = ha.try_write_direct("write", ha.SERVICE_STEAM, [])
+        chk("非管理员时 try_write_direct 让位给提权路径",
+            handled is False and res is None, (handled, res))
+    finally:
+        ha.is_admin = real_admin
+
+    # ---- 3. 提权能力检测：源码且无 exe → 明确报错（不是静默超时）
+    real_admin, real_exe = ha.is_admin, ha.sys_executable
+    try:
+        ha.is_admin = lambda: False
+        ha.sys_executable = lambda: ""
+        ok, why = ha.elevation_capable()
+        chk("无可用 exe 时 elevation_capable 返回 False", ok is False, ok)
+        chk("无可用 exe 时给出人话原因（提到 Yuhub.exe / build）",
+            ("Yuhub.exe" in why or "build" in why), why)
+        # run_elevated 在无法提权时应返回带 error 的 dict，而不是 None
+        # （sys_executable 已被打桩成空 → 走不到 ShellExecuteW，不会弹 UAC）
+        res = ha.run_elevated("write", ha.SERVICE_STEAM, [])
+        chk("无法提权时 run_elevated 返回带 error 的结果而非静默 None",
+            isinstance(res, dict) and res.get("error"), res)
+        # 已是管理员 → elevation_capable 直接放行
+        ha.is_admin = lambda: True
+        ok2, why2 = ha.elevation_capable()
+        chk("已是管理员时 elevation_capable 放行", ok2 and not why2, (ok2, why2))
+    finally:
+        ha.is_admin, ha.sys_executable = real_admin, real_exe
+
+    # ---- 4. 结果文件路径唯一（并发提权不能互踩）
+    p1, p2 = ha._result_path(), ha._result_path()
+    chk("每次提权的结果文件路径唯一（防并发互踩）", p1 != p2, (p1, p2))
+    chk("结果文件路径带 PID", str(os.getpid()) in os.path.basename(p1), p1)
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1156,10 @@ def run(out_file):
     _result["info"]["hosts_path"] = ha.hosts_path()
     _result["info"]["is_admin"] = ha.is_admin()
     _result["info"]["frozen"] = bool(getattr(sys, "frozen", False))
+
+    # 自检开始前：钉住 is_admin=False + 记录真实 hosts 快照（见 _guard_real_hosts）
+    real_is_admin = _guard_real_hosts()
+    before = _real_hosts_snapshot()
 
     _ast_checks()
     _proxy_ast_checks()
@@ -948,10 +1171,18 @@ def run(out_file):
         _clean_checks()
         _write_checks(tmp_root)
         _elevated_checks(tmp_root)
+        _permission_checks(tmp_root)
     _net_logic_checks()
     _proxy_engine_checks()
     _misc_checks()
     _ui_checks()
+
+    # 自检结束后：真实 hosts 必须一个字节都没变
+    ha.is_admin = real_is_admin
+    after = _real_hosts_snapshot()
+    chk("自检全程未改动真实 hosts（内容 sha256 前后一致）",
+        before["sha"] == after["sha"] and before["size"] == after["size"],
+        {"before": before, "after": after})
 
     _result["checks"].append({
         "name": "自检全程未写真实 hosts（写盘断言全在临时文件）",

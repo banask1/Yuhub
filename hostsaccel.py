@@ -46,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -156,6 +157,10 @@ _END_RE = re.compile(r"^#\s*===\s*End Yuhub Hosts Acceleration \[(steam|github)\
 
 _ELEVATED_FLAG = "--hosts-elevated"
 
+# 并发提权结果文件序号（配合 PID 保证每次调用的结果文件唯一，见 _result_path）
+_result_seq = 0
+_result_seq_lock = threading.Lock()
+
 
 def hosts_path():
     """系统 hosts 文件路径（Windows: %SystemRoot%\\System32\\drivers\\etc\\hosts）。"""
@@ -181,13 +186,22 @@ def backup_dir():
 
 
 def _result_path():
-    """提权写 hosts 的结果落地路径（提权进程写、普通进程读）。"""
+    """提权写 hosts 的结果落地路径（提权进程写、普通进程读）。
+
+    路径带 **PID + 递增序号**：同一进程内并发两次提权（比如"写入"和"退出清理"
+    几乎同时发生）如果共用同一个结果文件，会互相 os.remove 掉对方的结果，
+    导致其中一次永远等不到文件、一路轮询到 timeout 后报"取消了 UAC 或超时"。
+    """
     d = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%" if IS_WIN else "~"), "Yuhub")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
         return ""
-    return os.path.join(d, "hosts_result.json")
+    global _result_seq
+    with _result_seq_lock:
+        _result_seq += 1
+        seq = _result_seq
+    return os.path.join(d, "hosts_result_%d_%d.json" % (os.getpid(), seq))
 
 
 def is_admin():
@@ -198,6 +212,73 @@ def is_admin():
         return os.geteuid() == 0
     except Exception:
         return False
+
+
+def sys_executable():
+    """定位"能被 runas 唤起并解析 --hosts-elevated 的 exe"。
+
+    源码模式下 sys.executable 是 python.exe —— 把它 runas 起来后
+    `--hosts-elevated <b64>` 会被 python 当成**脚本名**，黑窗一闪
+    （showCmd=0 隐藏）然后报错退出，上层只能干等到超时。所以源码模式必须
+    显式去找同目录的 Yuhub.exe / dist\\Yuhub.exe。
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "Yuhub.exe"),
+                 os.path.join(here, "dist", "Yuhub.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def elevation_capable():
+    """能否走提权写盘。返回 (ok, 原因)。
+
+    提前拦截"源码运行且没有打包 exe"的情况，给一句人话，而不是让用户
+    白等 120 秒后收到"取消了 UAC 或超时"这种驴唇不对马嘴的提示。
+    """
+    if not IS_WIN:
+        return False, "当前系统不支持提权写 hosts"
+    if is_admin():
+        return True, ""                              # 已经是管理员，直接写
+    if sys_executable():
+        return True, ""
+    return False, ("当前是源码运行且未找到打包好的 Yuhub.exe，无法请求管理员权限。"
+                   "请先运行 build.bat 构建，或直接使用打包后的 Yuhub.exe。")
+
+
+def try_write_direct(mode, service, entries=None, proxy=False):
+    """不弹 UAC，直接在当前进程里写 / 清 hosts。
+
+    仅在**当前已是管理员**时调用（或用于"本来就不需要权限"的清理）。
+    返回 (handled, result)：handled=False 表示"权限不够，请走提权"，此时
+    result 为 None。这样上层就能做到"能直写就直写，不能才弹 UAC"，
+    而不是每次操作都强制弹一遍。
+    """
+    if not is_admin():
+        return False, None
+    if mode == "write":
+        clean_entries = []
+        for item in entries or []:
+            try:
+                ip, domain = str(item[0]), str(item[1])
+            except Exception:
+                return True, {"ok": False, "removed": 0, "backup": "",
+                              "error": "条目格式非法"}
+            if domain not in DOMAINS[service]:
+                return True, {"ok": False, "removed": 0, "backup": "",
+                              "error": "域名不在白名单：%s" % domain}
+            if proxy:
+                if ip != PROXY_IP:
+                    return True, {"ok": False, "removed": 0, "backup": "",
+                                  "error": "代理模式只允许写入 127.0.0.1"}
+            elif not is_valid_public_ipv4(ip):
+                return True, {"ok": False, "removed": 0, "backup": "",
+                              "error": "不是合法公网 IP：%s" % ip}
+            clean_entries.append((ip, domain))
+        return True, write_service_block(service, clean_entries, proxy=proxy)
+    return True, clean_service(service)
 
 
 # ---------------------------------------------------------------------------
@@ -568,13 +649,6 @@ def flush_dns_cache():
 # ---------------------------------------------------------------------------
 # 提权写 hosts（复用 cleaner.py 的模式：runas 唤起自己的 exe + 结果走文件）
 # ---------------------------------------------------------------------------
-def _yuhub_exe_path():
-    exe = sys.executable
-    if exe and os.path.isfile(exe):
-        return exe
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "Yuhub.exe")
-
-
 def elevated_hosts_main(payload_b64):
     """`Yuhub.exe --hosts-elevated <base64-json>` 的入口（提权进程侧）。
 
@@ -627,9 +701,17 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
 
     在**后台线程**里调用（轮询等结果文件会阻塞，不能拖主线程）。
     proxy=True：反向代理模式写入（条目应为 127.0.0.1 + 域名）。
+
+    返回约定：
+      dict        —— 写/清完成，看 res["ok"]
+      {"error": "..."} —— 前置条件不满足（无法提权），error 里是人话
+      None        —— 用户取消了 UAC，或提权进程超时没回结果
     """
     if not IS_WIN:
         return None
+    ok, why = elevation_capable()
+    if not ok:
+        return {"error": why}
     result_file = _result_path()
     if not result_file:
         return None
@@ -645,9 +727,12 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
          "result_file": result_file},
         ensure_ascii=False, separators=(",", ":"))
     b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    exe = sys_executable()
+    if not exe:
+        return {"error": "未找到可用于提权的 Yuhub.exe"}
     try:
         rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", _yuhub_exe_path(),
+            None, "runas", exe,
             "%s %s" % (_ELEVATED_FLAG, b64), None, 0)
     except OSError:
         return None

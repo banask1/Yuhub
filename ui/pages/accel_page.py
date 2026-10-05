@@ -1,20 +1,20 @@
-"""Steam / GitHub hosts 加速页 —— 本地反向代理模式（同 Steam++）+ 直连模式。
+"""Steam / GitHub hosts 加速页 —— 同一套「一键开关」交互（同 Steam++）。
 
-加速模式（页面顶部可切换，默认反向代理）：
-  **本地反向代理（推荐，同 Steam++ 的形态）**
+用户要的是"像 Steam++ 一样，只需要开启和关闭"，所以这一版把原来
+「加速模式分段 + 每服务一键优选/恢复默认」两套控制合并成**每服务一个开关**：
+
+  本地反向代理（推荐，同 Steam++ 的形态）
     hosts 把加速域名指向 127.0.0.1，本机监听 443/80，按 TLS SNI / HTTP Host
-    把流量转发到测速选出的真实节点。因为 DNS 完全由我们接管，社区主站等
+    把流量转发到测速选出的真实节点。DNS 完全由我们接管，社区主站等
     "写 hosts 也不生效"的域名也能走通；不解密流量、无需证书。
-  **直连 hosts**
+  直连 hosts
     把测速最优的公网 IP 直接写进 hosts。最简单，但对 DNS 之外的问题
     （SNI 阻断等）无能为力。
 
-工作流（每个服务独立一块卡片）：
-  一键优选加速 → 后台线程 DoH 解析 + TCP443 测速（结果逐域名经信号回主线程）
-              → 反代模式：先把代理跑起来、把真实 IP 存进映射缓存，
-                再弹 UAC 写 127.0.0.1 条目（顺序不能反，否则断网窗口）
-              → 成功后刷新 DNS 缓存、刷新状态展示
-  恢复默认   → 后台线程弹 UAC 清掉本服务的全部加速条目（反代模式顺带停代理）
+工作流：
+  打开开关 → 后台 DoH 解析 + TCP443 测速 → 写 hosts（反代模式先把代理跑起来）
+           → 刷新 DNS 缓存 → 开关停在"开"
+  关闭开关 → 停对应链路 + 清掉本服务条目（直连模式不占端口）
 
 线程纪律（本项目硬规则）：引擎回调一律来自后台线程，回调里**只 emit 信号**，
 所有界面改动都留在主线程槽函数里。代理解析回调发生在代理工作线程，
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 import hostsaccel as ha
 import hostssniproxy as hp
-from ..widgets import SegmentedControl, ghost_button, info_card, primary_button
+from ..widgets import SegmentedControl, ToggleSwitch, info_card
 from .base_page import BasePage
 
 _MODE_PROXY = "proxy"
@@ -86,6 +86,37 @@ class AccelPage(BasePage):
 
         self._build_content()
 
+    # ------------------------------------------------------- 开关与模式
+    def _switch_for(self, svc):
+        """取某服务的开关控件（测试与内部调用共用）。"""
+        card = self._cards.get(svc)
+        return getattr(card, "_switch", None) if card is not None else None
+
+    def _sync_switch(self, svc):
+        """把开关位置对齐到 hosts 的**真实状态**（程序改的，不触发信号）。
+
+        这一点很重要：on_shown 自愈、写入完成、清理完成之后都要把开关
+        重新对齐，否则会出现"hosts 已经加速了、开关还显示关着"的错位。
+        """
+        sw = self._switch_for(svc)
+        if sw is None:
+            return
+        on = bool(ha.current_entries(svc))
+        blocked = sw.blockSignals(True)
+        sw.setChecked(on)
+        sw.blockSignals(blocked)
+
+    def _toggled(self, svc, on):
+        """开关被用户点动：开 → 加速，关 → 恢复默认。"""
+        if self._busy[svc]:
+            # 忙碌中不许改取向：把开关拨回真实状态，避免"点了没反应"的错觉
+            self._sync_switch(svc)
+            return
+        if on:
+            self._start_optimize(svc)
+        else:
+            self._start_clean(svc)
+
     # ---------------------------------------------------------------- 代理
     def _proxy_resolver(self, domain):
         """给 SniProxy 的回调：domain -> ip or None。
@@ -130,7 +161,7 @@ class AccelPage(BasePage):
 
     # ---------------------------------------------------------------- 构建
     def _build_content(self):
-        # ---- 加速模式（全局一行）----
+        # ---- 加速模式（全局一行，决定"打开开关"时走哪条链路）----
         mode_card = QFrame()
         mode_card.setObjectName("Card")
         mv = QVBoxLayout(mode_card)
@@ -155,7 +186,7 @@ class AccelPage(BasePage):
         self.add(mode_card)
         self._update_mode_desc()
 
-        # ---- 每个服务一块卡片 ----
+        # ---- 每个服务一块卡片（卡片里只有一个开关）----
         self._cards = {}
         for svc in ha.SERVICES:
             card = self._build_service_card(svc)
@@ -170,7 +201,8 @@ class AccelPage(BasePage):
             " SNI 把流量转发到最快的真实节点（同 Steam++ 的做法，不解密流量、"
             "无需证书）；直连模式则把真实 IP 直接写进 hosts。写 hosts 前自动备份到"
             " %LOCALAPPDATA%\\Yuhub\\hosts_backup，写后自动刷新 DNS 缓存。"
-            "修改 hosts 需要管理员权限，点击按钮会弹一次 UAC 确认。",
+            "修改 hosts 需要管理员权限，打开开关时会弹一次 UAC 确认；"
+            "如果 Yuhub 本身就以管理员身份运行，则不再重复弹窗。",
         ))
         self.add(info_card(
             "能力边界（先说清楚，免得误会）",
@@ -181,7 +213,7 @@ class AccelPage(BasePage):
             "完全访问仍需专业代理工具。② 反向代理模式会占用本机 443/80 端口："
             "与 Steam++ 等同类工具同时开加速会冲突，二选一即可。③ 退出 Yuhub"
             " 时会自动停代理并提示恢复 hosts。测速结果随网络实时变化，觉得变慢"
-            "了随时「重新优选」或「恢复默认」。",
+            "了把开关关掉再打开就是一次重新优选。",
         ))
         self.add_stretch()
         self._refresh_status()
@@ -194,9 +226,18 @@ class AccelPage(BasePage):
         v.setContentsMargins(18, 16, 18, 16)
         v.setSpacing(10)
 
+        # 标题行：左边标题，右边开关（同 Steam++ 的卡片形态）
+        head = QHBoxLayout()
+        head.setSpacing(10)
         title = QLabel(meta["title"])
         title.setObjectName("CardTitle")
-        v.addWidget(title)
+        head.addWidget(title)
+        head.addStretch(1)
+        switch = ToggleSwitch(False)
+        switch.setToolTip("开启后自动优选并写入 hosts；关闭即恢复默认")
+        switch.toggled.connect(lambda on, s=svc: self._toggled(s, on))
+        head.addWidget(switch)
+        v.addLayout(head)
 
         desc = QLabel(meta["desc"])
         desc.setObjectName("CardDesc")
@@ -222,17 +263,6 @@ class AccelPage(BasePage):
         entries.setVisible(False)
         v.addWidget(entries)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        btn_go = primary_button("一键优选加速")
-        btn_go.clicked.connect(lambda checked=False, s=svc: self._start_optimize(s))
-        btn_reset = ghost_button("恢复默认")
-        btn_reset.clicked.connect(lambda checked=False, s=svc: self._start_clean(s))
-        btn_row.addWidget(btn_go)
-        btn_row.addWidget(btn_reset)
-        btn_row.addStretch(1)
-        v.addLayout(btn_row)
-
         # 进度行（测速中逐域名更新）
         progress = QLabel("")
         progress.setObjectName("Faint")
@@ -242,8 +272,7 @@ class AccelPage(BasePage):
 
         card._status = status
         card._entries = entries
-        card._btn_go = btn_go
-        card._btn_reset = btn_reset
+        card._switch = switch
         card._progress = progress
         return card
 
@@ -304,6 +333,8 @@ class AccelPage(BasePage):
                 card._status.setText("当前状态：未加速（系统 hosts 里没有本服务条目）")
                 card._entries.setVisible(False)
                 card._entries.setText("")
+            # 开关位置永远对齐 hosts 的真实状态（程序改的，不触发信号）
+            self._sync_switch(svc)
 
     def on_shown(self):
         # hosts 文件可能被别的工具改过，每次进页都重读
@@ -339,8 +370,6 @@ class AccelPage(BasePage):
         self._busy[svc] = True
         self._pending[svc] = []
         card = self._cards[svc]
-        card._btn_go.setEnabled(False)
-        card._btn_reset.setEnabled(False)
         card._progress.setVisible(True)
         card._progress.setText("正在解析与测速（0/%d）…" % len(ha.DOMAINS[svc]))
 
@@ -370,8 +399,7 @@ class AccelPage(BasePage):
         if not ok:
             self._busy[svc] = False
             card._progress.setVisible(False)
-            card._btn_go.setEnabled(True)
-            card._btn_reset.setEnabled(True)
+            self._sync_switch(svc)
             self.toast(msg)
             return
         proxy_mode = (self._current_mode() == _MODE_PROXY)
@@ -382,8 +410,7 @@ class AccelPage(BasePage):
             if not ok2:
                 self._busy[svc] = False
                 card._progress.setVisible(False)
-                card._btn_go.setEnabled(True)
-                card._btn_reset.setEnabled(True)
+                self._sync_switch(svc)
                 self.toast("本地代理启动失败（%s），未写入 hosts。"
                            "可切到「直连 hosts」模式" % why2)
                 self._refresh_status()
@@ -398,6 +425,20 @@ class AccelPage(BasePage):
             write_entries = [(ha.PROXY_IP, d) for _ip, d in self._pending[svc]]
         else:
             write_entries = self._pending[svc]
+
+        # 已经是管理员 → 不必再弹 UAC（这就是"明明有权限却总提示权限不够"的修法）
+        can_elev, _why = ha.elevation_capable()
+        if can_elev and ha.is_admin():
+            card._progress.setText("优选完成，正在写入系统 hosts…")
+            res = ha.try_write_direct("write", svc, write_entries, proxy=proxy_mode)[1]
+            if res and res.get("ok"):
+                ha.flush_dns_cache()
+                self._on_write_finished(svc, True, "")
+            else:
+                self._on_write_finished(svc, False,
+                                        (res or {}).get("error") or "写入 hosts 失败")
+            return
+
         card._progress.setText("优选完成，正在写入系统 hosts（请在 UAC 弹窗中确认）…")
 
         def work():
@@ -418,13 +459,11 @@ class AccelPage(BasePage):
         self._busy[svc] = False
         card = self._cards[svc]
         card._progress.setVisible(False)
-        card._btn_go.setEnabled(True)
-        card._btn_reset.setEnabled(True)
         if ok:
             n = len(self._pending[svc])
             mode_txt = ("本地反向代理" if self._current_mode() == _MODE_PROXY
                         else "直连")
-            self.toast("加速已生效：%d 个域名已写入 hosts（%s模式），DNS 缓存已刷新"
+            self.toast("加速已开启：%d 个域名已写入 hosts（%s模式），DNS 缓存已刷新"
                        % (n, mode_txt))
         else:
             self.toast(msg)
@@ -434,11 +473,28 @@ class AccelPage(BasePage):
     def _start_clean(self, svc):
         if self._busy[svc]:
             return
+        entries = ha.current_entries(svc)
+        if not entries:
+            # 本来就没有条目：不需要任何权限，直接报成功（旧版这里被提权入口挡住了）
+            self.toast("本服务当前没有加速条目，已是默认状态")
+            self._refresh_status()
+            return
         self._busy[svc] = True
         card = self._cards[svc]
-        card._btn_go.setEnabled(False)
-        card._btn_reset.setEnabled(False)
         card._progress.setVisible(True)
+
+        # 已是管理员 → 直接清，不弹 UAC
+        if ha.is_admin():
+            card._progress.setText("正在恢复默认…")
+            res = ha.try_write_direct("clean", svc)[1]
+            if res and res.get("ok"):
+                ha.flush_dns_cache()
+                self._on_clean_finished(svc, True, "")
+            else:
+                self._on_clean_finished(svc, False,
+                                        (res or {}).get("error") or "清理 hosts 失败")
+            return
+
         card._progress.setText("正在恢复默认（请在 UAC 弹窗中确认）…")
 
         def work():
@@ -458,8 +514,6 @@ class AccelPage(BasePage):
         self._busy[svc] = False
         card = self._cards[svc]
         card._progress.setVisible(False)
-        card._btn_go.setEnabled(True)
-        card._btn_reset.setEnabled(True)
         self.toast("已恢复默认" if ok else msg)
         # 两个服务都没有代理模式条目了 → 停掉代理（端口让出来）
         still_proxy = any(
