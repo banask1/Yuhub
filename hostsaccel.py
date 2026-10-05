@@ -686,8 +686,10 @@ def flush_dns_cache():
 def elevated_hosts_main(payload_b64):
     """`Yuhub.exe --hosts-elevated <base64-json>` 的入口（提权进程侧）。
 
-    payload: {"mode": "write"|"clean", "service": ..., "entries": [[ip, domain]...],
-              "proxy": bool, "result_file": ...}
+    payload: {"mode": "apply"} —— 统一入口，子进程自己读意图文件应用
+             （开/关统一走这条，见 elevated_apply_main）
+             或 {"mode": "write"|"clean", "service": ..., "entries": ...,
+                 "proxy": bool, "result_file": ...} —— 旧的单服务直写模式
     无窗口、不建 UI、不碰网络 —— 只改 hosts 后把结果 JSON 原子写回。
     """
     try:
@@ -700,7 +702,12 @@ def elevated_hosts_main(payload_b64):
         proxy = bool(payload.get("proxy"))
     except Exception:
         return 2
-    if not result_file or service not in SERVICES or mode not in ("write", "clean"):
+    if not result_file:
+        return 3
+    if mode == "apply":
+        # 统一应用入口：子进程自己读意图文件（父进程只负责把意图写好）
+        return elevated_apply_main(result_file)
+    if service not in SERVICES or mode not in ("write", "clean"):
         return 3
     if mode == "write":
         clean_entries = []
@@ -930,6 +937,220 @@ def instant_entries(service, mode, mapping=None):
 def optimize_service_map(service, on_domain=None):
     """同 optimize_service，但直接返回 {domain: ip}（后台预热缓存的入口）。"""
     return {d: ip for ip, d, _ms in optimize_service(service, on_domain=on_domain)}
+
+
+# ---------------------------------------------------------------------------
+# 意图文件（intent）+ 统一应用入口 —— 修「关不掉」的架构级方案
+# ---------------------------------------------------------------------------
+# 设计动机（v1.0.4）：以前"开"和"关"是两条独立的提权操作，各弹各的 UAC：
+#   * 用户在"开启的 UAC 还没点"时关掉开关 → 旧实现静默早退 + 开关弹回真实
+#     状态，用户再点一次就触发**反向操作**，状态机分叉、UAC 接连弹；
+#   * "写入途中被关"要补一刀清理 → 第二次 UAC，用户懵了取消掉 → hosts
+#     留着刚写的条目，开关弹回"开" → 彻底"关不掉"。
+# 现在开/关统一成**一份意图文件**：父进程把"每个服务想开还是想关"写进
+# 文件再发起提权；提权子进程应用的是**读文件那一刻的最新意图** —— UAC
+# 等待期间改主意，同一次 UAC 就按新意图执行，永不分叉、永不多弹。
+
+def intent_path():
+    """意图文件路径（%LOCALAPPDATA%\\Yuhub\\hosts_intent.json）。"""
+    d = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%" if IS_WIN else "~"),
+                     "Yuhub")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return ""
+    return os.path.join(d, "hosts_intent.json")
+
+
+def read_intent(path=None):
+    """读意图文件，返回 {"seq": int, "steam": bool, "github": bool} 或 None。
+
+    只认 0/1/true/false 布尔值；坏文件、缺 seq、没有任何服务键都算无效。
+    """
+    p = path or intent_path()
+    if not p:
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        seq = int(data.get("seq"))
+    except (TypeError, ValueError):
+        return None
+    out = {"seq": seq}
+    for s in SERVICES:
+        v = data.get(s)
+        if isinstance(v, bool):
+            out[s] = v
+    if len(out) == 1:                        # 只有 seq，没有任何服务键
+        return None
+    return out
+
+
+def write_intent(states, path=None):
+    """写入（覆盖）意图文件，返回新 seq；失败返回 -1。
+
+    **整文件覆盖**而不是合并：调用方传入的 states 就是"当前想要的完整
+    期望态"（UI 侧维护会话内快照，初次 toggle 前用 hosts 真实状态初始化）。
+    覆盖式写入杜绝了"上次会话遗留的 steam:True 被这次 github 的提权顺手
+    应用"这种陈旧意图污染。
+    """
+    p = path or intent_path()
+    if not p:
+        return -1
+    old = read_intent(p)
+    seq = (old["seq"] + 1) if old else 1
+    payload = {"seq": seq}
+    for s in SERVICES:
+        if s in states:
+            payload[s] = bool(states[s])
+    if len(payload) == 1:                    # 没有任何服务键，没东西可写
+        return -1
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False)
+        os.replace(tmp, p)
+        return seq
+    except OSError:
+        return -1
+
+
+def apply_intent(intent, hosts_file=None, do_backup=True):
+    """把意图应用到 hosts：on 的服务写代理区块，off 的清区块。
+
+    幂等：已经处于目标状态的服务**跳过**（不写盘、不备份），所以重复
+    应用 = 只动有变化的服务。返回：
+      {"ok": 总体是否全部成功, "seq": 意图 seq,
+       "services": {svc: {"ok", "action": "write"/"clean"/"skip", "error"}}}
+    只动意图里**出现过的**服务键 —— 没提的服务一律不碰。
+    """
+    seq = intent.get("seq", 0) if isinstance(intent, dict) else 0
+    out = {"ok": True, "seq": seq, "services": {}}
+    for s in SERVICES:
+        if s not in (intent or {}):
+            continue
+        want = bool(intent[s])
+        entries = current_entries(s, hosts_file)
+        have = bool(entries) or service_enabled(s, hosts_file)
+        sub = {"ok": True, "action": "skip", "error": ""}
+        if want:
+            # 已是"全量代理区块"就跳过（幂等的关键）
+            if (entries_mode(entries) == "proxy"
+                    and [d for _ip, d in entries] == list(DOMAINS[s])):
+                sub["action"] = "skip"
+            else:
+                sub["action"] = "write"
+                res = write_service_block(
+                    s, [(PROXY_IP, d) for d in DOMAINS[s]],
+                    hosts_file=hosts_file, do_backup=do_backup, proxy=True)
+                sub["ok"] = bool(res.get("ok"))
+                sub["error"] = res.get("error") or ""
+        else:
+            if not have:
+                sub["action"] = "skip"
+            else:
+                sub["action"] = "clean"
+                res = clean_service(s, hosts_file=hosts_file,
+                                    do_backup=do_backup)
+                sub["ok"] = bool(res.get("ok"))
+                sub["error"] = res.get("error") or ""
+        if not sub["ok"]:
+            out["ok"] = False
+        out["services"][s] = sub
+    return out
+
+
+_INTENT_STABLE_WINDOW = 0.6     # 子进程"意图没再变"的确认窗口（秒）
+_INTENT_MAX_ROUNDS = 8          # 防御性上限：意图疯狂变化时最多应用几轮
+
+
+def elevated_apply_main(result_file):
+    """提权子进程侧的"应用最新意图"入口（apply 模式的实现）。
+
+    循环：读意图 → 应用 → 落结果 → 等稳定窗看意图有没有又变 → 变了就
+    再应用一轮（结果文件覆盖重写）。父进程读完结果后比对 seq：seq 落后
+    于意图文件就再发起一轮提权（罕见，只在子进程退出后意图又变时发生）。
+    """
+    last_seq = None
+    rounds = 0
+    while rounds < _INTENT_MAX_ROUNDS:
+        rounds += 1
+        intent = read_intent()
+        if intent is None:
+            out = {"ok": False, "error": "意图文件不可读",
+                   "seq": last_seq or 0, "services": {}}
+        else:
+            out = apply_intent(intent)
+            last_seq = intent["seq"]
+        if result_file:
+            try:
+                tmp = result_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fp:
+                    json.dump(out, fp, ensure_ascii=False)
+                os.replace(tmp, result_file)
+            except OSError:
+                return 4
+        # 稳定窗：窗口内意图没再变才退出（UAC 期间改的主意在这里被吸收）
+        deadline = time.monotonic() + _INTENT_STABLE_WINDOW
+        changed = False
+        while time.monotonic() < deadline:
+            cur = read_intent()
+            if cur is not None and cur["seq"] != last_seq:
+                changed = True
+                break
+            time.sleep(0.05)
+        if not changed:
+            return 0
+    return 0
+
+
+def run_elevated_apply(timeout=120.0, path=None):
+    """弹一次 UAC，让提权子进程应用**当前意图文件**。返回结果 dict。
+
+    与 run_elevated 同一套结果文件/PID/序号机制；返回 dict 多带一个
+    "seq"（子进程实际应用的意图序号），父进程拿它和意图文件的 seq 比对，
+    落后了说明"应用完之后意图又变了"，需要再发起一轮。
+    """
+    if not IS_WIN:
+        return None
+    ok, why = elevation_capable()
+    if not ok:
+        return {"ok": False, "error": why}
+    result_file = _result_path()
+    if not result_file:
+        return {"ok": False, "error": "无法创建提权结果文件（临时目录不可写）"}
+    for p in (result_file, result_file + ".tmp"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    payload = json.dumps({"mode": "apply", "result_file": result_file},
+                         ensure_ascii=False, separators=(",", ":"))
+    b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    exe = sys_executable()
+    if not exe:
+        return {"ok": False, "error": "未找到可用于提权的 Yuhub.exe"}
+    ok, why = shell_execute_runas(exe, "%s %s" % (_ELEVATED_FLAG, b64))
+    if not ok:
+        return {"ok": False, "error": why}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(result_file):
+            time.sleep(0.08)
+            try:
+                with open(result_file, "r", encoding="utf-8") as fp:
+                    return json.load(fp)
+            except (OSError, ValueError):
+                return None
+        time.sleep(0.15)
+    return {"ok": False,
+            "error": "等待提权进程超时（%d 秒）——可能是杀软拦下了提权进程"
+                     % timeout}
 
 
 def entries_match(current, wanted):

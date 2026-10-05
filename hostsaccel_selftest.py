@@ -161,9 +161,10 @@ def _ast_checks():
 def _page_callback_check():
     """accel_page 的引擎回调（后台线程）只允许 emit。
 
-    ⚠️ v1.0.3：启用流程被拆成 _start_enable / _write_entries / _prefetch_map，
-    这份名单必须同步扩上 —— 否则新抽出来的函数就成了"静态扫描盲区"：
-    在盲区里写 setText 不会红，等于这道防线凭空消失（"它绿了"≠"它测到了"）。
+    ⚠️ v1.0.4：开/关统一成"意图应用"，后台入口变成 _apply_worker_direct /
+    _apply_worker_elevated / _prefetch_map / _proxy_resolver。这份名单必须
+    同步扩 —— 否则新抽出来的函数就成了"静态扫描盲区"：在盲区里写 setText
+    不会红，等于这道防线凭空消失（"它绿了"≠"它测到了"）。
     """
     src = _module_source("accel_page.py")
     if src is None:
@@ -172,29 +173,28 @@ def _page_callback_check():
     tree = ast.parse(src)
     bad = []
     scanned = []
+    forbidden = ("setText", "setVisible", "setEnabled",
+                 "toast", "addWidget", "update", "repaint")
     for node in ast.walk(tree):
-        # 找所有可能开后台线程的函数里的嵌套函数（on_domain / work 等）
+        # 找所有可能开后台线程的函数 —— 注意 v1.0.4 的教训：**函数体自身**
+        # 也跑在后台线程（_apply_worker_direct 整个就是线程入口），
+        # 只扫嵌套函数会漏掉直接写在函数体里的 setText（变异测试抓到的盲区）
         if isinstance(node, ast.FunctionDef) and node.name in (
-                "_start_optimize", "_start_clean", "_proxy_resolver",
-                "_start_enable", "_write_entries", "_prefetch_map"):
+                "_proxy_resolver", "_apply_worker_direct",
+                "_apply_worker_elevated", "_prefetch_map"):
             scanned.append(node.name)
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.FunctionDef) and sub is not node:
-                    for stmt in ast.walk(sub):
-                        # 回调体内出现直接改界面的调用（setText/setVisible/
-                        # setEnabled/toast）就是违规 —— 只允许 emit
-                        if (isinstance(stmt, ast.Call)
-                                and isinstance(stmt.func, ast.Attribute)
-                                and stmt.func.attr in (
-                                    "setText", "setVisible", "setEnabled",
-                                    "toast", "addWidget", "update", "repaint")):
-                            # emit 本身是 emit(...)，上面名单不含它
-                            bad.append("%s:%s" % (sub.name, stmt.func.attr))
+            for stmt in ast.walk(node):
+                # 后台线程里出现直接改界面的调用（setText/setVisible/
+                # setEnabled/toast）就是违规 —— 只允许 emit
+                if (isinstance(stmt, ast.Call)
+                        and isinstance(stmt.func, ast.Attribute)
+                        and stmt.func.attr in forbidden):
+                    bad.append("%s:%s" % (node.name, stmt.func.attr))
     chk("后台线程回调只 emit、绝不直接改界面（硬规则 3 的静态防线）",
         not bad, bad)
-    # 六条入口必须**都被真的扫到**，否则上面的"绿"只是名单写错了
-    need = {"_start_optimize", "_start_clean", "_proxy_resolver",
-            "_start_enable", "_write_entries", "_prefetch_map"}
+    # 四条入口必须**都被真的扫到**，否则上面的"绿"只是名单写错了
+    need = {"_proxy_resolver", "_apply_worker_direct",
+            "_apply_worker_elevated", "_prefetch_map"}
     chk("回调纪律扫描覆盖全部后台入口（名单不能漏）",
         need <= set(scanned), sorted(need - set(scanned)))
 
@@ -897,17 +897,32 @@ def _ui_checks():
 
     app = QApplication.instance() or QApplication([])
 
-    # 映射缓存打桩到临时文件（默认代理模式下优选结果会写真实缓存位置）
+    # ---- 全部文件落临时目录（自检绝不能碰真实 hosts / 真实意图文件）----
+    real_hosts_path = ha.hosts_path          # ← 注意：外层 guard 已把它钉到
+    real_backup_dir = ha.backup_dir          #   哨兵目录，finally 必须原样还回去
+    real_intent_path = ha.intent_path
     real_map_path = ha._map_cache_path
+    hpath = os.path.join(tempfile.gettempdir(),
+                         "yuhub_ui_hosts_%d" % os.getpid())
+    ipath = os.path.join(tempfile.gettempdir(),
+                         "yuhub_ui_intent_%d.json" % os.getpid())
     map_file = os.path.join(tempfile.gettempdir(),
                             "yuhub_hosts_map_ui_%d.json" % os.getpid())
+    ha.hosts_path = lambda: hpath
+    ha.intent_path = lambda: ipath
     ha._map_cache_path = lambda: map_file
+
+    def reset_hosts():
+        with open(hpath, "w", encoding="utf-8", newline="") as fh:
+            fh.write("127.0.0.1 localhost\r\n")
+        if os.path.exists(ipath):
+            os.remove(ipath)
+
+    reset_hosts()
 
     # SniProxy 工厂打桩：真实代理，但全部用临时端口（绝不占 443/80，
     # 也不和正在运行的 Steam++ 冲突）
     real_sni_factory = ap.hp.SniProxy
-    # ap.hp 与本模块的 hp 是同一个模块对象 —— 打桩前先把真实类存进局部量，
-    # 工厂内部调真实类，避免自我递归
     real_cls = hp.SniProxy
     up_holder = []
     up_ready = threading.Event()
@@ -936,7 +951,6 @@ def _ui_checks():
                         upstream_http_port=up)
 
     toasts = []
-    # 工厂在整个 UI 测试段内都生效（on_shown 自愈等后续也会建代理）
     ap.hp.SniProxy = fake_sni_factory
     page = ap.AccelPage(notify=toasts.append)
 
@@ -947,39 +961,11 @@ def _ui_checks():
     chk("开关默认是关（未加速状态）",
         all(not s.isChecked() for s in switches),
         [s.isChecked() for s in switches])
+    chk("直连模式已移除（只保留本地反向代理）",
+        not hasattr(page, "_mode_seg") and not hasattr(page, "_current_mode"),
+        "accel_page 不应再有模式分段控件")
 
-    # 模式切换控件
-    chk("加速模式分段控件有两个选项",
-        set(page._mode_seg._buttons) == {"proxy", "direct"},
-        sorted(page._mode_seg._buttons))
-    chk("默认模式是本地反向代理", page._current_mode() == "proxy",
-        page._current_mode())
-
-    real_entries = ha.current_entries
-    try:
-        ha.current_entries = lambda svc, path=None: (
-            [(ha.PROXY_IP, "github.com")] if svc == "github" else [])
-        page._refresh_status()
-        gh = page._cards["github"]._status.text()
-        st = page._cards["steam"]._status.text()
-        chk("状态展示区分已加速/未加速",
-            "已加速 1 个域名" in gh and "未加速" in st, (gh, st))
-        chk("状态展示标明代理模式", "本地反向代理" in gh, gh)
-        chk("开关位置跟随 hosts 真实状态（github 开、steam 关）",
-            page._cards["github"]._switch.isChecked()
-            and not page._cards["steam"]._switch.isChecked(),
-            (page._cards["github"]._switch.isChecked(),
-             page._cards["steam"]._switch.isChecked()))
-        # entries_mode 混合/异常时状态行不该崩
-        ha.current_entries = lambda svc, path=None: [("1.2.3.4", "github.com")]
-        page._refresh_status()
-        chk("直连条目状态展示标明直连",
-            "直连" in page._cards["github"]._status.text(),
-            page._cards["github"]._status.text())
-    finally:
-        ha.current_entries = real_entries
-
-    def pump_until(cond, ms=5000):
+    def pump_until(cond, ms=8000):
         timer = QElapsedTimer()
         timer.start()
         while timer.elapsed() < ms:
@@ -989,38 +975,65 @@ def _ui_checks():
                 return True
         return False
 
-    real_run, real_flush = ha.run_elevated, ha.flush_dns_cache
-    # ⚠️ 必须把 is_admin 钉成 False：测试机可能本身就是管理员，那样 UI 会走
-    # "管理员直写"分支、绕过下面打桩的 run_elevated，**真的往系统 hosts 里写**。
-    # 自检绝不能碰真实 hosts（这是本套件的头号红线）。
+    # ---- 打桩：非管理员 + 提权应用可控（模拟真实子进程语义）----
     real_admin_ui = ha.is_admin
-    ha.is_admin = lambda: False
-    try:
-        calls = []
-        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-            calls.append((mode, svc, list(entries or []), proxy))
-            or {"ok": True})
-        ha.flush_dns_cache = lambda: True
+    real_flush = ha.flush_dns_cache
+    real_elev_apply = ha.run_elevated_apply
+    real_apply_intent = ha.apply_intent
+    real_optmap = ha.optimize_service_map
+    ha.is_admin = lambda: False            # 红线：绝不走真实提权/直写
+    ha.flush_dns_cache = lambda: True
+    ha.optimize_service_map = lambda svc, on_domain=None: {}   # 预热不碰网
 
-        # ---- 反代模式默认流程：优选 → 写 127.0.0.1 条目 ----
-        page._on_measure_finished("steam", True, "",
-                                  [("1.2.3.4", "store.steampowered.com", 30.0)])
-        ok = pump_until(lambda: not page._busy["steam"])
-        chk("反代模式写入流程收尾（busy 归零）", ok, calls)
-        chk("反代模式 run_elevated 收到 proxy=True",
-            calls and calls[-1][3] is True, calls)
-        chk("反代模式写盘条目是 127.0.0.1",
-            calls and calls[-1][2] == [(ha.PROXY_IP, "store.steampowered.com")],
-            calls)
-        chk("真实 IP 进了映射缓存",
-            page._ipmap.get("store.steampowered.com") == "1.2.3.4", page._ipmap)
-        chk("映射缓存落盘可读回",
-            ha.load_map_cache().get("store.steampowered.com") == "1.2.3.4", "")
-        chk("优选前代理已被拉起（写盘不能早于监听）",
-            page._proxy_running(), "")
-        chk("写入成功弹出提示", any("加速已开启" in t for t in toasts), toasts[-3:])
+    apply_calls = []
+    stub = {"delay": 0.0, "fail": None, "stale_seq": False}
+
+    def fake_elevated_apply(timeout=120.0, path=None):
+        # 真实子进程语义：等一段（UAC 窗口）→ 应用**此刻**的最新意图 →
+        # 返回带 seq 的结果（page 靠 seq 判断要不要补一轮）
+        if stub["delay"]:
+            time.sleep(stub["delay"])
+        apply_calls.append("apply")
+        intent = ha.read_intent(ipath)
+        seq = intent["seq"] if intent else 0
+        if stub["fail"] == "cancel":
+            return {"ok": False, "error": "已取消管理员授权，未做任何改动",
+                    "seq": seq}
+        if stub["fail"] == "timeout":
+            return {"ok": False, "error": "等待提权进程超时（120 秒）",
+                    "seq": 0}
+        res = real_apply_intent(intent)
+        res["seq"] = seq
+        if stub["stale_seq"]:
+            # 模拟"子进程只应用了旧一档意图"：结果 seq 故意落后一档，
+            # page 应当自动补一轮（不会让开关与真实状态错位）
+            stub["stale_seq"] = False
+            res["seq"] = max(0, seq - 1)
+        return res
+
+    ha.run_elevated_apply = fake_elevated_apply
+
+    try:
+        # ---- U1 开 → 全量 127.0.0.1 落盘、开关保持开、提示出现 ----
+        toasts.clear()
+        page._switch_for("steam").setChecked(True)
+        ok = pump_until(lambda: not page._apply_running
+                        and bool(ha.current_entries("steam")))
+        chk("拨开开关 → hosts 写入全部域名的 127.0.0.1", ok,
+            len(ha.current_entries("steam")))
+        chk("写入条目全量覆盖域名清单",
+            [d for _ip, d in ha.current_entries("steam")]
+            == list(ha.DOMAINS["steam"]), "")
+        chk("开关保持开（意图被尊重，不弹回）",
+            page._switch_for("steam").isChecked(), "")
+        chk("意图文件已写且 seq 对齐",
+            (ha.read_intent(ipath) or {}).get("steam") is True
+            and page._intent_seq == (ha.read_intent(ipath) or {}).get("seq"),
+            page._intent_seq)
+        chk("开启成功有提示", any("已开启" in t for t in toasts), toasts[-2:])
 
         # resolver 命中缓存：不许触发 optimize_domain
+        page._ipmap["store.steampowered.com"] = "1.2.3.4"
         real_opt_dom = ha.optimize_domain
         ha.optimize_domain = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("缓存命中时不应现场解析"))
@@ -1029,92 +1042,170 @@ def _ui_checks():
         finally:
             ha.optimize_domain = real_opt_dom
         chk("resolver 命中缓存直接返回真实 IP", got == "1.2.3.4", got)
-        chk("resolver 拒绝清单外域名", page._proxy_resolver("evil.com") is None, "")
+        chk("resolver 拒绝清单外域名",
+            page._proxy_resolver("evil.com") is None, "")
 
-        # ---- 切直连模式：写真实 IP、proxy=False ----
-        page._mode_seg._buttons["direct"].setChecked(True)
-        page._mode_seg._buttons["proxy"].setChecked(False)
-        chk("切到直连模式生效", page._current_mode() == "direct", "")
-        calls.clear()
-        page._on_measure_finished("steam", True, "",
-                                  [("1.2.3.4", "store.steampowered.com", 30.0)])
-        pump_until(lambda: not page._busy["steam"])
-        chk("直连模式写盘条目是真实 IP 且 proxy=False",
-            calls and calls[-1][2] == [("1.2.3.4", "store.steampowered.com")]
-            and calls[-1][3] is False, calls)
-
-        # 切回反代
-        page._mode_seg._buttons["proxy"].setChecked(True)
-        page._mode_seg._buttons["direct"].setChecked(False)
-
-        # 用户取消 UAC（run_elevated 返回 None）
+        # ---- U2 关 → 区块清干净、开关保持关 ----
         toasts.clear()
-        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: None
-        page._on_measure_finished("steam", True, "",
-                                  [("1.1.1.1", "api.steampowered.com", 40.0)])
-        pump_until(lambda: not page._busy["steam"])
-        chk("取消 UAC 有明确提示且不算成功",
-            any("未完成写入" in t for t in toasts), toasts[-2:])
-        chk("取消后 busy 归零", not page._busy["steam"], "")
+        page._switch_for("steam").setChecked(False)
+        ok = pump_until(lambda: not page._apply_running
+                        and not ha.current_entries("steam"))
+        chk("拨回开关 → hosts 区块清干净", ok, "")
+        chk("开关保持关", not page._switch_for("steam").isChecked(), "")
+        chk("关闭成功有提示", any("已关闭" in t for t in toasts), toasts[-2:])
 
-        # 测速全失败
-        toasts.clear()
-        page._on_measure_finished("github", False, "未能测出任何可用节点", [])
-        chk("测速全失败直接提示、不进写盘", any("未能测出" in t for t in toasts)
-            and not page._busy["github"], toasts[-2:])
-
-        # 恢复默认成功路径（无剩余代理条目时顺带停代理）
-        toasts.clear()
-        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-            calls.append((mode, svc, list(entries or []), proxy)) or {"ok": True})
-        # _start_clean 现在会先看 current_entries：没有条目就短路（不弹 UAC）。
-        # 这里用**可变桩**：调用前"有条目"（否则短路），clean 完成后"变空"
-        # （模拟清理真的生效），这样收尾的 _refresh_status 才会把开关拨回关位。
-        state = {"on": True}
-
-        def _stub_entries(svc, path=None):
-            if svc == "github" and state["on"]:
-                return [(ha.PROXY_IP, "github.com")]
-            return []
-
-        real_entries_rc = ha.current_entries
-        ha.current_entries = _stub_entries
+        # ---- U2b 秒加速：启用路径上一次测速都没有（Steam++ 同款）----
+        reset_hosts()
+        measured = []
+        real_optsvc = ha.optimize_service
+        ha.optimize_service = (
+            lambda svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None:
+            (measured.append(svc) or []))
         try:
-            real_run_rc = ha.run_elevated
-
-            def _clean_and_flip(mode, svc, entries=None, timeout=120.0, proxy=False):
-                calls.append((mode, svc, list(entries or []), proxy))
-                if mode == "clean":
-                    state["on"] = False        # 清理成功 → 条目没了
-                return {"ok": True}
-
-            ha.run_elevated = _clean_and_flip
-            try:
-                page._start_clean("github")
-                pump_until(lambda: not page._busy["github"])
-                chk("恢复默认成功提示", any("恢复默认" in t for t in toasts),
-                    toasts[-2:])
-                chk("恢复默认开关回到关位",
-                    not page._cards["github"]._switch.isChecked(),
-                    page._cards["github"]._switch.isChecked())
-            finally:
-                ha.run_elevated = real_run_rc
+            page._switch_for("steam").setChecked(True)
+            ok = pump_until(lambda: not page._apply_running
+                            and bool(ha.current_entries("steam")))
+            chk("秒加速：拨开开关零测速直接写盘（快就快在这里）",
+                ok and "steam" not in measured, (ok, measured))
         finally:
-            ha.current_entries = real_entries_rc
-        chk("恢复默认走 clean 模式且不带 proxy 标记",
-            calls and calls[-1][0] == "clean" and calls[-1][3] is False, calls)
+            ha.optimize_service = real_optsvc
+            page._switch_for("steam").setChecked(False)
+            pump_until(lambda: not page._apply_running
+                       and not ha.current_entries("steam"))
 
-        # 无条目时恢复默认 → 短路报"已是默认状态"，不弹 UAC（用户报的"恢复不了"的另一面）
+        # ---- U3 ★核心回归★ UAC 等待中关掉 → 同一次提权按"关"执行 ----
+        reset_hosts()
         toasts.clear()
-        calls.clear()
-        page._start_clean("github")
-        chk("无条目时恢复默认不弹 UAC、直接报已是默认",
-            any("已是默认状态" in t for t in toasts) and not calls, toasts[-2:])
+        del apply_calls[:]
+        stub["delay"] = 0.35
+        try:
+            page._switch_for("steam").setChecked(True)     # t=0 开
+            time.sleep(0.12)                               # 应用在跑（UAC 窗口）
+            app.processEvents()
+            page._switch_for("steam").setChecked(False)    # t=0.12 关（改主意）
+            ok = pump_until(lambda: not page._apply_running
+                            and not ha.current_entries("steam"))
+            chk("UAC 等待中关掉 → 最终状态是关", ok,
+                len(ha.current_entries("steam")))
+            chk("整个过程只发起一次提权（意图被同一轮吸收，无第二次 UAC）",
+                apply_calls == ["apply"], apply_calls)
+        finally:
+            stub["delay"] = 0.0
+
+        # ---- U4 UAC 取消 → 开关对齐真实状态 + 明确报错；重试能关掉 ----
+        reset_hosts()
+        toasts.clear()
+        # 先造成"已加速"状态（直接写临时 hosts）
+        real_apply_intent({"seq": 1, "steam": True})
+        page._resync_intent()
+        page._set_switch("steam", True)
+        app.processEvents()
+        stub["fail"] = "cancel"
+        page._switch_for("steam").setChecked(False)        # 关 → 取消 UAC
+        pump_until(lambda: not page._apply_running)
+        chk("UAC 取消后开关对齐 hosts 真实状态（仍开 + 明确提示）",
+            page._switch_for("steam").isChecked()
+            and any("未完成" in t or "取消" in t for t in toasts),
+            (page._switch_for("steam").isChecked(), toasts[-2:]))
+        stub["fail"] = None
+        page._switch_for("steam").setChecked(False)        # 重试 → 成功
+        ok = pump_until(lambda: not page._apply_running
+                        and not ha.current_entries("steam"))
+        chk("取消后重试能真正关掉", ok, "")
+
+        # ---- U5 结果 seq 落后（子进程退出后意图又变）→ 自动补一轮 ----
+        reset_hosts()
+        toasts.clear()
+        del apply_calls[:]
+        stub["stale_seq"] = True
+        try:
+            page._switch_for("steam").setChecked(True)
+            ok = pump_until(lambda: not page._apply_running
+                            and bool(ha.current_entries("steam")))
+            chk("结果 seq 落后 → 自动补一轮应用（不靠用户再点）",
+                ok and apply_calls == ["apply", "apply"], apply_calls)
+        finally:
+            stub["stale_seq"] = False
+
+        # ---- U6 已是目标状态 → 不发起提权（不弹 UAC）----
+        # 先把 U5 遗留的"开"真正关掉，再做重复关的短路检查
+        page._switch_for("steam").setChecked(False)
+        pump_until(lambda: not page._apply_running
+                   and not ha.current_entries("steam"))
+        toasts.clear()
+        n0 = len(apply_calls)
+        page._toggled("steam", False)                      # 已是关，再关一次
+        app.processEvents()
+        time.sleep(0.1)
+        app.processEvents()
+        chk("已是默认状态时重复关 → 不发起提权",
+            len(apply_calls) == n0
+            and any("已是" in t for t in toasts),
+            (apply_calls[n0:], toasts[-2:]))
+
+        # ---- U7 代理启动失败 → 开关拨回、不写盘、不发起提权 ----
+        toasts.clear()
+        n0 = len(apply_calls)
+        real_ensure_proxy = page._ensure_proxy
+        page._ensure_proxy = lambda: (False, "端口被占用")
+        page._switch_for("steam").setChecked(True)
+        app.processEvents()
+        time.sleep(0.1)
+        app.processEvents()
+        chk("代理启动失败 → 开关拨回且不写盘、不提权",
+            not page._switch_for("steam").isChecked()
+            and not ha.current_entries("steam")
+            and len(apply_calls) == n0,
+            (page._switch_for("steam").isChecked(), apply_calls[n0:]))
+        page._ensure_proxy = real_ensure_proxy
+
+        # ---- U8 意图覆盖式写入 + 坏文件拒绝 ----
+        reset_hosts()
+        s1 = ha.write_intent({"steam": True}, path=ipath)
+        s2 = ha.write_intent({"github": False}, path=ipath)
+        i2 = ha.read_intent(ipath)
+        chk("意图 seq 递增", s2 == s1 + 1 and i2["seq"] == s2, (s1, s2))
+        chk("意图是覆盖式（旧服务的键不残留）",
+            "steam" not in i2 and i2["github"] is False, i2)
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write("not json")
+        bad1 = ha.read_intent(ipath) is None
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"steam": True}))          # 缺 seq
+        bad2 = ha.read_intent(ipath) is None
+        chk("坏意图文件被拒绝（非 JSON / 缺 seq）", bad1 and bad2,
+            (bad1, bad2))
+
+        # ---- U9 状态展示（真实临时 hosts 内容）----
+        real_apply_intent({"seq": 9, "github": True})
+        page.on_shown()
+        chk("状态行展示已加速（github）",
+            "已加速" in page._cards["github"]._status.text(),
+            page._cards["github"]._status.text())
+        # 直连条目标注（v1.0.3 及以前写过直连条目，升级后如实标注）
+        real_apply_intent({"seq": 10, "github": False})
+        ha.write_service_block("github", [("1.2.3.4", "github.com")],
+                               hosts_file=hpath, proxy=False)
+        page._update_card("github")
+        chk("直连条目能被识别并如实标注",
+            "已加速" in page._cards["github"]._status.text()
+            and "直连" in page._cards["github"]._status.text(),
+            page._cards["github"]._status.text())
+        real_apply_intent({"seq": 11, "github": False})
+        page._update_card("github")
     finally:
-        ha.run_elevated, ha.flush_dns_cache = real_run, real_flush
         ha.is_admin = real_admin_ui
+        ha.flush_dns_cache = real_flush
+        ha.run_elevated_apply = real_elev_apply
+        ha.apply_intent = real_apply_intent
+        ha.optimize_service_map = real_optmap
+        ha.hosts_path = real_hosts_path        # 原样还给外层 guard 的哨兵
+        ha.backup_dir = real_backup_dir
+        ha.intent_path = real_intent_path
+        ha._map_cache_path = real_map_path
 
     # ---- on_shown 自愈：hosts 有 127.0.0.1 条目而代理没跑 → 自动拉起 ----
+    # （此时 hosts_path 已还原成哨兵 —— 用 current_entries 打桩控制内容）
     page._stop_proxy()
     chk("手动停代理后 running=False", not page._proxy_running(), "")
     real_entries = ha.current_entries
@@ -1127,179 +1218,78 @@ def _ui_checks():
     finally:
         ha.current_entries = real_entries
 
-    # ---- shutdown：停代理 + 清代理条目（run_elevated 打桩记录） ----
-    calls2 = []
+    # ---- shutdown：停代理 + 写意图（全关）+ 发起一次提权应用 ----
+    apply_calls2 = []
     real_entries = ha.current_entries
-    real_run2 = ha.run_elevated
+    real_ea2 = ha.run_elevated_apply
+    real_intent2 = ha.intent_path
     try:
         ha.current_entries = lambda svc, path=None: (
             [(ha.PROXY_IP, "github.com")] if svc == "github" else [])
-        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-            calls2.append((mode, svc)) or {"ok": True})
+        ha.intent_path = lambda: ipath
+        page._intent_state["github"] = True     # 与条目一致
+
+        def _apply2(timeout=120.0, path=None):
+            apply_calls2.append("apply")
+            return {"ok": True, "seq": 99, "services": {}}
+
+        ha.run_elevated_apply = _apply2
         page.shutdown()
-        pump_until(lambda: calls2, ms=5000)
+        pump_until(lambda: apply_calls2, ms=5000)
         chk("shutdown 停掉了代理", not page._proxy_running(), "")
-        chk("shutdown 只清理反代模式的条目（github 被清、steam 不动）",
-            calls2 == [("clean", "github")], calls2)
-    finally:
-        ha.current_entries, ha.run_elevated = real_entries, real_run2
-
-    # busy 防重入：正在测速时再点不应开工（打桩观察 optimize_service 是否被调）
-    real_opt = ha.optimize_service
-    called = []
-    ha.optimize_service = lambda svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None: (
-        called.append(svc) or [])
-    try:
-        page._busy["steam"] = True
-        page._start_optimize("steam")
-        chk("忙碌时重复点击被忽略（防重入）", called == [], called)
-    finally:
-        ha.optimize_service = real_opt
-        page._busy["steam"] = False
-
-    # ---- 秒加速：反向代理模式拨开开关 → 不测速，直接写全量 127.0.0.1 ----
-    real_opt_fast = ha.optimize_service
-    real_optmap_fast = ha.optimize_service_map
-    real_entries_fast = ha.current_entries
-    real_admin_fast = ha.is_admin
-    real_run_fast = ha.run_elevated
-    measured, writes = [], []
-    ha.optimize_service = lambda svc, doh_timeout=2.5, tcp_timeout=1.2, on_domain=None: (
-        measured.append(svc) or [])
-    # 预热走 optimize_service_map：单独打桩，才能把"同步测速"和"后台预热"
-    # 分开断言（否则预热线程会污染 measured，判定变成掷骰子）
-    ha.optimize_service_map = lambda svc, on_domain=None: (
-        measured.append("map:" + svc) or {})
-    ha.current_entries = lambda svc, path=None: []
-    ha.is_admin = lambda: False
-    ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-        writes.append((mode, svc, list(entries or []), proxy)) or {"ok": True})
-    try:
-        page._switch_for("steam").setChecked(True)
-        ok = pump_until(lambda: not page._busy["steam"])
-        # 条件里必须带上 bool(writes)：只看"busy 归零"的话，走老路子
-        #（先测速、测不到就放弃）也能满足 —— 那样这条断言就名不副实了。
-        chk("秒加速：代理模式拨开开关立刻就写完（不等测速）",
-            ok and bool(writes), (ok, writes[-1:]))
-        chk("秒加速：写的是全部域名的 127.0.0.1",
-            bool(writes) and writes[-1][0] == "write" and writes[-1][3] is True
-            and len(writes[-1][2]) == len(ha.DOMAINS["steam"])
-            and all(ip == ha.PROXY_IP for ip, _d in writes[-1][2]),
-            writes[-1:] and (writes[-1][0], writes[-1][3], len(writes[-1][2])))
-        chk("秒加速：同步启用路径上一次测速都没有（快就快在这里）",
-            "steam" not in measured, measured)
-    finally:
-        ha.optimize_service = real_opt_fast
-        ha.optimize_service_map = real_optmap_fast
-        ha.current_entries = real_entries_fast
-        ha.is_admin = real_admin_fast
-        ha.run_elevated = real_run_fast
-        page._busy["steam"] = False
-        sws = page._switch_for("steam")
-        blk = sws.blockSignals(True)
-        sws.setChecked(False)
-        sws.blockSignals(blk)
-
-    # ---- 关闭永不被"忙碌"挡住（v1.0.2「关不掉」的根因） ----
-    real_entries_c = ha.current_entries
-    real_admin_c = ha.is_admin
-    real_run_c = ha.run_elevated
-    cleans = []
-    try:
-        ha.current_entries = lambda svc, path=None: (
-            [("127.0.0.1", "github.com")] if svc == "github" else [])
-        ha.is_admin = lambda: False
-        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-            cleans.append((mode, svc)) or {"ok": True})
-        # 模拟"正在测速"：busy=True 且有一个在途任务
-        page._busy["github"] = True
-        page._cancel["github"] = threading.Event()
-        sws = page._switch_for("github")
-        blk = sws.blockSignals(True)
-        sws.setChecked(True)
-        sws.blockSignals(blk)
-        sws.setChecked(False)              # 用户在测速途中把开关拨到"关"
-        pump_until(lambda: ("clean", "github") in cleans)
-        chk("忙碌中拨到关 → 立刻清理，不被 busy 挡住",
-            ("clean", "github") in cleans, cleans)
-        chk("关闭会作废在途任务（cancel 事件被 set）",
-            page._cancel["github"].is_set(), "")
-        # 注意：此刻 busy 还是 True —— 但那是在跑**清理**（正当工作），
-        # 不再是那份被作废的测速任务。等清理收尾后才该归零。
-        pump_until(lambda: not page._busy["github"])
-        chk("关闭全流程收尾后 busy 归零", not page._busy["github"], page._busy)
-    finally:
-        ha.current_entries = real_entries_c
-        ha.is_admin = real_admin_c
-        ha.run_elevated = real_run_c
-        page._busy["github"] = False
-
-    # 写入途中被关：以"关"为准，收尾补一次清理（不留"开关关着 hosts 还在"）
-    real_entries_w = ha.current_entries
-    real_admin_w = ha.is_admin
-    real_run_w = ha.run_elevated
-    late_clean = []
-    try:
-        ha.current_entries = lambda svc, path=None: (
-            [("127.0.0.1", "github.com")] if svc == "github" else [])
-        ha.is_admin = lambda: False
-        ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-            late_clean.append((mode, svc)) or {"ok": True})
-        page._busy["github"] = True
-        page._cancel["github"] = threading.Event()
-        page._cancel["github"].set()       # 用户已改成"关"
-        page._writing["github"] = True     # 写盘还在路上（多半卡在 UAC）
-        page._on_write_finished("github", True, "")
-        pump_until(lambda: ("clean", "github") in late_clean)
-        chk("写入途中被关 → 收尾补一次清理（最终状态一定是关）",
-            ("clean", "github") in late_clean, late_clean)
-    finally:
-        ha.current_entries = real_entries_w
-        ha.is_admin = real_admin_w
-        ha.run_elevated = real_run_w
-        page._busy["github"] = False
-        page._writing["github"] = False
-
-    real_elev = ha.run_elevated
-    real_entries_sw2 = ha.current_entries
-    cleaned = []
-    ha.run_elevated = lambda mode, svc, entries=None, timeout=120.0, proxy=False: (
-        cleaned.append((mode, svc)) or {"ok": True})
-    try:
-        # 打桩成"有条目"，拨回才会真的走 clean
-        ha.current_entries = lambda svc, path=None: (
-            [("127.0.0.1", "github.com")] if svc == "github" else [])
-        page._refresh_status()
-        sws = page._switch_for("github")
-        blk = sws.blockSignals(True)
-        sws.setChecked(True)
-        sws.blockSignals(blk)
-        sws.setChecked(False)          # 用户拨回 → 恢复默认
-        pump_until(lambda: not page._busy["github"])
-        chk("开关拨回触发恢复默认（clean）", ("clean", "github") in cleaned, cleaned)
-    finally:
-        ha.current_entries, ha.run_elevated = real_entries_sw2, real_elev
-
-    # 忙碌时"拨开"仍被回弹（打开动作防重入；关闭动作不受限，上面已验）
-    real_entries = ha.current_entries
-    try:
-        ha.current_entries = lambda svc, path=None: []
-        page._busy["github"] = True
-        sws = page._switch_for("github")
-        blk = sws.blockSignals(True)
-        sws.setChecked(False)
-        sws.blockSignals(blk)
-        sws.setChecked(True)           # 忙碌中还想再拨开 → 忽略并回弹
-        page._refresh_status()
-        chk("忙碌时拨开不重复开工（开关回到 hosts 真实状态）",
-            not page._switch_for("github").isChecked(), "")
+        chk("shutdown 写入全关意图并发起提权应用",
+            (ha.read_intent(ipath) or {}).get("github") is False
+            and apply_calls2 == ["apply"],
+            ((ha.read_intent(ipath) or {}), apply_calls2))
     finally:
         ha.current_entries = real_entries
-        page._busy["github"] = False
+        ha.run_elevated_apply = real_ea2
+        ha.intent_path = real_intent2
+
+    # ---- 应用的串行化：应用在跑时再拨开关，不得开出第二个并发应用 ----
+    real_entries_s = ha.current_entries
+    real_admin_s = ha.is_admin
+    real_ea3 = ha.run_elevated_apply
+    concurrent = {"n": 0, "max": 0}
+    try:
+        ha.current_entries = lambda svc, path=None: []
+        ha.is_admin = lambda: False
+
+        def _slow_apply(timeout=120.0, path=None):
+            concurrent["n"] += 1
+            concurrent["max"] = max(concurrent["max"], concurrent["n"])
+            time.sleep(0.25)
+            concurrent["n"] -= 1
+            intent = ha.read_intent(ipath)
+            res = real_apply_intent(intent)
+            res["seq"] = intent["seq"] if intent else 0
+            return res
+
+        ha.run_elevated_apply = _slow_apply
+        page._intent_state["steam"] = False
+        page._apply_running = False
+        page._switch_for("steam").setChecked(True)   # 启动第一个应用（慢）
+        pump_until(lambda: page._apply_running and concurrent["n"] == 1,
+                   ms=8000)
+        page._ensure_apply()      # 应用在跑时再调用一次 → 守卫必须挡住
+        pump_until(lambda: not page._apply_running
+                   and concurrent["n"] == 0, ms=8000)
+        chk("应用严格串行（同时最多一个提权在跑）",
+            concurrent["max"] == 1, concurrent)
+    finally:
+        ha.current_entries = real_entries_s
+        ha.is_admin = real_admin_s
+        ha.run_elevated_apply = real_ea3
+        page._apply_running = False
 
     if os.path.exists(map_file):
         os.remove(map_file)
-    ha._map_cache_path = real_map_path
+    if os.path.exists(ipath):
+        os.remove(ipath)
+    try:
+        os.remove(hpath)
+    except OSError:
+        pass
     ap.hp.SniProxy = real_sni_factory
 
 
@@ -1487,6 +1477,119 @@ def _permission_checks(tmp_root):
 
 
 # ---------------------------------------------------------------------------
+def _intent_checks(tmp_root):
+    """意图文件 + 统一应用（v1.0.4 修「关不掉」的架构核心）。
+
+    全部在临时 hosts / 临时意图文件上跑 —— 意图文件路径也要打桩：
+    elevated_apply_main 内部自己 read_intent()，不打桩就碰真实
+    %LOCALAPPDATA%\\Yuhub\\hosts_intent.json。
+    """
+    import base64 as b64mod
+
+    hpath = os.path.join(tmp_root, "it_hosts")
+    ipath = os.path.join(tmp_root, "it_intent.json")
+    rpath = os.path.join(tmp_root, "it_result.json")
+    with open(hpath, "w", encoding="utf-8", newline="") as fh:
+        fh.write("127.0.0.1 localhost\r\n")
+    _ri, _rp = ha.intent_path, ha._result_path
+    _rh, _rb = ha.hosts_path, ha.backup_dir
+    ha.intent_path = lambda: ipath
+    ha._result_path = lambda: rpath
+    ha.hosts_path = lambda: hpath      # 提权 apply 内部自己读 hosts_path()
+    ha.backup_dir = lambda: os.path.join(tmp_root, "it_bak")
+    try:
+        # -- write/read 往返、覆盖式、seq 递增 --
+        s1 = ha.write_intent({"steam": True}, path=ipath)
+        i1 = ha.read_intent(ipath)
+        chk("意图写入后可读回（带 seq）",
+            s1 == 1 and i1 == {"seq": 1, "steam": True}, (s1, i1))
+        s2 = ha.write_intent({"github": False}, path=ipath)
+        i2 = ha.read_intent(ipath)
+        chk("意图是覆盖式写入（旧服务的键不残留，防陈旧意图污染）",
+            s2 == s1 + 1 and "steam" not in i2 and i2["github"] is False, i2)
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write("not json")
+        chk("非 JSON 意图被拒绝（read_intent 返回 None）",
+            ha.read_intent(ipath) is None, "")
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"steam": True}))
+        chk("缺 seq 的意图被拒绝", ha.read_intent(ipath) is None, "")
+        chk("没有任何服务键的意图被拒绝",
+            ha.write_intent({}, path=ipath) == -1, "")
+
+        # -- apply_intent：开 = 全量代理区块；关 = 清干净；幂等 --
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"seq": 3, "steam": True, "github": False}))
+        r = ha.apply_intent(ha.read_intent(ipath), hosts_file=hpath)
+        ent = ha.current_entries("steam", hpath)
+        chk("apply 开：写入全量 127.0.0.1 区块",
+            r["ok"] and r["services"]["steam"]["action"] == "write"
+            and [d for _ip, d in ent] == list(ha.DOMAINS["steam"])
+            and all(ip == ha.PROXY_IP for ip, _d in ent),
+            (r["services"]["steam"], len(ent)))
+        chk("apply 关（本来就没有）→ 幂等跳过",
+            r["services"]["github"]["action"] == "skip", r["services"]["github"])
+        r2 = ha.apply_intent(ha.read_intent(ipath), hosts_file=hpath)
+        chk("apply 幂等：已是目标状态 → 双双跳过不写盘",
+            r2["ok"] and r2["services"]["steam"]["action"] == "skip"
+            and r2["services"]["github"]["action"] == "skip",
+            (r2["services"]["steam"]["action"],
+             r2["services"]["github"]["action"]))
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"seq": 4, "steam": False}))
+        r3 = ha.apply_intent(ha.read_intent(ipath), hosts_file=hpath)
+        chk("apply 关：清掉区块，hosts 其余内容不动",
+            r3["ok"] and r3["services"]["steam"]["action"] == "clean"
+            and not ha.current_entries("steam", hpath)
+            and "127.0.0.1 localhost" in open(hpath, encoding="utf-8").read(),
+            (r3["services"]["steam"]["action"],))
+
+        # -- elevated_hosts_main 的 apply 模式：意图在稳定窗内被吸收 --
+        # （「关不掉」的核心：UAC 等待期间改主意，同一次提权按新意图执行）
+        with open(ipath, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"seq": 5, "steam": True}))
+        payload = json.dumps({"mode": "apply", "result_file": rpath},
+                             ensure_ascii=False, separators=(",", ":"))
+        b64 = b64mod.b64encode(payload.encode("utf-8")).decode("ascii")
+
+        def flip_later():
+            time.sleep(0.25)          # 第一轮应用之后、稳定窗之内
+            ha.write_intent({"steam": False}, path=ipath)
+
+        _ft = threading.Thread(target=flip_later, daemon=True)
+        _ft.start()
+        rc = ha.elevated_hosts_main(b64)
+        _ft.join()
+        res = {}
+        try:
+            with open(rpath, "r", encoding="utf-8") as fh:
+                res = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        chk("提权 apply：UAC 期间改主意 → 同一次提权按最新意图执行",
+            rc == 0 and res.get("seq") == 6
+            and res.get("services", {}).get("steam", {}).get("action") == "clean"
+            and not ha.current_entries("steam", hpath),
+            (rc, res.get("seq"), res.get("services", {}).get("steam")))
+        chk("提权 apply：结果文件带 seq（父进程据此判断要不要补一轮）",
+            isinstance(res.get("seq"), int), res.get("seq"))
+
+        # -- 缺意图文件：明确报错而不是崩溃 --
+        os.remove(ipath)
+        rc2 = ha.elevated_hosts_main(b64)
+        try:
+            with open(rpath, "r", encoding="utf-8") as fh:
+                res2 = json.load(fh)
+        except (OSError, ValueError):
+            res2 = {}
+        chk("提权 apply：意图文件不可读 → 结果 ok=False 带人话原因",
+            rc2 == 0 and res2.get("ok") is False
+            and "意图" in (res2.get("error") or ""), (rc2, res2.get("error")))
+    finally:
+        ha.intent_path, ha._result_path = _ri, _rp
+        ha.hosts_path, ha.backup_dir = _rh, _rb
+
+
 def run(out_file):
     _result["info"]["suite"] = "hosts"
     _result["info"]["hosts_path"] = ha.hosts_path()
@@ -1510,6 +1613,7 @@ def run(out_file):
         _write_checks(tmp_root)
         _elevated_checks(tmp_root)
         _permission_checks(tmp_root)
+        _intent_checks(tmp_root)
     _net_logic_checks()
     _proxy_engine_checks()
     _misc_checks()

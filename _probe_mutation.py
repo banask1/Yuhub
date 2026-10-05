@@ -666,11 +666,12 @@ def m_hosts_cb():
     import hostsaccel_selftest as _hst
     orig = _hst._module_source
     src = orig("accel_page.py")
-    assert src and "_domain_done.emit" in src, "accel_page 源码读不到"
+    # v1.0.4：后台入口变成 _apply_worker_*，emit 锚点相应换成 _apply_finished
+    assert src and "_apply_finished.emit" in src, "accel_page 源码读不到"
     mutated = src.replace(
-        "self._domain_done.emit(svc, done, total, domain, ip, ms, error)",
-        "self._domain_done.emit(svc, done, total, domain, ip, ms, error)\n"
-        "            self._cards[svc]._progress.setText('后台线程直接改界面')")
+        "        self._apply_finished.emit(res)",
+        "        self._apply_finished.emit(res)\n"
+        "        self._cards['steam']._progress.setText('后台线程直接改界面')")
     assert mutated != src, "锚点没命中"
 
     def fake(filename, _orig=orig, _mut=mutated):
@@ -859,6 +860,20 @@ CASES.append(("permorder", "被占用文件被判定为「非权限问题」",
               m_permorder, r_permorder, "uninstall"))
 
 
+def do_base():
+    base, err = run_once("base")
+    if base is None:
+        say("基线跑不起来：%s" % err)
+        return 1
+    base_fail = failed_names(base)
+    say("基线：ok=%s 断言数=%d 失败=%s"
+        % (base["ok"], len(base["checks"]), sorted(base_fail) or "无"))
+    if base_fail:
+        say("!! 基线就有失败项，后面的结论不可信")
+        return 1
+    return 0
+
+
 # ---- 33) 夺取所有权分支被删除：_delete_dir 退回"只有摘只读 + 逐项删" ----
 # v1.0.2 问题 3 的第一个根因：ACL 受阻时连管理员也删不掉，解药是
 # takeown + icacls /reset。最直接的"变坏"就是把这道分支拿掉。
@@ -924,71 +939,68 @@ def case_by_tag(tag):
             return item
     return None
 
-
-def do_base():
-    base, err = run_once("base")
-    if base is None:
-        say("基线跑不起来：%s" % err)
-        return 1
-    base_fail = failed_names(base)
-    say("基线：ok=%s 断言数=%d 失败=%s"
-        % (base["ok"], len(base["checks"]), sorted(base_fail) or "无"))
-    if base_fail:
-        say("!! 基线就有失败项，后面的结论不可信")
-        return 1
-    return 0
-
-
-# ---- 33) 「秒加速」被改回"先测速再写盘"（Steam++ 之前的老行为）----
+# ---- 33) 「秒加速」被改回"先测速再写"（Steam++ 之前的老行为）----
 def m_fastaccel():
-    """把 _start_enable 换回"无论什么模式都先跑一遍测速"。
+    """把 _toggled 换成"开启前先同步跑一遍测速"的老路子。
 
-    这正是用户报的"不像 Steam++ 那样秒开"的根因，所以必须有断言逮住它：
-    代理模式拨开开关时应该**零测速**、直接写全量 127.0.0.1。
+    这正是用户报的"不像 Steam++ 那样秒开"的根因。新架构里启用路径
+    **零测速**（意图应用只是写 127.0.0.1），所以有断言盯着
+    optimize_service 是否被同步启用路径调用。
     """
+    import threading as _th
     import ui.pages.accel_page as _ap
-    _ap.AccelPage._m_orig_enable = _ap.AccelPage._start_enable
-    _ap.AccelPage._start_enable = lambda self, svc: self._start_optimize(svc)
+
+    def slow_toggle(self, svc, on):
+        if on:
+            import hostsaccel as _ha
+            _ha.optimize_service(svc)          # 老路子：先测速再写
+        _ap.AccelPage._m_orig_toggled(self, svc, on)
+
+    _ap.AccelPage._m_orig_toggled = _ap.AccelPage._toggled
+    _ap.AccelPage._toggled = slow_toggle
 
 
 def r_fastaccel():
     import ui.pages.accel_page as _ap
-    _ap.AccelPage._start_enable = _ap.AccelPage._m_orig_enable
+    _ap.AccelPage._toggled = _ap.AccelPage._m_orig_toggled
 
 
-CASES.append(("fastaccel", "秒加速：同步启用路径上一次测速都没有（快就快在这里）",
+CASES.append(("fastaccel", "秒加速：拨开开关零测速直接写盘（快就快在这里）",
               m_fastaccel, r_fastaccel, "hosts"))
 
-# ---- 34) 「关闭动作被忙碌挡住」被放回来（v1.0.2 的「关不掉」）----
+# ---- 34) 「应用串行化守卫」被拆掉（并发提权，UAC 接连弹）----
 def m_canceloff():
-    """把 _start_disable 换回旧实现：忙碌中一律把开关弹回、什么都不做。
+    """把 _ensure_apply 的"在跑就不重入"守卫去掉。
 
-    这就是用户报的「关不掉」——点关没反应，得干等测速跑完。断言逮不住它
-    的话，这个 bug 会静悄悄地回来。
+    没有这个守卫，用户连拨开关会开出多个并发提权应用 —— 正是 v1.0.3
+    修「关不掉」之前"状态机分叉、UAC 一个接一个"的根源。断言用慢速
+    应用桩 + 直接二次调用 _ensure_apply，确保守卫真的被测到。
     """
+    import threading as _th
     import ui.pages.accel_page as _ap
 
-    def old_disable(self, svc):
-        if self._busy[svc]:
-            self._sync_switch(svc)
-            return
-        self._start_clean(svc)
+    def unguarded(self):
+        self._apply_running = True
+        import hostsaccel as _ha
+        worker = (self._apply_worker_direct if _ha.is_admin()
+                  else self._apply_worker_elevated)
+        _th.Thread(target=worker, daemon=True).start()
 
-    _ap.AccelPage._m_orig_disable = _ap.AccelPage._start_disable
-    _ap.AccelPage._start_disable = old_disable
+    _ap.AccelPage._m_orig_ensure = _ap.AccelPage._ensure_apply
+    _ap.AccelPage._ensure_apply = unguarded
 
 
 def r_canceloff():
     import ui.pages.accel_page as _ap
-    _ap.AccelPage._start_disable = _ap.AccelPage._m_orig_disable
+    _ap.AccelPage._ensure_apply = _ap.AccelPage._m_orig_ensure
 
 
-CASES.append(("canceloff", "忙碌中拨到关 → 立刻清理，不被 busy 挡住",
+CASES.append(("canceloff", "应用严格串行（同时最多一个提权在跑）",
               m_canceloff, r_canceloff, "hosts"))
 
 # ---- 35) 回调纪律扫描名单被写窄（新函数成了扫描盲区）----
 def m_astscan():
-    """把 accel_page 里的 _start_enable 改名，模拟"名单没跟上重构"。
+    """把 accel_page 里的 _apply_worker_elevated 改名，模拟"名单没跟上重构"。
 
     这种漏最阴：断言照样全绿，但那段代码其实**根本没被扫到**
    （"它绿了"≠"它测到了"）。所以专门有一条断言盯着"名单覆盖全部后台入口"。
@@ -996,8 +1008,9 @@ def m_astscan():
     import hostsaccel_selftest as _hst
     orig = _hst._module_source
     src = orig("accel_page.py")
-    assert src and "def _start_enable" in src, "锚点没命中"
-    mutated = src.replace("def _start_enable", "def _start_enable_RENAMED", 1)
+    assert src and "def _apply_worker_elevated" in src, "锚点没命中"
+    mutated = src.replace("def _apply_worker_elevated",
+                          "def _apply_worker_elevated_RENAMED", 1)
 
     def fake(filename, _orig=orig, _mut=mutated):
         return _mut if filename == "accel_page.py" else _orig(filename)
@@ -1013,6 +1026,36 @@ def r_astscan():
 
 CASES.append(("astscan", "回调纪律扫描覆盖全部后台入口（名单不能漏）",
               m_astscan, r_astscan, "hosts"))
+
+# ---- 36) 「意图 seq 落后自动补一轮」被砍掉（收尾不看最新意图）----
+def m_stalefix():
+    """把 _on_apply_finished 开头的 seq 复查分支去掉。
+
+    子进程带 0.6s 稳定窗，绝大多数"应用期间改主意"都会被同一轮吸收；
+    这个复查是极小竞态窗（子进程退出后意图又变）的兜底。砍掉它，落下的
+    意图就永远没人补 —— 开关与 hosts 会悄悄错位。断言：结果 seq 落后时
+    必须看到第二次 apply。
+    """
+    import ui.pages.accel_page as _ap
+
+    def no_recheck(self, res):
+        self._apply_running = False
+        for svc in _ap.ha.SERVICES:
+            self._cards[svc]._progress.setVisible(False)
+        self._resync_intent()
+        self._refresh_status()
+
+    _ap.AccelPage._m_orig_oaf = _ap.AccelPage._on_apply_finished
+    _ap.AccelPage._on_apply_finished = no_recheck
+
+
+def r_stalefix():
+    import ui.pages.accel_page as _ap
+    _ap.AccelPage._on_apply_finished = _ap.AccelPage._m_orig_oaf
+
+
+CASES.append(("stalefix", "结果 seq 落后 → 自动补一轮应用（不靠用户再点）",
+              m_stalefix, r_stalefix, "hosts"))
 
 
 def do_one(tag):
