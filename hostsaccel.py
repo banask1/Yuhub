@@ -46,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -165,23 +166,107 @@ _ELEVATED_FLAG = "--hosts-elevated"
 _result_seq = 0
 _result_seq_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# 自检隔离（由 main.py 的**所有** `--*-selftest` 入口统一开启）
+#
+# 血泪教训（v1.0.5 实测，第二次踩同一个坑）：MainWindow.teardown() 会走
+# accel_page.shutdown() → 清加速条目 → run_elevated_apply（**真提权、真写盘**）。
+# theme 自检会实例化 MainWindow —— 于是跑一次 theme 自检，用户真实 hosts 里的
+# steam 区块就被清掉了（2091 → 847 字节）。
+#
+# 「某个套件自己记得打桩」是靠不住的：只要有一个入口忘了，真实系统就被改。
+# 所以把钩子挂到**模块层**、由入口统一开启：一旦隔离生效，
+#   · hosts_path / backup_dir / intent_path / _map_cache_path / _result_path
+#     全部指向临时目录；
+#   · run_elevated / run_elevated_apply / elevated_hosts_main 直接拒绝执行
+#     （自检永远不弹 UAC、永远不碰真实 hosts）。
+# ---------------------------------------------------------------------------
+_ISOLATED_ROOT = ""            # 非空 = 自检隔离生效中
+_REAL_HOSTS_PATH = ""          # 隔离前的真实 hosts（快照/还原/断言要用）
+_REAL_BACKUP_DIR = ""
 
-def hosts_path():
-    """系统 hosts 文件路径（Windows: %SystemRoot%\\System32\\drivers\\etc\\hosts）。"""
+
+def selftest_isolated():
+    """当前是否处于自检隔离模式。"""
+    return bool(_ISOLATED_ROOT)
+
+
+def selftest_root():
+    return _ISOLATED_ROOT
+
+
+def real_hosts_path():
+    """真实系统 hosts 的路径（隔离生效时也能拿到）。"""
+    return _REAL_HOSTS_PATH or _system_hosts_path()
+
+
+def real_backup_dir():
+    """真实备份目录（隔离生效时也能拿到）。"""
+    return _REAL_BACKUP_DIR or _system_backup_dir()
+
+
+def enable_selftest_isolation(root=None):
+    """开启自检隔离，返回隔离根目录（失败返回 ""）。
+
+    幂等：重复调用只更新根目录，不会把真实路径记成"隔离后的路径"。
+    """
+    global _ISOLATED_ROOT, _REAL_HOSTS_PATH, _REAL_BACKUP_DIR
+    if not _ISOLATED_ROOT:                       # 只在首次记录真实路径
+        _REAL_HOSTS_PATH = _system_hosts_path()
+        _REAL_BACKUP_DIR = _system_backup_dir()
+    if not root:
+        root = os.path.join(tempfile.gettempdir(),
+                            "yuhub_selftest_iso_%d" % os.getpid())
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError:
+        return ""
+    _ISOLATED_ROOT = root
+    # 隔离目录里的 hosts 先放一份最小内容，免得自检拿不到文件
+    hp = os.path.join(root, "hosts")
+    if not os.path.exists(hp):
+        try:
+            with open(hp, "w", encoding="utf-8", newline="") as fh:
+                fh.write("127.0.0.1 localhost\r\n")
+        except OSError:
+            pass
+    return root
+
+
+def _system_hosts_path():
     if IS_WIN:
         root = os.environ.get("SystemRoot", r"C:\Windows")
         return os.path.join(root, "System32", "drivers", "etc", "hosts")
     return "/etc/hosts"
 
 
-def backup_dir():
-    """hosts 备份目录（%LOCALAPPDATA%\\Yuhub\\hosts_backup）。
-
-    放这里而不是文档目录的 Yuhub 文件夹：那里是主题包根目录，
-    主题列表会扫子目录 —— 放进去备份目录会以"垃圾主题"的形式出现在列表里。
-    """
+def _system_backup_dir():
     d = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%" if IS_WIN else "~"),
                      "Yuhub", "hosts_backup")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = ""
+    return d
+
+
+def hosts_path():
+    """系统 hosts 文件路径（自检隔离生效时指向临时目录）。"""
+    if _ISOLATED_ROOT:
+        return os.path.join(_ISOLATED_ROOT, "hosts")
+    return _system_hosts_path()
+
+
+def backup_dir():
+    """hosts 备份目录（自检隔离生效时指向临时目录）。
+
+    放 %LOCALAPPDATA% 而不是文档目录的 Yuhub 文件夹：那里是主题包根目录，
+    主题列表会扫子目录 —— 放进去备份目录会以"垃圾主题"的形式出现在列表里。
+    """
+    if _ISOLATED_ROOT:
+        d = os.path.join(_ISOLATED_ROOT, "hosts_backup")
+    else:
+        return _system_backup_dir()
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
@@ -195,8 +280,13 @@ def _result_path():
     路径带 **PID + 递增序号**：同一进程内并发两次提权（比如"写入"和"退出清理"
     几乎同时发生）如果共用同一个结果文件，会互相 os.remove 掉对方的结果，
     导致其中一次永远等不到文件、一路轮询到 timeout 后报"取消了 UAC 或超时"。
+    自检隔离生效时落到临时目录（见 enable_selftest_isolation）。
     """
-    d = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%" if IS_WIN else "~"), "Yuhub")
+    if _ISOLATED_ROOT:
+        d = _ISOLATED_ROOT
+    else:
+        d = os.path.join(os.path.expandvars(
+            r"%LOCALAPPDATA%" if IS_WIN else "~"), "Yuhub")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
@@ -209,13 +299,28 @@ def _result_path():
 
 
 def is_admin():
-    """当前进程是否具有管理员权限（Windows 用 IsUserAnAdmin）。"""
+    """当前进程是否**已提权**（能真正写 hosts 的那种权限）。
+
+    ⚠️ 这里踩过坑：旧实现用 `shell32.IsUserAnAdmin()`，它问的是"账户是不是
+    Administrators 组的"，**不是"进程有没有提权"**。在"账户是管理员 + UAC
+    开着 + Yuhub 以普通权限运行"的机器上它返回 1（本机实测 IsUserAnAdmin=1
+    而 TokenElevation=0），于是：
+      · elevation_capable() 说"已经有权限了"，
+      · 界面上却不弹 UAC、直接写盘 → WinError 5，
+      · 用户看到"明明有权限却提示写入 hosts 失败 / hosts 未被改动"。
+    现在统一走 winadmin.is_elevated()（TokenElevation），拿到内核的判决。
+    自动/覆盖判定都跟着这个口径走。
+    """
     try:
-        if IS_WIN:
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        return os.geteuid() == 0
+        import winadmin
+        return bool(winadmin.is_elevated())
     except Exception:
-        return False
+        try:
+            if IS_WIN:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            return os.geteuid() == 0
+        except Exception:
+            return False
 
 
 def shell_execute_runas(exe, args):
@@ -603,6 +708,130 @@ def _backup(hosts_file):
         return ""
 
 
+# ---------------------------------------------------------------------------
+# hosts 落盘策略（对标 Steam++ / Watt Toolkit 的 HostsService.UpdateHosts）
+#
+# Steam++ 的写法是：
+#     File.SetAttributes(hosts, FileAttributes.Normal);   // 先摘只读
+#     File.WriteAllLines(hosts, lines);                   // 原地覆盖写
+# 它**不建临时文件、不重命名**。这不是随手写的 —— 装了火绒/360 这类安全
+# 软件的机器上，hosts 常被纳入「关键文件保护」：「删除/重命名系统文件」
+# 会被拦，而单纯写数据多数能过。
+#
+# 我们原来的方案是 tmp + os.replace（改名覆盖），需要删除权限 —— 本机实测
+# （用户机器：火绒 + 提权子进程）第一次写入成功，之后**每次**都在
+# os.replace 处拿到 WinError 5「拒绝访问」，表现就是"开得起来、关不掉 /
+# hosts 未被改动"。所以改成：原地写优先（Steam++ 同款），原子替换兜底。
+# ---------------------------------------------------------------------------
+def _clear_readonly(target):
+    """摘掉只读属性（Steam++ 同样先 SetAttributes(Normal)）。
+
+    只读文件连原地写都是 WinError 5。失败不致命，继续往下试即可。
+    """
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetFileAttributesW.restype = ctypes.c_uint32
+        k32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+        k32.SetFileAttributesW.restype = ctypes.c_int
+        k32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        attrs = k32.GetFileAttributesW(str(target))
+        if attrs == 0xFFFFFFFF:                 # INVALID_FILE_ATTRIBUTES
+            return False
+        if attrs & 0x1:                         # FILE_ATTRIBUTE_READONLY
+            k32.SetFileAttributesW(str(target), attrs & ~0x1)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _write_inplace(target, text):
+    """① 原地重写：打开现有文件 → 覆盖 → 截断。不删、不改名（Steam++ 同款）。
+
+    `r+b` 走 OPEN_EXISTING，不会触发"创建"语义；只用 FILE_WRITE_DATA，
+    不需要删除权限。失败直接抛 OSError，由阶梯决定是否降级。
+    """
+    data = text.encode("utf-8")
+    with open(target, "r+b") as fh:
+        fh.seek(0)
+        fh.write(data)
+        fh.truncate()
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _write_replace(target, text):
+    """② 原子替换：同目录 tmp + os.replace（失败不留半截文件）。"""
+    tmp = target + ".yuhub.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+
+
+def _drop_tmp(target):
+    """清掉失败留下的临时文件（best-effort，别在 etc 里攒垃圾）。"""
+    try:
+        os.remove(target + ".yuhub.tmp")
+        return True
+    except OSError:
+        return False
+
+
+_AV_HINT = ("（系统或安全软件拒绝了写入：请把 Yuhub.exe 加入火绒/360 等"
+            "安全软件的信任区，或关闭其「hosts 文件保护」后重试）")
+
+
+def commit_hosts(target, text, original=None):
+    """把整份 text 落到 hosts，返回 {"ok", "method", "error"}。
+
+    策略阶梯（按"最容易被放行"排序）：
+      ① inplace —— 原地重写，不删不改名（Steam++ 做法，首选）；
+      ② replace —— 原子替换，① 被拦时兜底。
+    每种方法各重试 3 次，退避 0.3s / 0.9s —— 装火绒这类安全软件的机器上，
+    第一次写入往往被拦并弹「是否允许修改 hosts」，用户点「允许」之后**需要
+    重试一次才能过**（被拦那次的返回值就是 WinError 5，不会自动重放）。
+    每次重试前都重新摘一次只读属性（有的保护软件会把它加回去）。
+    落地后**回读校验**；不一致就用 original 原样还原并报失败 —— 宁可明确
+    失败，也不能把 hosts 留成半截（原地写没有原子性，这一步是它的保险）。
+    """
+    _drop_tmp(target)          # 先清掉上次失败留下的 tmp，别让它留在 etc 里
+    errors = []
+    for name, fn in (("inplace", _write_inplace), ("replace", _write_replace)):
+        last = None
+        for attempt in range(3):
+            _clear_readonly(target)
+            try:
+                fn(target, text)
+            except OSError as exc:
+                last = exc
+                _drop_tmp(target)
+                if attempt < 2:
+                    time.sleep(0.3 if attempt == 0 else 0.9)
+                continue
+            # 回读校验（newline="" 才不会把 \r\n 折叠成 \n）
+            try:
+                with open(target, "r", encoding="utf-8", newline="") as fh:
+                    got = fh.read()
+            except OSError:
+                got = None
+            if got == text:
+                return {"ok": True, "method": name, "error": ""}
+            if original is not None:
+                try:
+                    _write_inplace(target, original)
+                except OSError:
+                    pass
+            return {"ok": False, "method": "",
+                    "error": "写入 hosts 失败：%s 方法落地后校验不一致"
+                             "（已尝试还原原内容）" % name}
+        errors.append("%s：%s" % (name, last))
+    _drop_tmp(target)
+    return {"ok": False, "method": "",
+            "error": "写入 hosts 失败：%s。%s" % ("；".join(errors), _AV_HINT)}
+
+
 def write_service_block(service, entries, hosts_file=None, do_backup=True,
                         proxy=False):
     """清洗旧内容 → 追加本服务新区块 → 写回。
@@ -627,14 +856,11 @@ def write_service_block(service, entries, hosts_file=None, do_backup=True,
     lines += [""] + build_block_lines(
         service, [(ip, d, 0.0) for ip, d in entries], proxy=proxy)
     text = _newline().join(lines) + _newline()
-    try:
-        tmp = target + ".yuhub.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
-            fh.write(text)
-        os.replace(tmp, target)
-    except OSError as exc:
-        res["error"] = "写入 hosts 失败（需要管理员权限）：%s" % exc
+    commit = commit_hosts(target, text, original=raw)
+    if not commit["ok"]:
+        res["error"] = commit["error"]
         return res
+    res["method"] = commit["method"]
     res["ok"] = True
     return res
 
@@ -656,14 +882,11 @@ def clean_service(service, hosts_file=None, do_backup=True):
         res["ok"] = True
         return res
     text = _newline().join(lines) + _newline()
-    try:
-        tmp = target + ".yuhub.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
-            fh.write(text)
-        os.replace(tmp, target)
-    except OSError as exc:
-        res["error"] = "写入 hosts 失败（需要管理员权限）：%s" % exc
+    commit = commit_hosts(target, text, original=raw)
+    if not commit["ok"]:
+        res["error"] = commit["error"]
         return res
+    res["method"] = commit["method"]
     res["ok"] = True
     return res
 
@@ -692,6 +915,10 @@ def elevated_hosts_main(payload_b64):
                  "proxy": bool, "result_file": ...} —— 旧的单服务直写模式
     无窗口、不建 UI、不碰网络 —— 只改 hosts 后把结果 JSON 原子写回。
     """
+    if _ISOLATED_ROOT:
+        # 自检隔离：入口直接拒绝（双保险 —— 万一有套件真的调到这里，
+        # 也绝不写真实 hosts）。返回 6 = "被隔离拦下"。
+        return 6
     try:
         payload = json.loads(base64.b64decode(payload_b64.encode("ascii"))
                              .decode("utf-8"))
@@ -750,6 +977,9 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
     """
     if not IS_WIN:
         return None
+    if _ISOLATED_ROOT:
+        # 自检隔离：永不提权（提权子进程按真实 hosts 路径写盘，隔离就白做了）
+        return {"ok": False, "error": "自检隔离模式：已禁用提权写盘"}
     ok, why = elevation_capable()
     if not ok:
         return {"error": why}
@@ -791,8 +1021,11 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
 # 优选映射缓存（域名 → 真实 IP）：本地反向代理按 SNI 查的表
 # ---------------------------------------------------------------------------
 def _map_cache_path():
-    d = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%" if IS_WIN else "~"),
-                     "Yuhub")
+    if _ISOLATED_ROOT:
+        d = _ISOLATED_ROOT
+    else:
+        d = os.path.join(os.path.expandvars(
+            r"%LOCALAPPDATA%" if IS_WIN else "~"), "Yuhub")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
@@ -952,9 +1185,16 @@ def optimize_service_map(service, on_domain=None):
 # 等待期间改主意，同一次 UAC 就按新意图执行，永不分叉、永不多弹。
 
 def intent_path():
-    """意图文件路径（%LOCALAPPDATA%\\Yuhub\\hosts_intent.json）。"""
-    d = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%" if IS_WIN else "~"),
-                     "Yuhub")
+    """意图文件路径（%LOCALAPPDATA%\\Yuhub\\hosts_intent.json）。
+
+    自检隔离生效时落到临时目录 —— 否则跑一次自检就会把用户真实的
+    "开关期望态"改掉（v1.0.5 实测踩到）。
+    """
+    if _ISOLATED_ROOT:
+        d = _ISOLATED_ROOT
+    else:
+        d = os.path.join(os.path.expandvars(
+            r"%LOCALAPPDATA%" if IS_WIN else "~"), "Yuhub")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
@@ -1031,13 +1271,17 @@ def apply_intent(intent, hosts_file=None, do_backup=True):
     """
     seq = intent.get("seq", 0) if isinstance(intent, dict) else 0
     out = {"ok": True, "seq": seq, "services": {}}
+    # 诊断字段：出问题时一眼看出"应用这次意图的进程到底有没有管理员权限"、
+    # 用的是哪条落盘路径（inplace/replace）。用户机器上那些查不清的
+    # WinError 5 就靠它定性。
+    out["admin"] = is_admin()
     for s in SERVICES:
         if s not in (intent or {}):
             continue
         want = bool(intent[s])
         entries = current_entries(s, hosts_file)
         have = bool(entries) or service_enabled(s, hosts_file)
-        sub = {"ok": True, "action": "skip", "error": ""}
+        sub = {"ok": True, "action": "skip", "error": "", "method": ""}
         if want:
             # 已是"全量代理区块"就跳过（幂等的关键）
             if (entries_mode(entries) == "proxy"
@@ -1050,6 +1294,7 @@ def apply_intent(intent, hosts_file=None, do_backup=True):
                     hosts_file=hosts_file, do_backup=do_backup, proxy=True)
                 sub["ok"] = bool(res.get("ok"))
                 sub["error"] = res.get("error") or ""
+                sub["method"] = res.get("method") or ""
         else:
             if not have:
                 sub["action"] = "skip"
@@ -1059,6 +1304,7 @@ def apply_intent(intent, hosts_file=None, do_backup=True):
                                     do_backup=do_backup)
                 sub["ok"] = bool(res.get("ok"))
                 sub["error"] = res.get("error") or ""
+                sub["method"] = res.get("method") or ""
         if not sub["ok"]:
             out["ok"] = False
         out["services"][s] = sub
@@ -1083,7 +1329,7 @@ def elevated_apply_main(result_file):
         intent = read_intent()
         if intent is None:
             out = {"ok": False, "error": "意图文件不可读",
-                   "seq": last_seq or 0, "services": {}}
+                   "seq": last_seq or 0, "services": {}, "admin": is_admin()}
         else:
             out = apply_intent(intent)
             last_seq = intent["seq"]
@@ -1118,6 +1364,10 @@ def run_elevated_apply(timeout=120.0, path=None):
     """
     if not IS_WIN:
         return None
+    if _ISOLATED_ROOT:
+        # 自检隔离：永不提权（同上）
+        return {"ok": False, "seq": 0,
+                "error": "自检隔离模式：已禁用提权写盘", "services": {}}
     ok, why = elevation_capable()
     if not ok:
         return {"ok": False, "error": why}

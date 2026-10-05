@@ -35,12 +35,15 @@
 """
 
 import os
+import time
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 MSG_ACTIVATE = b"activate"
 MSG_ACK = b"ack"
+# 「请让位，我要接管」—— 只用于"以管理员身份重启"这条路径（见 acquire_takeover）。
+MSG_TAKEOVER = b"takeover"
 DEFAULT_KEY = "Yuhub-SingleInstance"
 
 # 连接探测超时。Windows 上管道不存在时会**立刻**失败，不会真的等这么久；
@@ -99,6 +102,9 @@ class SingleInstance(QObject):
     # 收到「第二个实例想启动」的请求 → 应该把窗口显示出来
     activate_requested = Signal()
 
+    # 收到「提权重启的新实例要接管」→ 应该保存状态并退出，把管道让出去
+    takeover_requested = Signal()
+
     def __init__(self, key=DEFAULT_KEY, parent=None):
         super().__init__(parent)
         # key 是"半成品"，name 才是真正拿去 listen/connect 的服务名（带用户名后缀）。
@@ -137,33 +143,103 @@ class SingleInstance(QObject):
         self.listening = True
         return True
 
-    # ------------------------------------------------------------ 角色二
-    def _probe(self):
-        """连一下已有实例，递出「把窗口显示出来」的请求，并**等回执**。
+    # ------------------------------------------------------------ 角色三
+    def _alive(self):
+        """只探活，**不递任何消息**（不同于 `_probe`）。
 
-        返回 True 表示有活着的实例（消息已尽力送达）。
+        提权重启时要判断"旧实例让位了没有"，这时候最怕的就是顺手敲一下门
+        —— 那会把旧窗口激活，用户以为重启失败。
+        """
+        sock = QLocalSocket()
+        sock.connectToServer(self.name)
+        ok = sock.waitForConnected(CONNECT_TIMEOUT_MS)
+        if ok:
+            sock.disconnectFromServer()
+            if sock.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+                sock.waitForDisconnected(CONNECT_TIMEOUT_MS)
+        else:
+            sock.abort()
+        return ok
+
+    def request_takeover(self):
+        """递出「请让位」并等回执。返回 True 表示确实连上了旧实例。"""
+        return self._send(MSG_TAKEOVER)
+
+    def acquire_takeover(self, timeout_ms=12000, interval_ms=150):
+        """提权重启专用：请旧实例让位，等管道释放后自己接管。
+
+        **不能直接调 `acquire()`**：`acquire()` 的第一件事是 `_probe()`，
+        也就是"敲旧实例的门、让它把窗口显示出来"。提权重启时旧实例本来就
+        要退出，这一敲的后果是**旧窗口被激活、新实例自己退出** —— 用户点
+        了"以管理员身份重启"，结果程序闪了一下还是普通权限的旧窗口。
+
+        超时没等到让位就退化成普通 `acquire()`（至少保证程序可用，
+        最坏是"重启没成功"，而不是"程序打不开了"）。
+        """
+        if not self._alive():
+            return self.acquire()          # 旧实例早退了，直接拿
+        self.request_takeover()
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            if not self._alive():
+                if self.acquire():
+                    return True
+            time.sleep(interval_ms / 1000.0)
+        return self.acquire()
+
+    # ------------------------------------------------------------ 发消息
+    def _send(self, msg):
+        """连上已有实例 → 写 msg → 收到回执 → 断开。返回 True=确实连上了。
+
+        ⚠️ **不能只靠 `waitForBytesWritten` / `waitForReadyRead`**（实测踩过）：
+        当客户端和服务端**在同一个进程**里时（自检是这样；"以管理员身份重启"
+        时新旧实例也短暂共存），这两个 wait 都不保证把消息推出去 —— 字节还
+        躺在 Qt 的写缓冲里，而紧接着的 `disconnectFromServer()` 会把它丢掉，
+        对端一个字都收不到。症状非常隐蔽：`request_takeover()` 返回 True
+        （连接确实建立了），旧实例却始终不让位。
+
+        所以这里**显式泵事件循环**，直到 `bytesToWrite()` 归零并拿到回执。
         """
         sock = QLocalSocket()
         sock.connectToServer(self.name)
         if not sock.waitForConnected(CONNECT_TIMEOUT_MS):
             sock.abort()
             return False
+        app = QCoreApplication.instance()
         try:
-            sock.write(MSG_ACTIVATE)
-            sock.flush()
-            sock.waitForBytesWritten(CONNECT_TIMEOUT_MS)
-            # 一定要等回执再断开（实测踩过）：
-            # 写完立刻 disconnect，服务端可能还没读到，Windows 上它只会看到
-            # "对端已关闭"、readAll() 返回空 —— 消息就这么没了。表现是
-            # "第二个实例确实退出了，但第一个实例的窗口根本不弹"。
-            # 有 ack 才能确定对方真的读到并处理了。
-            if sock.waitForReadyRead(ACK_TIMEOUT_MS):
-                bytes(sock.readAll())
+            sock.write(msg)
+            deadline = time.monotonic() + ACK_TIMEOUT_MS / 1000.0
+            acked = False
+            while True:
+                if app is not None:
+                    # 同进程时，对端就是靠这一下才读到消息
+                    app.processEvents()
+                sock.flush()
+                sock.waitForBytesWritten(20)
+                if sock.bytesToWrite() == 0:
+                    if acked:
+                        break
+                    if app is not None:
+                        app.processEvents()
+                    if sock.waitForReadyRead(30):
+                        bytes(sock.readAll())
+                        acked = True
+                        break
+                if time.monotonic() >= deadline:
+                    break
         finally:
             sock.disconnectFromServer()
             if sock.state() != QLocalSocket.LocalSocketState.UnconnectedState:
                 sock.waitForDisconnected(CONNECT_TIMEOUT_MS)
         return True
+
+    # ------------------------------------------------------------ 角色二
+    def _probe(self):
+        """连一下已有实例，递出「把窗口显示出来」的请求，并**等回执**。
+
+        返回 True 表示有活着的实例（消息已尽力送达）。
+        """
+        return self._send(MSG_ACTIVATE)
 
     # ------------------------------------------------------------ 监听端
     def _on_new_connection(self):
@@ -194,6 +270,12 @@ class SingleInstance(QObject):
         except RuntimeError:
             return
         if not data:
+            return
+        # 接管请求优先：提权重启时旧实例必须先让位（否则新实例 listen 不上，
+        # 用户会看到"程序重启了一次却还是普通权限"）。
+        if MSG_TAKEOVER in data:
+            self._ack(conn)
+            self.takeover_requested.emit()
             return
         if MSG_ACTIVATE in data:
             self._ack(conn)

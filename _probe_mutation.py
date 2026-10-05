@@ -661,6 +661,82 @@ def r_hosts_ip():
 CASES.append(("hostsip", "非公网 IP 127.0.0.1 被拒",
               m_hosts_ip, r_hosts_ip, "hosts"))
 
+# ---- 29b) 落盘阶梯：首选路 / 兜底路 / 回读校验，三条各切一次 ----
+# 背景：用户机器（火绒）里 tmp+os.replace 会被「hosts 保护」拦成 WinError 5，
+# 改成"原地写优先 + 替换兜底 + 回读校验"之后，这三条都必须真的被测到 ——
+# 只删掉任何一条而断言还全绿，就说明这道防线是摆设。
+def m_noinplace():
+    import hostsaccel as _ha
+    orig = _ha._write_inplace
+
+    def denied(_target, _text):
+        raise OSError(13, "拒绝访问")
+
+    _ha._m_orig_inplace = orig
+    _ha._write_inplace = denied
+
+
+def r_noinplace():
+    import hostsaccel as _ha
+    _ha._write_inplace = _ha._m_orig_inplace
+
+
+CASES.append(("noinplace", "落盘首选原地写（Steam++ 同款，不删不改名）",
+              m_noinplace, r_noinplace, "hosts"))
+
+
+def m_noreplace():
+    import hostsaccel as _ha
+    orig = _ha._write_replace
+
+    def denied(_target, _text):
+        raise OSError(13, "拒绝访问")
+
+    _ha._m_orig_replace = orig
+    _ha._write_replace = denied
+
+
+def r_noreplace():
+    import hostsaccel as _ha
+    _ha._write_replace = _ha._m_orig_replace
+
+
+CASES.append(("noreplace", "原地写被拦时兜底原子替换成功",
+              m_noreplace, r_noreplace, "hosts"))
+
+
+def m_noverify():
+    """把回读校验整段切掉：原地写没有原子性，没有校验就会"写坏了还报成功"。"""
+    import hostsaccel as _ha
+    orig = _ha.commit_hosts
+
+    def loose(target, text, original=None):
+        _ha._clear_readonly(target)
+        _ha._drop_tmp(target)
+        for name, fn in (("inplace", _ha._write_inplace),
+                         ("replace", _ha._write_replace)):
+            try:
+                fn(target, text)
+                return {"ok": True, "method": name, "error": ""}
+            except OSError as exc:
+                _ha._drop_tmp(target)
+                last = exc
+        return {"ok": False, "method": "",
+                "error": "写入 hosts 失败：%s" % last}
+
+    _ha._m_orig_commit = orig
+    _ha.commit_hosts = loose
+
+
+def r_noverify():
+    import hostsaccel as _ha
+    _ha.commit_hosts = _ha._m_orig_commit
+
+
+CASES.append(("noverify", "落地后校验不一致时明确失败（不假装成功）",
+              m_noverify, r_noverify, "hosts"))
+
+
 # ---- 29) UI 回调纪律被破坏：后台线程回调里直接 setText 改界面 ----
 def m_hosts_cb():
     import hostsaccel_selftest as _hst
@@ -1056,6 +1132,106 @@ def r_stalefix():
 
 CASES.append(("stalefix", "结果 seq 落后 → 自动补一轮应用（不靠用户再点）",
               m_stalefix, r_stalefix, "hosts"))
+
+
+# ---- 43) 「管理员模式」三条：标志位同源 / 接管消息真的送达 / 取消授权不退程序 ----
+# 背景（v1.0.5）：对齐 Steam++ 的 `requireAdministrator` —— 主程序常驻管理员后
+# hosts 由同一个进程直写，不再逐次弹 UAC、也不再让杀软反复审视新进程。
+# 这条路上的三个关键点各切一刀，确认对应断言真的会红。
+def m_badflag():
+    """把"重启标志"改成另一个字面量（且 UI 与 main 各改各的）。
+
+    期望："winadmin 给出统一的 RELAUNCH_FLAG" 变红 —— 这个常量只能有一个
+    来源，两边不一致时新实例会认不出自己，跑去敲旧实例的门。
+    """
+    import winadmin as _w
+    import main as _m
+    _w._m_orig_flag = _w.RELAUNCH_FLAG
+    _m._m_orig_flag = _m.RELAUNCH_FLAG
+    _w.RELAUNCH_FLAG = "--elevate-now"
+    _m.RELAUNCH_FLAG = "--elevate-now"
+
+
+def r_badflag():
+    import winadmin as _w
+    import main as _m
+    _w.RELAUNCH_FLAG = _w._m_orig_flag
+    _m.RELAUNCH_FLAG = _m._m_orig_flag
+
+
+CASES.append(("badflag", "winadmin 给出统一的 RELAUNCH_FLAG",
+              m_badflag, r_badflag, "hosts"))
+
+
+def m_takeovernopump():
+    """把「递接管消息」退回成只 waitFor* 不泵事件循环的写法。
+
+    这是本次真踩到的坑：客户端与服务端**在同一个进程**里时，
+    `waitForBytesWritten` / `waitForReadyRead` 都不保证把字节推出去，
+    紧接着的 disconnect 直接把消息丢了 —— 函数还返回 True（连接确实建过），
+    旧实例却永远收不到"请让位"，于是"以管理员身份重启"永远重启不了。
+    期望："request_takeover → 旧实例收到 takeover_requested" 变红。
+    """
+    import single_instance as _si
+
+    def naive(self):
+        from PySide6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        sock.connectToServer(self.name)
+        if not sock.waitForConnected(_si.CONNECT_TIMEOUT_MS):
+            sock.abort()
+            return False
+        try:
+            sock.write(_si.MSG_TAKEOVER)
+            sock.flush()
+            sock.waitForBytesWritten(_si.CONNECT_TIMEOUT_MS)
+            if sock.waitForReadyRead(_si.ACK_TIMEOUT_MS):
+                bytes(sock.readAll())
+        finally:
+            sock.disconnectFromServer()
+            if sock.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+                sock.waitForDisconnected(_si.CONNECT_TIMEOUT_MS)
+        return True
+
+    _si.SingleInstance._m_orig_req = _si.SingleInstance.request_takeover
+    _si.SingleInstance.request_takeover = naive
+
+
+def r_takeovernopump():
+    import single_instance as _si
+    _si.SingleInstance.request_takeover = _si.SingleInstance._m_orig_req
+
+
+CASES.append(("takeovernopump", "request_takeover → 旧实例收到 takeover_requested（据此让位）",
+              m_takeovernopump, r_takeovernopump, "hosts"))
+
+
+def m_relaunchignore():
+    """「以管理员身份重启」不看 UAC 的返回值：取消也照样退出自己。
+
+    用户点了「否」→ 程序关了却没重启，比不改还糟。
+    期望："取消管理员授权 → 不重启、按钮恢复可点、给出提示" 变红。
+    """
+    import ui.pages.accel_page as _ap
+    import winadmin as _w
+
+    def bad(self):
+        _w.relaunch_as_admin([_w.RELAUNCH_FLAG])      # 返回值直接丢掉
+        self._relaunching = True
+        self._quit_for_relaunch()
+
+    _ap.AccelPage._m_orig_relaunch = _ap.AccelPage._on_relaunch_clicked
+    _ap.AccelPage._on_relaunch_clicked = bad
+
+
+def r_relaunchignore():
+    import ui.pages.accel_page as _ap
+    _ap.AccelPage._on_relaunch_clicked = _ap.AccelPage._m_orig_relaunch
+
+
+CASES.append(("relaunchignore", "取消管理员授权 → 不重启、按钮恢复可点、给出提示",
+              m_relaunchignore, r_relaunchignore, "hosts"))
+
 
 
 def do_one(tag):

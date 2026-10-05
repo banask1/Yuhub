@@ -302,6 +302,14 @@ def _run_all(mark):
          "%d -> %d" % (len(before), len(memopt.list_processes())))
 
     ops = res.get("system_ops") or {}
+    # 这两条分支互斥：管理员下跑 3 条真·系统调用断言，非管理员下跑 2 条
+    # "如实标记 skip" 断言。所以本套件总数会随进程提权状态变化（103/104）。
+    # 单列一条一致性断言，把"走了哪条分支"这件事明确报出来 —— 免得
+    # "另一条分支根本没跑"被静默当成"验证过了"。
+    mark("[前置] elevated 标记与真实提权状态一致（决定走哪条分支）",
+         bool(res.get("elevated")) == bool(memopt.is_admin()),
+         "elevated=%s is_admin=%s（True→管理员三重断言，False→非管理员两条 skip 断言）"
+         % (res.get("elevated"), memopt.is_admin()))
     if res.get("elevated"):
         mark("管理员：清 standby 成功", ops.get("standby") == "ok", ops)
         mark("管理员：收缩文件缓存成功", ops.get("filecache") == "ok", ops)

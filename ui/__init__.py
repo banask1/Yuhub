@@ -132,6 +132,47 @@
 #       永不多弹 UAC。开关位置显示**用户意图**而非 hosts 真实状态，
 #       杜绝"点了被弹回"的错觉；应用失败时意图对齐回真实状态并明确报错。
 #       应用严格串行（同时最多一个提权在跑）；已是目标状态时不发起提权。
-VERSION = "1.0.4"
+#    ④ v1.0.5 写盘方式对标 Steam++（Watt Toolkit 的 HostsService）：
+#       原来"同目录 tmp + os.replace（改名覆盖）"需要**删除系统文件**的
+#       权限 —— 装了火绒/360 的机器上这一步会被「hosts 文件保护」拦成
+#       WinError 5，现象是"第一次能开、之后每次写/清都失败（hosts 未被
+#       改动 / 关不掉）"。Steam++ 的做法是
+#           File.SetAttributes(hosts, Normal);  File.WriteAllLines(...)
+#       即**先摘只读、再原地覆盖写**，全程不删不改名。现在照做：
+#       落盘阶梯 = ① 原地写（首选，Steam++ 同款，只用 FILE_WRITE_DATA）
+#                 → ② 原子替换（兜底，① 被拦时用）
+#       两种方法各重试 2 次（间隔 0.25s，给安全软件扫描/弹窗留窗口），
+#       落地后**回读校验**，不一致就用原文还原并如实报失败（原地写没有
+#       原子性，这一步是它的保险）；失败信息同时带上两种方法的原始错误
+#       + 「把 Yuhub.exe 加进火绒信任区」的处置指引；残留的
+#       hosts.yuhub.tmp 会被自动清掉。apply 结果新增 admin/method 字段，
+#       下次再出问题一眼能定性（没权限还是被拦）。
+#    ⑤ v1.0.5 常驻管理员模式（对标 Steam++ 的 requireAdministrator）：
+#       读 SteamTools 源码时发现一个容易忽略但很关键的事实 ——
+#       `source/SteamTools/app.manifest` 里写死
+#           <requestedExecutionLevel level="requireAdministrator" />
+#       也就是**它的主程序从启动就常驻管理员**。所以它的 hosts 写入永远
+#       发生在**同一个已提权进程**里：UAC 只在启动弹一次，火绒/360 这类
+#       软件也只需要放行同一个程序一次。
+#       我们原来是普通权限启动 + 每次拨开关 `runas` 拉一个**新的提权子
+#       进程**写盘：UAC 每次都弹，而且 HIPS 类软件会把这个"新来的实例"
+#       重新审视一遍、拦一次就拿 WinError 5（用户看到的"hosts 未被改动"）。
+#       现在加速页多一条权限状态条 + 「以管理员身份重启」按钮：一键换成
+#       管理员模式后，`_ensure_apply` 直接走同进程写盘、退出清理也不再提权，
+#       全程零 UAC。默认仍保持普通权限启动（拖放文件、开机自启都不弹窗），
+#       把选择权交给用户。
+#       配套（都是踩出来的）：
+#         · `winadmin.relaunch_as_admin()` —— `ShellExecuteW` 必须显式
+#           `restype = c_void_p`（HINSTANCE 截断会把"成功"读成"取消了 UAC"）；
+#         · 单实例新增「接管」消息：提权重启的新实例**不能**走 `acquire()`
+#           去敲旧实例的门（那会把旧窗口激活、提权的新实例反而退出），
+#           而是先请旧实例让位（`takeover_requested` → 旧实例退出）再接管
+#           管道；超时则降级成普通 `acquire()`（最坏是"没重启成功"，
+#           绝不能是"程序打不开了"）；
+#         · `SingleInstance._send()` 必须**显式泵事件循环**直到字节发完 ——
+#           客户端与服务端同进程时，`waitForBytesWritten`/`waitForReadyRead`
+#           都不保证把消息推出去，紧接着的 disconnect 会把它丢掉（本次实测：
+#           `request_takeover()` 返回 True 但旧实例永远收不到）。
+VERSION = "1.0.5"
 VERSION_LABEL = f"v{VERSION}"
 APP_NAME = "Yuhub"

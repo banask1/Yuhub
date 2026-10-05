@@ -21,6 +21,15 @@ _datas = [
     ("hostssniproxy.py", "."),
     # accel_page.py：自检要 AST 扫描"后台线程回调只 emit"的界面纪律。
     ("ui/pages/accel_page.py", "ui/pages"),
+    # main.py / single_instance.py：自检要核对"提权重启"这条路 ——
+    # ① main.py 带 RELAUNCH_FLAG 时必须走 acquire_takeover（不能去敲旧实例的门，
+    #    否则旧窗口被激活、提权的新实例反而退出）；
+    # ② single_instance._alive 只能探活、绝不能递 activate 消息。
+    # 两条都是"读源码才验得了"的结构性约束，源码没随包 → 断言直接红（不是跳过）。
+    ("main.py", "."),
+    ("single_instance.py", "."),
+    # winadmin.py：提权判定（TokenElevation）与"以管理员身份重新拉起自己"。
+    ("winadmin.py", "."),
 ]
 for _root, _dirs, _files in os.walk("resources"):
     for _name in _files:

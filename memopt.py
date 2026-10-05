@@ -273,10 +273,17 @@ def foreground_pid():
 
 
 def is_admin():
+    """当前进程**是否已提权**。
+
+    ⚠️ 不用 IsUserAnAdmin：它判的是"账户在不在 Administrators 组"，在
+    UAC 开启 + 进程未提权时照样返回 1（本机实测），会让上层误判"有权限"
+    而直接执行需要提权的动作 → WinError 5。改走 TokenElevation。
+    """
     if not IS_WIN:
         return False
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        import winadmin
+        return bool(winadmin.is_elevated())
     except Exception:                                    # noqa: BLE001
         return False
 

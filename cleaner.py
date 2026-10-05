@@ -124,11 +124,20 @@ def drive_space(drive="C:") -> dict:
 
 
 def is_admin():
-    """当前进程是否有管理员权限（UAC 过滤令牌下即使属 Administrators 组也会返回 False）。"""
+    """当前进程**是否已提权**（能真正删系统级残留的那种权限）。
+
+    ⚠️ 旧实现用 `IsUserAnAdmin()`，它的语义是"账户是否属于 Administrators
+    组"。在"账户是管理员 + UAC 开着 + 程序以普通权限运行"的机器上它返回 1
+    （本机实测 IsUserAnAdmin=1 而 TokenElevation=0），于是程序以为"我有权限、
+    不用提权"，直接去删需要管理员才能删的东西 → WinError 5 → 用户看到
+    "明明有权限却删不掉"。现在统一走 winadmin.is_elevated()（TokenElevation），
+    拿不到就保守当作**未提权**（宁可多走一次提权，也不要自以为有权限）。
+    """
     if not IS_WIN:
         return False
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        import winadmin
+        return bool(winadmin.is_elevated())
     except Exception:
         return False
 

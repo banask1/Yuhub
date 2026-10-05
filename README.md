@@ -74,13 +74,15 @@ Yuhub 是一个用 **Python + PySide6** 写的 Windows 桌面工具箱，打包�
 - 无需 UPnP、无需自建服务器、免费
 
 ### Steam加速（本地反向代理 + hosts，同 Steam++ 形态）
-- **与 Steam++（Watt Toolkit）同形态**：DoH 加密解析 + TCP 443 并发测速，配合**本地反向代理**（本机监听 443/80，按 TLS SNI 透传转发到最快真实节点，不解密流量、无需证书）与**直连 hosts** 两种模式
+- **与 Steam++（Watt Toolkit）同形态**：hosts 把加速域名指向 `127.0.0.1`，**本地反向代理**在本机监听 443/80，按 TLS SNI / HTTP Host 透传转发到最优真实节点（不解密流量、无需证书）
 - **DoH 防污染解析**：DNSPod / AliDNS / Cloudflare / Google 加密查询；对投毒 IP（如 steamcommunity.com 常见污染段）靠 TCP 测活自然过滤，候选全灭时回落到内置兜底池
 - **覆盖 Steam 与 GitHub 共 40 个域名**：Steam 商店 / 登录 / API / 社区 / 结算 / 头像 / 国内山海云 CDN，GitHub 主站 / API / codeload / objects / raw / assets 等
-- **安全写入 hosts**：写前自动带时间戳备份到 `%LOCALAPPDATA%\Yuhub\hosts_backup`，区块标记幂等可重复优选；反代模式写入 127.0.0.1，真实 IP 存映射缓存（`accel_map.json`）
-- **退出自愈**：退出 Yuhub 自动停代理并恢复 hosts；若没来得及恢复，下次启动检测到 127.0.0.1 条目会自动把代理拉起来，网络不会一直断
+- **秒加速**：拨开开关不测速，直接写 `127.0.0.1`（真实 IP 由代理按 SNI 现场解析，缓存 6 小时），所以是瞬时的
+- **安全写入 hosts**：写前自动带时间戳备份到 `%LOCALAPPDATA%\Yuhub\hosts_backup`，区块标记幂等；落盘走**原地覆盖写优先**（同 Steam++，请求 FILE_WRITE_DATA、不删不改名，火绒/360 的「hosts 文件保护」拦不住），原子替换兜底 + 写后回读校验，失败会明确告知原因和处置办法
+- **管理员模式（可选，同 Steam++ 的常驻管理员形态）**：普通权限下每次开关都弹一次 UAC，且安全软件可能对新起的提权进程重新审视一遍。点加速页的「以管理员身份重启」后，程序以管理员身份运行，之后 hosts 由**同一个进程直接写入** —— 不再弹 UAC、安全软件也只需放行一次。默认仍是普通权限启动（拖放文件、开机自启都不弹窗），选择权在你
+- **开关永不弹回**：开关位置显示的是**你的意图**；开/关统一走一个「意图文件」，UAC 等待期间改主意会被同一次授权吸收，不会分叉、不会多弹
+- **退出自愈**：退出 Yuhub 自动停代理并恢复 hosts；若没来得及恢复，下次启动检测到 `127.0.0.1` 条目会自动把代理拉起来，网络不会一直断
 - **诚实的能力边界**：DNS 层污染已解决（实测 github.com / store / steam-chat 真实 TLS 握手通过）；但 steamcommunity.com 存在 SNI 层阻断，透传代理不装证书绕不过，完全访问仍需专业代理工具
-- 修改 hosts 需要管理员权限：点击按钮弹一次 UAC，解析与测速都在普通权限下进行
 - 方案与 Chinachani/steam-hosts-tools (MIT)、Watt Toolkit 同源，在此致谢
 
 ### 软件卸载
@@ -131,14 +133,15 @@ Yuhub/
 ├── sysinfo.py               # CPU 核心数采集
 ├── downloader.py            # 多线程下载引擎（纯标准库）
 ├── autostart.py             # 开机自启读写（纯标准库）
-├── single_instance.py       # 单实例守卫
+├── single_instance.py       # 单实例守卫（含"提权重启时交权"的接管通路）
+├── winadmin.py              # 进程提权判定（TokenElevation）+ 以管理员身份重新拉起自己
 ├── etier.py                 # 内嵌 EasyTier 集成（不依赖 Qt）
 ├── screenshare.py           # 屏幕共享引擎：GDI 抓屏 + 自研帧协议 + TCP 广播（纯标准库）
 ├── lan_share.py             # 临时云盘：房间内文件互传（纯标准库）
 ├── node_probe.py            # 中继节点测速：并发探测 + 带时间戳的缓存
 ├── gpu_sensors.py           # 显卡温度/功耗（NVML + ADL，不依赖 Qt）
 ├── updater.py               # 自动更新核心（版本比对 / 下载校验 / 替换器）
-├── hostsaccel.py            # hosts 网络加速引擎：DoH 解析 + TCP443 测速 + hosts 写入（纯标准库）
+├── hostsaccel.py            # hosts 网络加速引擎：DoH 解析 + hosts 写入（原地写阶梯，纯标准库）
 ├── hostssniproxy.py         # 本地反向代理：443 按 TLS SNI 透传 / 80 按 Host 转发（纯标准库，不解密）
 ├── *_selftest.py            # 打包后自检脚本
 ├── build.bat / build_icon.py# 图标生成与一键打包

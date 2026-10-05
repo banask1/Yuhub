@@ -100,11 +100,14 @@ def _ast_checks():
         return
     tree = ast.parse(src)
 
-    # 1) import 全部是标准库白名单
+    # 1) import 全部是标准库白名单（+ 本项目自己的 winadmin）
+    #    winadmin：进程提权判定（TokenElevation）。单独成模块是因为
+    #    cleaner/uninstaller/memopt 也踩了同一个坑，不能各自抄一份 ctypes。
     allowed = {
         "base64", "concurrent.futures", "ctypes", "datetime", "ipaddress",
         "json", "os", "platform", "re", "shutil", "socket", "subprocess",
-        "sys", "threading", "time", "urllib.request",
+        "sys", "tempfile", "threading", "time", "urllib.request",
+        "winadmin",
     }
     imported = set()
     for node in ast.walk(tree):
@@ -162,9 +165,11 @@ def _page_callback_check():
     """accel_page 的引擎回调（后台线程）只允许 emit。
 
     ⚠️ v1.0.4：开/关统一成"意图应用"，后台入口变成 _apply_worker_direct /
-    _apply_worker_elevated / _prefetch_map / _proxy_resolver。这份名单必须
-    同步扩 —— 否则新抽出来的函数就成了"静态扫描盲区"：在盲区里写 setText
-    不会红，等于这道防线凭空消失（"它绿了"≠"它测到了"）。
+    _apply_worker_elevated / _prefetch_map / _proxy_resolver。
+    ⚠️ v1.0.5：退出清理在管理员模式下改成同进程直写 → 多出 _shutdown_apply_direct
+    （它同样跑在工作线程里，同样不许碰界面）。这份名单必须同步扩 —— 否则新抽
+    出来的函数就成了"静态扫描盲区"：在盲区里写 setText 不会红，等于这道防线
+    凭空消失（"它绿了"≠"它测到了"）。
     """
     src = _module_source("accel_page.py")
     if src is None:
@@ -181,7 +186,8 @@ def _page_callback_check():
         # 只扫嵌套函数会漏掉直接写在函数体里的 setText（变异测试抓到的盲区）
         if isinstance(node, ast.FunctionDef) and node.name in (
                 "_proxy_resolver", "_apply_worker_direct",
-                "_apply_worker_elevated", "_prefetch_map"):
+                "_apply_worker_elevated", "_prefetch_map",
+                "_shutdown_apply_direct"):
             scanned.append(node.name)
             for stmt in ast.walk(node):
                 # 后台线程里出现直接改界面的调用（setText/setVisible/
@@ -192,9 +198,10 @@ def _page_callback_check():
                     bad.append("%s:%s" % (node.name, stmt.func.attr))
     chk("后台线程回调只 emit、绝不直接改界面（硬规则 3 的静态防线）",
         not bad, bad)
-    # 四条入口必须**都被真的扫到**，否则上面的"绿"只是名单写错了
+    # 五条入口必须**都被真的扫到**，否则上面的"绿"只是名单写错了
     need = {"_proxy_resolver", "_apply_worker_direct",
-            "_apply_worker_elevated", "_prefetch_map"}
+            "_apply_worker_elevated", "_prefetch_map",
+            "_shutdown_apply_direct"}
     chk("回调纪律扫描覆盖全部后台入口（名单不能漏）",
         need <= set(scanned), sorted(need - set(scanned)))
 
@@ -510,8 +517,121 @@ def _write_checks(tmp_root):
 
 
 # ---------------------------------------------------------------------------
+# ④b 落盘阶梯（对标 Steam++：原地写优先，原子替换兜底）
+#
+# 用户机器（火绒）实测：tmp + os.replace 第一次成功、之后每次都
+# WinError 5「拒绝访问」—— 安全软件的 hosts 保护盯的是"删除/重命名系统
+# 文件"这一下。所以真正的修复不是"多弹一次 UAC"，而是**换掉落盘动作**。
+# 这一段把三件事钉死：
+#   ① 首选原地写（不删不改名）；② 原地写被拦时能兜底替换；
+#   ③ 两条路都被拦时**明确失败且不写坏 hosts**（还要给出放行提示）。
+# ---------------------------------------------------------------------------
+def _commit_checks(tmp_root):
+    tmp = os.path.join(tmp_root, "commit_hosts")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write("127.0.0.1 localhost\r\n")
+    real_inplace, real_replace = ha._write_inplace, ha._write_replace
+
+    def denied(_target, _text):
+        raise OSError(13, "拒绝访问")          # WinError 5 的 errno 形态
+
+    try:
+        # ① 正常路径：首选原地写，且不留 tmp
+        c1 = ha.commit_hosts(tmp, "127.0.0.1 localhost\r\n# new\r\n")
+        chk("落盘首选原地写（Steam++ 同款，不删不改名）",
+            c1["ok"] and c1["method"] == "inplace", c1)
+        chk("原地写后内容正确",
+            open(tmp, encoding="utf-8", newline="").read()
+            == "127.0.0.1 localhost\r\n# new\r\n", "")
+        chk("原地写不产生 .yuhub.tmp", not os.path.exists(tmp + ".yuhub.tmp"), "")
+
+        # ② 原地写被安全软件拦 → 兜底原子替换
+        ha._write_inplace = denied
+        c2 = ha.commit_hosts(tmp, "127.0.0.1 localhost\r\n# via-replace\r\n")
+        chk("原地写被拦时兜底原子替换成功",
+            c2["ok"] and c2["method"] == "replace", c2)
+        chk("兜底替换后内容正确",
+            "# via-replace" in open(tmp, encoding="utf-8", newline="").read(), "")
+
+        # ③ 两条路都被拦 → 明确失败 + 不写坏原文件 + 给出放行提示
+        ha._write_replace = denied
+        before = open(tmp, encoding="utf-8", newline="").read()
+        c3 = ha.commit_hosts(tmp, "127.0.0.1 localhost\r\n# never\r\n")
+        after = open(tmp, encoding="utf-8", newline="").read()
+        chk("两条落盘路径都被拦时如实报失败", not c3["ok"], c3)
+        chk("失败时 hosts 内容一字未动", before == after, (before[:40], after[:40]))
+        chk("失败信息同时点出两种落盘路径",
+            "inplace" in c3["error"] and "replace" in c3["error"], c3["error"])
+        chk("失败信息给出安全软件放行指引",
+            "信任区" in c3["error"], c3["error"][:80])
+        chk("都失败后不留 .yuhub.tmp", not os.path.exists(tmp + ".yuhub.tmp"), "")
+
+        # ④ 落地后校验不一致 → 还原原内容并报失败（原地写没有原子性，
+        #    这一步是它的保险；打桩成"假装成功但什么都没写"）
+        ha._write_inplace = lambda _t, _x: None
+        ha._write_replace = denied
+        before4 = open(tmp, encoding="utf-8", newline="").read()
+        c4 = ha.commit_hosts(tmp, "127.0.0.1 localhost\r\n# mismatch\r\n",
+                             original=before4)
+        after4 = open(tmp, encoding="utf-8", newline="").read()
+        chk("落地后校验不一致时明确失败（不假装成功）", not c4["ok"], c4)
+        chk("校验不一致时按原内容还原", before4 == after4, "")
+    finally:
+        ha._write_inplace, ha._write_replace = real_inplace, real_replace
+
+    # ⑤ 只读属性会被自动摘掉（Steam++ 也是先 SetAttributes(Normal)）
+    ro = os.path.join(tmp_root, "commit_ro")
+    with open(ro, "w", encoding="utf-8", newline="") as fh:
+        fh.write("127.0.0.1 localhost\r\n")
+    try:
+        os.chmod(ro, 0o444)
+    except OSError:
+        pass
+    c5 = ha.commit_hosts(ro, "127.0.0.1 localhost\r\n# ro-cleared\r\n")
+    chk("只读 hosts 也能写入（先摘只读属性）",
+        c5["ok"] and "# ro-cleared" in open(ro, encoding="utf-8", newline="").read(),
+        c5)
+    try:
+        os.chmod(ro, 0o666)
+    except OSError:
+        pass
+
+    # ⑥ 诊断字段：apply 结果要能看出"这一轮有没有管理员权限、用的哪条路"
+    ip = os.path.join(tmp_root, "commit_intent.json")
+    real_ip = ha.intent_path
+    ha.intent_path = lambda: ip
+    try:
+        ha.write_intent({"steam": True}, path=ip)
+        res = ha.apply_intent(ha.read_intent(ip), hosts_file=tmp)
+    finally:
+        ha.intent_path = real_ip
+    chk("apply 结果带 admin 诊断字段", "admin" in res, list(res))
+    chk("apply 结果带落盘方式字段",
+        res["services"]["steam"].get("method") in ("inplace", "replace"),
+        res["services"]["steam"])
+
+
+# ---------------------------------------------------------------------------
 # ⑤ 提权入口（载荷校验 + 临时路径下的 clean 全流程）
 # ---------------------------------------------------------------------------
+def _isolation_off():
+    """临时关掉自检隔离，返回恢复函数。
+
+    **只能用在"所有写盘路径都已打桩成临时文件"的用例里**（提权入口的进程内
+    测试就是这种：hosts_path/backup_dir/result_file 全部被钉到 tmp_root）。
+    隔离本身是为了兜住"某个套件忘了打桩"的情况；这些用例是**故意**要跑
+    提权入口的真实逻辑，所以需要精确地、临时地把闸门抬起来 —— 抬起来之前
+    打桩必须已经在位（见 _elevated_checks 的外层注释）。
+    """
+    real = ha._ISOLATED_ROOT
+    ha._ISOLATED_ROOT = ""
+
+    def resume():
+        ha._ISOLATED_ROOT = real
+
+    return resume
+
+
 def _elevated_checks(tmp_root):
     import base64 as b64mod
 
@@ -540,7 +660,11 @@ def _elevated_checks(tmp_root):
         return os.path.join(tmp_root, name)
 
     try:
-        return _elevated_checks_inner(tmp_root, payload, _rf)
+        _resume = _isolation_off()
+        try:
+            return _elevated_checks_inner(tmp_root, payload, _rf)
+        finally:
+            _resume()
     finally:
         ha.hosts_path, ha.backup_dir = _rp, _rb
 
@@ -715,6 +839,19 @@ def _misc_checks():
     chk("flush_dns_cache 返回布尔且不抛异常", isinstance(res, bool), res)
     chk("提权开关与 main.py 分发一致", ha._ELEVATED_FLAG == "--hosts-elevated",
         ha._ELEVATED_FLAG)
+    # Toast 折行：气泡是 QLabel 且没开 wordWrap，写盘失败那条文案带
+    # "加入安全软件信任区" 的处置指引（一百多字），不折行会撑出一条比窗口还宽
+    # 的提示条。短文案必须原样不动（否则会污染现有断言里的关键字匹配）。
+    try:
+        import ui.pages.accel_page as _ap
+        long_text = _ap._toast_text("啊" * 100)
+        chk("Toast 折行：短文案原样、长文案按定宽折行（不撑破窗口）",
+            _ap._toast_text("短文案") == "短文案"
+            and long_text.count("\n") >= 2
+            and max(len(l) for l in long_text.split("\n")) <= _ap._TOAST_WRAP,
+            (len(long_text), long_text.count("\n") + 1))
+    except Exception as exc:                            # noqa: BLE001
+        chk("accel_page 暴露 Toast 折行helper", False, repr(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1282,6 +1419,131 @@ def _ui_checks():
         ha.run_elevated_apply = real_ea3
         page._apply_running = False
 
+    # ---- U13 权限状态条 + 「以管理员身份重启」（对标 Steam++ requireAdministrator）----
+    import winadmin
+    real_admin_p = ha.is_admin
+    try:
+        ha.is_admin = lambda: True
+        page._refresh_privilege()
+        admin_hidden = page._priv_btn.isHidden()
+        admin_text = page._priv_label.text()
+        ha.is_admin = lambda: False
+        page._refresh_privilege()
+        norm_shown = not page._priv_btn.isHidden()
+        norm_text = page._priv_label.text()
+    finally:
+        ha.is_admin = real_admin_p
+    chk("管理员模式：状态条说明同进程直写、隐藏重启按钮",
+        admin_hidden and "管理员模式" in admin_text,
+        (admin_hidden, admin_text[:48]))
+    chk("普通权限：如实说明 UAC / 杀软风险并给出重启按钮",
+        norm_shown and "普通权限" in norm_text, (norm_shown, norm_text[:48]))
+
+    # 取消 UAC → 不重启、按钮恢复、明确提示（顺序错了就变成"关了却没重启"）
+    real_relaunch = winadmin.relaunch_as_admin
+    page._relaunching = False
+    page._priv_btn.setEnabled(True)
+    toasts.clear()
+    try:
+        winadmin.relaunch_as_admin = lambda extra=(), cwd=None: False
+        page._on_relaunch_clicked()
+    finally:
+        winadmin.relaunch_as_admin = real_relaunch
+    chk("取消管理员授权 → 不重启、按钮恢复可点、给出提示",
+        (not page._relaunching) and page._priv_btn.isEnabled()
+        and any("取消" in t for t in toasts), toasts[-2:])
+
+    # 同意 → 先置"重启中"再退出自己（退出走打桩，别把自检带走）
+    quit_calls = []
+    real_quit = page._quit_for_relaunch
+    toasts.clear()
+    try:
+        winadmin.relaunch_as_admin = lambda extra=(), cwd=None: True
+        page._quit_for_relaunch = lambda: quit_calls.append("quit")
+        page._on_relaunch_clicked()
+    finally:
+        winadmin.relaunch_as_admin = real_relaunch
+        page._quit_for_relaunch = real_quit
+    chk("同意提权 → 标记重启中并退出自己（先拿授权、再退出）",
+        page._relaunching and quit_calls == ["quit"]
+        and any("重启" in t for t in toasts), (page._relaunching, quit_calls))
+
+    # 重启中退出：绝不清 hosts（新实例马上复用同一份，清了反而多一次断档）
+    apply_calls3 = []
+    real_ea4 = ha.run_elevated_apply
+    real_entries4 = ha.current_entries
+    try:
+        ha.run_elevated_apply = lambda timeout=120.0, path=None: (
+            apply_calls3.append("apply")
+            or {"ok": True, "seq": 0, "services": {}})
+        ha.current_entries = lambda svc, path=None: [(ha.PROXY_IP, "github.com")]
+        page._intent_state["github"] = True
+        page._relaunching = True
+        page.shutdown()
+        time.sleep(0.25)
+        app.processEvents()
+    finally:
+        ha.run_elevated_apply = real_ea4
+        ha.current_entries = real_entries4
+        page._relaunching = False
+    chk("重启中退出不清理 hosts（避免清一遍再写一遍的断档）",
+        apply_calls3 == [], apply_calls3)
+
+    # 管理员模式退出清理 → 走同进程直写（不弹 UAC、不起子进程）
+    direct_calls = []
+    real_shd = page._shutdown_apply_direct
+    real_entries5 = ha.current_entries
+    real_admin5 = ha.is_admin
+    real_intent5 = ha.intent_path
+    try:
+        ha.current_entries = lambda svc, path=None: [(ha.PROXY_IP, "github.com")]
+        ha.intent_path = lambda: ipath
+        ha.is_admin = lambda: True
+        page._intent_state["github"] = True
+        page._shutdown_apply_direct = lambda: direct_calls.append("direct")
+        page.shutdown()
+        pump_until(lambda: direct_calls, ms=3000)
+    finally:
+        ha.current_entries = real_entries5
+        ha.is_admin = real_admin5
+        ha.intent_path = real_intent5
+        page._shutdown_apply_direct = real_shd
+    chk("管理员模式下退出清理走同进程直写（不起提权子进程）",
+        direct_calls == ["direct"], direct_calls)
+
+    # ---- U14 单实例「接管」：提权重启的落地机制 ----
+    # 为什么必须专门测：`acquire()` 的第一件事是敲旧实例的门（唤醒旧窗口），
+    # 提权重启时这一敲会让旧窗口被激活、提权的新实例反而退出 —— 用户看到
+    # "点了重启，闪一下还是普通权限"。所以必须有"只探活"和"请让位"两条路。
+    import single_instance as si
+    skey = "Yuhub-SelfTest-Takeover-%d" % os.getpid()
+    g1 = si.SingleInstance(key=skey)
+    got = {"takeover": 0, "activate": 0}
+    g1.takeover_requested.connect(
+        lambda: got.__setitem__("takeover", got["takeover"] + 1))
+    g1.activate_requested.connect(
+        lambda: got.__setitem__("activate", got["activate"] + 1))
+    first = g1.acquire()
+    chk("单实例（测试键）：抢到监听", first and g1.listening, first)
+    g2 = si.SingleInstance(key=skey)
+    alive = g2._alive()
+    pump_until(lambda: False, ms=120)
+    chk("_alive 只探活、绝不发 activate（否则重启会唤醒旧窗口）",
+        alive and got["activate"] == 0, (alive, got))
+    probed = g2._probe()
+    pump_until(lambda: got["activate"] > 0, ms=3000)
+    chk("_probe 递 activate（第二个实例敲门 → 旧窗口被唤醒）",
+        probed and got["activate"] == 1, (probed, got))
+    sent = g2.request_takeover()
+    pump_until(lambda: got["takeover"] > 0, ms=3000)
+    chk("request_takeover → 旧实例收到 takeover_requested（据此让位）",
+        sent and got["takeover"] == 1, (sent, got))
+    g1.close()                       # 旧实例让位
+    took = g2.acquire_takeover(timeout_ms=4000)
+    chk("acquire_takeover：旧实例让位后接管成功",
+        took and g2.listening, (took, g2.listening))
+    g2.close()
+
     if os.path.exists(map_file):
         os.remove(map_file)
     if os.path.exists(ipath):
@@ -1296,6 +1558,228 @@ def _ui_checks():
 # ---------------------------------------------------------------------------
 # ② 写盘安全检查（临时文件）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ①b 自检隔离 + 提权判定（v1.0.5 事故的回归防线）
+#
+# 事故复盘：theme 自检实例化 MainWindow，teardown() → accel_page.shutdown()
+# → run_elevated_apply —— **真提权、真写盘**，一次就跑掉了用户真实 hosts 里的
+# steam 区块（2091 → 847 字节）。同一个坑 v1.0.2 也踩过一次（变异测试写
+# hosts）。所以现在：隔离由入口统一开启，且**自检永远不可能提权**。
+# ---------------------------------------------------------------------------
+def _isolation_checks():
+    chk("自检隔离生效（hosts 路径已钉到临时目录）",
+        ha.selftest_isolated() and ha.hosts_path() != ha.real_hosts_path(),
+        (ha.selftest_isolated(), ha.hosts_path()))
+    chk("隔离时不变量：隔离 hosts 落在临时根目录里",
+        os.path.dirname(ha.hosts_path()) == ha.selftest_root(), ha.hosts_path())
+    rp = ha.real_hosts_path()
+    chk("隔离不影响「真实 hosts 快照」的取路径（红线不能盯错文件）",
+        rp and "etc" in rp.lower().replace("/", "\\")
+        and os.path.isdir(os.path.dirname(rp)), rp)
+    # 提权入口在隔离下一律拒绝 —— 这条是"自检永不写真实系统"的硬保证
+    res = ha.run_elevated_apply(timeout=0.1)
+    chk("隔离时 run_elevated_apply 直接拒绝（绝不弹 UAC）",
+        isinstance(res, dict) and not res.get("ok")
+        and "隔离" in (res.get("error") or ""), res)
+    chk("隔离时 elevated_hosts_main 入口被拒（双保险）",
+        ha.elevated_hosts_main("eA==") == 6, "")
+    # 提权判定口径：必须问内核"令牌是否提权"，不能问"账户是不是管理员组"。
+    # 打桩成"令牌未提权"后 is_admin 必须跟着变 False —— 谁把它改回
+    # IsUserAnAdmin（在管理员账户 + UAC 的机器上恒为 1）这条就会红。
+    try:
+        import winadmin
+        real_te = winadmin._token_elevated
+        winadmin._token_elevated = lambda: False
+        try:
+            follows_token = (ha.is_admin() is False)
+        finally:
+            winadmin._token_elevated = real_te
+        chk("is_admin 跟随 TokenElevation（不是用 IsUserAnAdmin 判组）",
+            follows_token, ha.is_admin())
+        chk("winadmin 暴露提权判定与陷阱诊断",
+            callable(winadmin.is_elevated)
+            and callable(winadmin.group_admin_but_not_elevated), "")
+    except Exception as exc:                       # pragma: no cover
+        chk("winadmin 可导入", False, str(exc))
+
+
+def _admin_mode_checks():
+    """管理员模式（对标 Steam++ 的 requireAdministrator）。
+
+    事实依据（SteamTools 源码，逐条对过）：
+      · `source/SteamTools/app.manifest` 里写死
+            <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        —— 它的主程序**从启动就常驻管理员**，所以 hosts 写入永远发生在同一个
+        已提权进程里：UAC 只在启动弹一次，火绒/360 这类软件也只需要放行同一个
+        程序一次。
+      · `source/SteamTool.Core/HostsService.cs` 的 UpdateHosts 不做"临时文件 +
+        改名替换"，只 `File.SetAttributes(Normal)` + `File.WriteAllLines`
+        （原地覆盖写）；HOST_TAG 是 `#Steam++`。
+
+    第二条 v1.0.5 已复刻（见 _commit_checks）；这里守住第一条：Yuhub 要有
+    "以管理员身份重启"这条路，重启之后同进程直写、不再逐次提权。
+    """
+    import winadmin
+
+    # ① 标志位只能有一个来源 —— 否则 UI 与 main.py 各写一份，
+    #    重启起来的新实例认不出自己是谁，会去敲旧实例的门（旧窗口被激活、
+    #    提权的新实例反而退出，用户看到"重启没生效"）。
+    flag_source = getattr(winadmin, "RELAUNCH_FLAG", None)
+    chk("winadmin 给出统一的 RELAUNCH_FLAG",
+        flag_source == "--relaunch-elevated", flag_source)
+    try:
+        import main as _main
+        main_flag = getattr(_main, "RELAUNCH_FLAG", None)
+    except Exception as exc:                            # noqa: BLE001
+        main_flag = "import 失败：%r" % (exc,)
+    chk("main.RELAUNCH_FLAG 与 winadmin 同源（不各写一份字面量）",
+        main_flag == flag_source, (main_flag, flag_source))
+
+    # ② ShellExecuteW 的 restype 必须是 c_void_p。
+    #    这条是 v1.0.2「开关拨回就自动弹回」的根因：HINSTANCE 是指针宽度，
+    #    ctypes 默认按 c_long 取，高位非零会被截断成负数/小值 → rc<=32 被
+    #    误判成"用户取消了 UAC"。**功能级验证**：打桩 windll，看它有没有把
+    #    restype 设成 c_void_p、verb 是不是 runas、返回码语义对不对。
+    real_ctypes = winadmin.ctypes
+
+    class _FakeFn:
+        def __init__(self, rc):
+            self.restype = None
+            self.argtypes = None
+            self.rc = rc
+            self.calls = []
+
+        def __call__(self, *a):
+            self.calls.append(a)
+            return self.rc
+
+    class _FakeShell:
+        def __init__(self, fn):
+            self.ShellExecuteW = fn
+
+    class _FakeWindll:
+        def __init__(self, fn):
+            self.shell32 = _FakeShell(fn)
+
+    class _FakeCtypes:
+        def __init__(self, fn):
+            self.windll = _FakeWindll(fn)
+            self.c_void_p = real_ctypes.c_void_p
+            self.c_wchar_p = real_ctypes.c_wchar_p
+            self.c_int = real_ctypes.c_int
+
+    ok_fn = _FakeFn(42)                     # 42 > 32 = 成功
+    try:
+        winadmin.ctypes = _FakeCtypes(ok_fn)
+        got_ok = winadmin.shell_execute_runas("Yuhub.exe", "--relaunch-elevated")
+    finally:
+        winadmin.ctypes = real_ctypes
+    chk("ShellExecuteW 的 restype 被显式设成 c_void_p（防 HINSTANCE 截断）",
+        ok_fn.restype is real_ctypes.c_void_p, ok_fn.restype)
+    chk("提权用 runas 谓词且成功码 >32 判为成功",
+        got_ok is True and ok_fn.calls
+        and ok_fn.calls[0][1] == "runas", (got_ok, ok_fn.calls[:1]))
+
+    cancel_fn = _FakeFn(5)                  # ≤32 = 用户取消 / 策略拒绝
+    try:
+        winadmin.ctypes = _FakeCtypes(cancel_fn)
+        got_cancel = winadmin.shell_execute_runas("Yuhub.exe")
+    finally:
+        winadmin.ctypes = real_ctypes
+    chk("用户取消 UAC（返回码 ≤32）判为失败，绝不假装成功",
+        got_cancel is False, got_cancel)
+
+    # ③ self_command：源码态要带上 main.py 路径，打包态就是 exe 自己。
+    #    ⚠️ 本自检本身可能就跑在**冻结态**（打包后自检），那时 self_command
+    #    必然只能给出 exe 形态 —— 拿"源码态形态"去断言会假红（v1.0.5 首次
+    #    打包自检就踩到了）。所以按运行形态分流，并单列一条前置断言把
+    #    "这次到底走的哪条路"明确报出来，别让"没跑"伪装成"过了"。
+    frozen_now = bool(getattr(sys, "frozen", False))
+    exe_now, args_now = winadmin.self_command([winadmin.RELAUNCH_FLAG])
+    if frozen_now:
+        chk("[前置] 本自检运行在打包态（源码态形态改由打桩验证）",
+            exe_now == sys.executable and ".py" not in args_now
+            and winadmin.RELAUNCH_FLAG in args_now, (exe_now, args_now))
+    else:
+        chk("self_command 源码态：解释器 + 脚本 + 重启标志",
+            bool(exe_now) and ".py" in args_now
+            and winadmin.RELAUNCH_FLAG in args_now, (exe_now, args_now))
+    had_frozen = hasattr(sys, "frozen")
+    old_frozen = getattr(sys, "frozen", None)
+    try:
+        sys.frozen = True
+        exe_fz, args_fz = winadmin.self_command([winadmin.RELAUNCH_FLAG])
+    finally:
+        if had_frozen:
+            sys.frozen = old_frozen
+        else:
+            try:
+                del sys.frozen
+            except AttributeError:
+                pass
+    chk("self_command 打包态：exe 自己 + 参数（不再带脚本路径）",
+        exe_fz == sys.executable and ".py" not in args_fz
+        and winadmin.RELAUNCH_FLAG in args_fz, (exe_fz, args_fz))
+
+    # ④ 单实例「接管」：提权重启时旧实例必须让位 ——
+    #    绝不能让新实例走 acquire() 去敲旧实例的门（那会把旧窗口激活，
+    #    提权的新实例自己退出）。
+    try:
+        import single_instance as si
+        has_takeover = (
+            si.MSG_TAKEOVER == b"takeover"
+            and hasattr(si.SingleInstance, "takeover_requested")
+            and hasattr(si.SingleInstance, "acquire_takeover")
+            and hasattr(si.SingleInstance, "_alive"))
+    except Exception as exc:                            # noqa: BLE001
+        si, has_takeover = None, False
+        chk("single_instance 可导入（接管机制前提）", False, repr(exc))
+    chk("single_instance 提供 takeover 消息/信号/接管入口",
+        has_takeover, "")
+
+    # ⑤ `_alive` 只探活、不递消息（同族的坑：顺手复用 _probe 就会去唤醒旧窗口）
+    #    ⚠️ 判据必须看**引用**而不是文本 —— `_alive` 的 docstring 里就写着
+    #    "不同于 `_probe`"，用 `"_probe" in src` 会被自己的注释误伤（本次踩过）。
+    src = _module_source("single_instance.py")
+    alive_refs = set()
+    alive_found = False
+    if src:
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_alive":
+                alive_found = True
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name):
+                        alive_refs.add(sub.id)
+                    elif isinstance(sub, ast.Attribute):
+                        alive_refs.add(sub.attr)
+                break
+    chk("_alive 只探活、不递 activate（否则提权重启会唤醒旧窗口）",
+        alive_found and not ({"MSG_ACTIVATE", "_probe"} & alive_refs),
+        sorted(alive_refs & {"MSG_ACTIVATE", "_probe"}) if alive_found
+        else "没找到 _alive")
+
+    # ⑥ acquire_takeover 的超时必须**降级**成普通 acquire —— 最坏是"重启没
+    #    成功"，绝不能是"程序打不开了"。
+    take_body = ""
+    if src:
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name == "acquire_takeover"):
+                take_body = ast.get_source_segment(src, node) or ""
+                break
+    chk("acquire_takeover 超时降级为普通 acquire（绝不把程序卡死）",
+        bool(take_body) and "return self.acquire()" in take_body
+        and "request_takeover" in take_body, take_body[:80])
+
+    # ⑦ main.py 必须按标志分流：带 RELAUNCH_FLAG 走接管，否则走普通敲门
+    msrc = _module_source("main.py")
+    chk("main.py 对提权重启走 acquire_takeover（不是 acquire）",
+        bool(msrc) and "acquire_takeover" in msrc
+        and "RELAUNCH_FLAG in sys.argv" in msrc, "")
+
+
 def _guard_real_hosts():
     """把"真写系统 hosts"这条路上锁死 —— 自检第一红线。
 
@@ -1319,11 +1803,16 @@ def _guard_real_hosts():
 
     返回 (real_is_admin, real_hosts_path, real_backup_dir) 供收尾还原；
     真实 hosts 的路径另存在 `_REAL_HOSTS_PATH` 供快照函数读取。
+
+    ⚠️ 真实路径要走 `ha.real_hosts_path()` 拿：自检隔离（main.py 的
+    `--*-selftest` 入口统一开启）生效后，`ha.hosts_path()` 返回的是隔离
+    目录里的 hosts —— 用它做"真实 hosts 快照"等于盯错了文件，这道红线
+    会静默失效（"它绿了"≠"它测到了"）。
     """
     global _REAL_HOSTS_PATH, _REAL_BACKUP_DIR, _REAL_HOSTS_BYTES
     real_is_admin = ha.is_admin
-    _REAL_HOSTS_PATH = ha.hosts_path()
-    _REAL_BACKUP_DIR = ha.backup_dir()
+    _REAL_HOSTS_PATH = ha.real_hosts_path()
+    _REAL_BACKUP_DIR = ha.real_backup_dir()
     # 留存原始字节：万一自检还是污染了真实 hosts（绕过所有打桩），
     # 收尾时用它原样还原。这是最后一道保险，不留污染给用户。
     try:
@@ -1497,6 +1986,9 @@ def _intent_checks(tmp_root):
     ha._result_path = lambda: rpath
     ha.hosts_path = lambda: hpath      # 提权 apply 内部自己读 hosts_path()
     ha.backup_dir = lambda: os.path.join(tmp_root, "it_bak")
+    # 本段所有写盘路径（hosts/意图/结果/备份）都已打桩到 tmp_root，才敢把
+    # 隔离闸门临时抬起，让提权入口的真实逻辑跑起来。
+    _resume = _isolation_off()
     try:
         # -- write/read 往返、覆盖式、seq 递增 --
         s1 = ha.write_intent({"steam": True}, path=ipath)
@@ -1588,13 +2080,21 @@ def _intent_checks(tmp_root):
     finally:
         ha.intent_path, ha._result_path = _ri, _rp
         ha.hosts_path, ha.backup_dir = _rh, _rb
+        _resume()
 
 
 def run(out_file):
+    # 自检隔离：先把自己也钉住（main.py 的入口已经钉过一次；直接调用本模块
+    # 的自检（变异测试、探针）也必须同样安全 —— 双保险）。
+    ha.enable_selftest_isolation()
     _result["info"]["suite"] = "hosts"
-    _result["info"]["hosts_path"] = ha.hosts_path()
+    _result["info"]["hosts_path"] = ha.real_hosts_path()
+    _result["info"]["isolated"] = ha.selftest_isolated()
     _result["info"]["is_admin"] = ha.is_admin()
     _result["info"]["frozen"] = bool(getattr(sys, "frozen", False))
+
+    _isolation_checks()
+    _admin_mode_checks()
 
     # 自检开始前：钉住 is_admin=False + hosts_path/backup_dir 指向哨兵
     # + 记录真实 hosts 快照（见 _guard_real_hosts）
@@ -1611,6 +2111,7 @@ def run(out_file):
     with tempfile.TemporaryDirectory(prefix="yuhub_hosts_selftest_") as tmp_root:
         _clean_checks()
         _write_checks(tmp_root)
+        _commit_checks(tmp_root)
         _elevated_checks(tmp_root)
         _permission_checks(tmp_root)
         _intent_checks(tmp_root)

@@ -515,19 +515,22 @@ def _check_delete_permissions(checks):
     #    _take_ownership 被调用过、且最终报告"权限受阻"而不是"占用"。
     #
     #    两个前提必须成立，否则断言无意义：
-    #      a) un.is_admin() 为真（_delete_dir 只在管理员下做 takeown）；
+    #      a) _delete_dir 认为自己在管理员下（只在管理员下做 takeown）；
     #      b) 打桩的删除确实抛 WinError 5（真·权限）。
     #
-    #    ⚠️ 非管理员时**不把断言算作通过**：那会让"前提缺失"伪装成"验证
-    #    过了"（本项目在"读不到源码 → 通过"上栽过）。这里单列一条环境
-    #    前置断言，把"没跑"和"跑过了"分开报。
+    #    ⚠️ 这两个前提**靠自己构造成立，不靠运行环境**（v1.0.5 改）：
+    #    以前这里依赖"当前进程真的是管理员"，而 is_admin() 已改成
+    #    TokenElevation 口径（本机普通启动恒为 False）→ 断言会退化成
+    #    "永远跳过"的装饰品。现在改成**打桩 un.is_admin = lambda: True**
+    #    强制走到 takeown 分支，前提 a 由我们自己保证。
+    #    （这就是本项目的红线：跳过分支不能记成 pass，"它绿了"≠"它测到了"。）
     checks.append({
-        "name": "[前置] ACL 回归需要管理员环境（否则该断言只是空转）",
-        "pass": bool(un.IS_WIN and un.is_admin()),
-        "detail": "IS_WIN=%s is_admin=%s（非管理员时下面两条 takeown 断言无法验证）"
-                  % (un.IS_WIN, un.is_admin()),
+        "name": "[前置] ACL 回归可打桩（Windows 下才存在 takeown 分支）",
+        "pass": bool(un.IS_WIN and callable(getattr(un, "is_admin", None))),
+        "detail": "IS_WIN=%s hasattr(is_admin)=%s（下面用打桩 is_admin=True 强制走到 takeown）"
+                  % (un.IS_WIN, callable(getattr(un, "is_admin", None))),
     })
-    if un.IS_WIN and un.is_admin():
+    if un.IS_WIN:
         acl_dir = os.path.join(tempfile.gettempdir(),
                                "YuhubSelfTestAcl_%d" % os.getpid())
         shutil.rmtree(acl_dir, ignore_errors=True)
@@ -540,6 +543,8 @@ def _check_delete_permissions(checks):
         real_remove = os.remove
         real_rmdir = os.rmdir
         real_take = un._take_ownership
+        real_is_admin = un.is_admin
+        env_admin = un.is_admin()          # 记录真实值（仅供 detail 展示）
 
         calls = {"takeown": 0, "remove": 0}
 
@@ -566,6 +571,7 @@ def _check_delete_permissions(checks):
         os.remove = _fake_remove
         os.rmdir = _fake_rmdir
         un._take_ownership = _fake_take
+        un.is_admin = lambda: True          # ← 前提 a：强制走 takeown 分支
         try:
             r = un._delete_dir(acl_dir)
         finally:
@@ -573,12 +579,13 @@ def _check_delete_permissions(checks):
             os.remove = real_remove
             os.rmdir = real_rmdir
             un._take_ownership = real_take
+            un.is_admin = real_is_admin
         why = str(r[3])
         checks.append({
             "name": "ACL 受阻时 _delete_dir 走 takeown 夺权分支",
             "pass": calls["takeown"] >= 1,
-            "detail": "takeown 调用次数=%d remove 尝试=%d"
-                      % (calls["takeown"], calls["remove"]),
+            "detail": "takeown 调用次数=%d remove 尝试=%d（打桩 is_admin=True，真实值=%s）"
+                      % (calls["takeown"], calls["remove"], env_admin),
         })
         checks.append({
             "name": "ACL 受阻的失败原因报「权限」而非「占用」",

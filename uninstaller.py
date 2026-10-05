@@ -209,9 +209,17 @@ def human_bytes(n):
 
 
 def is_admin():
-    """当前进程是否有管理员权限。"""
+    """当前进程**是否已提权**（不是"账户是否管理员组"）。
+
+    ⚠️ 旧实现用 `IsUserAnAdmin()`：它问的是账户组身份，在"管理员账户 + UAC
+    开着 + 进程未提权"时返回 1（本机实测），于是 `_delete_dir` 以为"我是
+    管理员，可以 takeown 夺权"，实际调用 takeown/icacls 全部 WinError 5，
+    最后对用户报"权限受阻"——正是"有权限也删不掉残留"的成因之一。
+    现在走 TokenElevation（winadmin.is_elevated），拿不到就保守当未提权。
+    """
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        import winadmin
+        return bool(winadmin.is_elevated())
     except Exception:
         return False
 

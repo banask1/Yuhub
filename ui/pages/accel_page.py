@@ -44,11 +44,13 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QVBoxLayout,
 )
 
 import hostsaccel as ha
 import hostssniproxy as hp
+import winadmin
 from ..widgets import ToggleSwitch, info_card
 from .base_page import BasePage
 
@@ -62,6 +64,19 @@ _SERVICE_META = {
         "desc": "主站、API、代码下载（codeload / objects）与页面资源提速。",
     },
 }
+
+#: Toast 文案的折行宽度。Toast 的气泡是 `QLabel` 且**没有开 wordWrap**，
+#: 所以超长的一句错误（写盘失败时会带上"加入安全软件信任区"的处置指引，
+#: 一百多字）会拉出一条比窗口还宽的提示条。只在超长时按定宽折行。
+_TOAST_WRAP = 44
+
+
+def _toast_text(text, width=_TOAST_WRAP):
+    """把过长的提示文案折成多行（QLabel 认 `\\n`）。"""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    return "\n".join(text[i:i + width] for i in range(0, len(text), width))
 
 
 class AccelPage(BasePage):
@@ -94,6 +109,9 @@ class AccelPage(BasePage):
         self._ipmap = ha.load_map_cache()
         self._ipmap_lock = threading.Lock()
         self._proxy = None               # 惰性创建（SniProxy）
+        # 「以管理员身份重启」进行中：退出时**不要**清 hosts —— 新实例马上
+        # 接管并复用同一份 hosts，清掉再写一遍反而多一次断档。
+        self._relaunching = False
 
         self._apply_finished.connect(self._on_apply_finished)
         self._prefetch_finished.connect(self._on_prefetch_finished)
@@ -225,11 +243,13 @@ class AccelPage(BasePage):
 
         services = res.get("services") or {}
         if not services or not res.get("ok"):
-            # 整体失败（取消 UAC / 超时 / 意图不可读）：如实报错 + 意图
-            # 对齐回真实状态（开关与 hosts 保持一致，绝不假装成功）
+            # 整体失败（取消 UAC / 超时 / 意图不可读 / 写盘被安全软件拦）：
+            # 如实报错 + 意图对齐回真实状态（开关与 hosts 保持一致，绝不假装成功）。
+            # 错误串本身已经写明"没做任何改动"或"该往哪放行"，不再追加
+            # "hosts 未被改动"这种笼统话术（写盘被拦时它还可能不准确）。
             self._resync_intent()
-            self.toast("操作未完成：%s。 hosts 未被改动，可重试。"
-                       % (res.get("error") or "未知原因"))
+            self.toast(_toast_text("操作未完成：%s"
+                                   % (res.get("error") or "未知原因")))
             self._refresh_status()
             return
 
@@ -237,10 +257,11 @@ class AccelPage(BasePage):
         for svc, sub in services.items():
             if not sub.get("ok"):
                 self._resync_intent([svc])
-                self.toast("%s：未能%s（%s）"
-                           % (_SERVICE_META[svc]["title"],
-                              "开启" if sub.get("action") == "write" else "关闭",
-                              sub.get("error") or "未知原因"))
+                self.toast(_toast_text("%s：未能%s（%s）"
+                                       % (_SERVICE_META[svc]["title"],
+                                          "开启" if sub.get("action") == "write"
+                                          else "关闭",
+                                          sub.get("error") or "未知原因")))
                 continue
             if sub.get("action") in ("write", "clean"):
                 changed.append(svc)
@@ -344,6 +365,9 @@ class AccelPage(BasePage):
         self._proxy_status.setWordWrap(True)
         self.add(self._proxy_status)
 
+        # ---- 权限状态条（对标 Steam++ 的常驻管理员）----
+        self.add(self._build_privilege_bar())
+
         # ---- 每个服务一块卡片（卡片里只有一个开关，同 Steam++ 形态）----
         self._cards = {}
         for svc in ha.SERVICES:
@@ -375,6 +399,100 @@ class AccelPage(BasePage):
         ))
         self.add_stretch()
         self._refresh_status()
+
+    # ------------------------------------------------ 权限状态 / 管理员模式
+    def _build_privilege_bar(self):
+        """权限状态条 —— 对标 Steam++ 的 `requireAdministrator` 形态。
+
+        看 SteamTools 的源码会发现一件容易忽略的事：它的主程序清单里写死了
+
+            <requestedExecutionLevel level="requireAdministrator" />
+
+        也就是**整个程序从启动就常驻管理员**。所以它的 hosts 写入永远发生在
+        同一个已提权进程里：UAC 只弹启动那一次，火绒/360 这类软件也只需要
+        放行同一个程序一次。
+
+        我们默认是普通权限启动（好处是拖放文件、开机自启都不弹窗），代价是
+        每拨一次开关就得 `runas` 拉一个**新的提权子进程**去写 hosts ——
+        UAC 每次都弹，而 HIPS 类软件会把这个"新来的实例"重新审视一遍，
+        拦一次我们就拿到 WinError 5（用户看到的"提示 hosts 未被改动"）。
+
+        这条状态条把选择权交给用户：一键换成管理员模式（之后同进程直写、
+        零弹窗），或者维持现状（每次操作一次 UAC）。
+        """
+        bar = QFrame()
+        bar.setObjectName("Card")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(18, 14, 18, 14)
+        h.setSpacing(12)
+        self._priv_label = QLabel("")
+        self._priv_label.setObjectName("CardDesc")
+        self._priv_label.setWordWrap(True)
+        h.addWidget(self._priv_label, 1)
+        self._priv_btn = QPushButton("以管理员身份重启")
+        self._priv_btn.setObjectName("MiniButton")
+        self._priv_btn.setCursor(Qt.PointingHandCursor)
+        self._priv_btn.clicked.connect(self._on_relaunch_clicked)
+        h.addWidget(self._priv_btn, 0)
+        self._refresh_privilege()
+        return bar
+
+    def _refresh_privilege(self):
+        """按当前提权状态刷新状态条（管理员模式下隐藏按钮）。"""
+        label = getattr(self, "_priv_label", None)
+        if label is None:
+            return
+        btn = getattr(self, "_priv_btn", None)
+        if ha.is_admin():
+            label.setText(
+                "管理员模式（同 Steam++）：hosts 由本进程直接写入，"
+                "开启/关闭都不再弹 UAC，安全软件也只需放行一次。")
+            if btn is not None:
+                btn.setVisible(False)
+        else:
+            label.setText(
+                "当前是普通权限：每次开启/关闭都会弹一次 UAC，火绒/360 等"
+                "安全软件还可能在写盘时再拦一次。改成管理员模式后，程序会"
+                "以管理员身份重启，之后 hosts 直写、不再弹窗。")
+            if btn is not None:
+                btn.setVisible(True)
+                btn.setEnabled(True)
+
+    def _on_relaunch_clicked(self):
+        """以管理员身份重启（对标 Steam++ 的 requireAdministrator）。
+
+        顺序很关键：**先拿到 UAC 同意，再退出自己**。反过来的话，用户在
+        UAC 上点"否"就变成"程序关了却没重启"，比不改更糟。
+        """
+        btn = getattr(self, "_priv_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+        try:
+            agreed = winadmin.relaunch_as_admin([winadmin.RELAUNCH_FLAG])
+        except Exception:
+            agreed = False
+        if not agreed:
+            if btn is not None:
+                btn.setEnabled(True)
+            self.toast("已取消管理员授权，仍以普通权限运行")
+            return
+        # 用户点了"是"，新实例已经在起来了：让出单实例管道后退出。
+        # 新实例带 RELAUNCH_FLAG，会先请本实例让位再接管
+        # （见 single_instance.SingleInstance.acquire_takeover）。
+        self._relaunching = True
+        self.toast("正在以管理员身份重启…")
+        self._quit_for_relaunch()
+
+    def _quit_for_relaunch(self):
+        """重启前退出自己。
+
+        单独抽一个方法是为了自检能打桩（自检里真调 `app.quit()` 会把整套
+        自检带走），同时也让"先拿授权、再退出"这个顺序在源码上一眼可见。
+        """
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _build_service_card(self, svc):
         meta = _SERVICE_META[svc]
@@ -502,12 +620,31 @@ class AccelPage(BasePage):
         停代理 + 把加速条目清掉（否则 hosts 指着 127.0.0.1、代理死了，
         这些域名就全断了）。清理由提权进程完成 —— UAC 会在退出时弹一次；
         用户取消也没关系，下次启动 on_shown 的自愈逻辑会把代理重新拉起来。
+
+        两种情况例外：
+          · **正在「以管理员身份重启」** → 什么都不清。新实例马上接管并
+            复用同一份 hosts，清掉再写一遍纯属多余（中间还有一段 DNS 断档）。
+          · **已经是管理员** → 直接在当前进程里清（不弹 UAC、不起子进程），
+            这正是 Steam++ 的工作方式。
         """
         self._stop_proxy()
+        if self._relaunching:
+            return
         dirty = {s: False for s in ha.SERVICES
                  if self._intent_state.get(s) or ha.current_entries(s)}
         if not dirty:
             return
         ha.write_intent(dirty)
-        threading.Thread(target=ha.run_elevated_apply,
-                         name="YuhubHostsExitApply", daemon=True).start()
+        if ha.is_admin():
+            # 管理员：当前进程直接清（不走 _apply_worker_direct —— 它会 emit
+            # _apply_finished，而此刻窗口正在析构，槽函数里动的是已释放的控件）。
+            threading.Thread(target=self._shutdown_apply_direct,
+                             name="YuhubHostsExitApply",
+                             daemon=True).start()
+        else:
+            threading.Thread(target=ha.run_elevated_apply,
+                             name="YuhubHostsExitApply", daemon=True).start()
+
+    def _shutdown_apply_direct(self):
+        """退出清理（管理员直写版）：只落盘，不碰界面。"""
+        ha.apply_intent(ha.read_intent() or dict(self._intent_state))
