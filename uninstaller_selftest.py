@@ -436,6 +436,74 @@ def _check_delete_permissions(checks):
         "detail": "全部命中" if not bad else "偏差：%s" % "; ".join(bad),
     })
 
+    # ⑥ 「被占用」绝不能误判成「权限不足」（v1.0.2 修的第二个根因）。
+    #    Python 把 WinError 32（共享冲突）也映射成 PermissionError 且
+    #    errno=13 —— 只要先判 isinstance 就会误判，导致 MoveFileEx 兜底
+    #    永远走不到、UI 还一直劝用户提权（提权对占用没用）。
+    #    这里用一个**真被本进程打开**的文件来制造 WinError 32。
+    lock_dir = os.path.join(tempfile.gettempdir(),
+                            "YuhubSelfTestLock_%d" % os.getpid())
+    shutil.rmtree(lock_dir, ignore_errors=True)
+    os.makedirs(lock_dir)
+    locked = os.path.join(lock_dir, "inuse.bin")
+    fh = open(locked, "wb")
+    fh.write(b"z" * 2048)
+    fh.flush()
+    try:
+        try:
+            os.remove(locked)
+            exc = None
+        except OSError as e:
+            exc = e
+        # 只有在真的复现出"占用"（非 None）时才有意义
+        if exc is None:
+            checks.append({
+                "name": "被占用文件被判定为「非权限问题」",
+                "pass": True,
+                "detail": "本次未能复现占用（环境差异），跳过",
+            })
+        else:
+            got = un._is_permission_error(exc)
+            checks.append({
+                "name": "被占用文件被判定为「非权限问题」",
+                "pass": got is False,
+                "detail": "winerror=%r errno=%r -> _is_permission_error=%s（期望 False）"
+                          % (getattr(exc, "winerror", None), exc.errno, got),
+            })
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+    # ⑦ 真·拒绝访问（WinError 5）仍必须判定为权限问题（别把上面那条修过头）
+    class _Fake5(OSError):
+        winerror = 5
+        errno = 13
+    checks.append({
+        "name": "真·权限拒绝（WinError 5）判定为权限问题",
+        "pass": un._is_permission_error(_Fake5()) is True,
+        "detail": "winerror=5 -> %s" % un._is_permission_error(_Fake5()),
+    })
+
+    # ⑧ 「目录非空」（WinError 145）不算权限问题 —— 它是子项没删掉的连带结果
+    class _Fake145(OSError):
+        winerror = 145
+        errno = 0
+    checks.append({
+        "name": "目录非空（WinError 145）不算权限问题",
+        "pass": un._is_permission_error(_Fake145()) is False,
+        "detail": "winerror=145 -> %s" % un._is_permission_error(_Fake145()),
+    })
+
+    # ⑨ 夺取所有权的能力必须在（"有权限也删不掉"的解药）
+    checks.append({
+        "name": "uninstaller 提供 _take_ownership（ACL 解药）",
+        "pass": callable(getattr(un, "_take_ownership", None)),
+        "detail": "存在=%s" % hasattr(un, "_take_ownership"),
+    })
+
 
 def _runtime_flags():
     """顺带记录运行时关键能力，用于排查"打包后某能力丢失"。"""

@@ -214,6 +214,36 @@ def is_admin():
         return False
 
 
+def shell_execute_runas(exe, args):
+    """以管理员身份启动 exe（弹 UAC），返回 (ok, err)。
+
+    ⚠️ **必须显式声明 restype / argtypes**：`ShellExecuteW` 返回的是
+    `HINSTANCE`（**指针宽度**），而 ctypes.windll 默认按 `c_long`（32 位）
+    取返回值。虽然大多数情况下返回的是 42 这种小值、截断不发作，但只要
+    Windows 返回一个高位非零的句柄，截断后就会变成**负数或 ≤32**，
+    于是被本函数下游的 `rc <= 32` 误判成"用户取消了 UAC" —— 表现为
+    "点了关掉/开启，开关弹回去、什么也没发生"（用户报的"hosts 关不掉"）。
+    显式 `restype = c_void_p` 才是对的写法。
+
+    ok=True 时 err=""；ok=False 时 err 是给用户看的人话（取消 / 启动失败）。
+    """
+    try:
+        fn = ctypes.windll.shell32.ShellExecuteW
+        fn.restype = ctypes.c_void_p
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                       ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+        rc = fn(None, "runas", exe, args, None, 0)
+    except Exception as exc:
+        return False, "无法发起提权请求：%s" % exc
+    # NULL(0) 或 ≤32 = 失败；32 以上才是成功（见 ShellExecute 返回码约定）
+    if not rc or int(rc) <= 32:
+        code = int(rc or 0)
+        if code == 5:
+            return False, "提权被系统策略拒绝（返回码 5）"
+        return False, "已取消管理员授权，未做任何改动"
+    return True, ""
+
+
 def sys_executable():
     """定位"能被 runas 唤起并解析 --hosts-elevated 的 exe"。
 
@@ -703,9 +733,9 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
     proxy=True：反向代理模式写入（条目应为 127.0.0.1 + 域名）。
 
     返回约定：
-      dict        —— 写/清完成，看 res["ok"]
-      {"error": "..."} —— 前置条件不满足（无法提权），error 里是人话
-      None        —— 用户取消了 UAC，或提权进程超时没回结果
+      dict             —— 写/清完成，看 res["ok"]；或失败原因 res["error"]
+      {"error": "..."} —— 无法提权 / 用户取消 / 超时，error 里是人话
+      None             —— 仅在非 Windows 或建不出结果文件时返回（极少）
     """
     if not IS_WIN:
         return None
@@ -714,7 +744,7 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
         return {"error": why}
     result_file = _result_path()
     if not result_file:
-        return None
+        return {"error": "无法创建提权结果文件（临时目录不可写）"}
     for p in (result_file, result_file + ".tmp"):
         try:
             os.remove(p)
@@ -730,14 +760,9 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
     exe = sys_executable()
     if not exe:
         return {"error": "未找到可用于提权的 Yuhub.exe"}
-    try:
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", exe,
-            "%s %s" % (_ELEVATED_FLAG, b64), None, 0)
-    except OSError:
-        return None
-    if rc <= 32:
-        return None                                  # 用户取消了 UAC
+    ok, why = shell_execute_runas(exe, "%s %s" % (_ELEVATED_FLAG, b64))
+    if not ok:
+        return {"error": why}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if os.path.exists(result_file):
@@ -748,7 +773,7 @@ def run_elevated(mode, service, entries=None, timeout=120.0, proxy=False):
             except (OSError, ValueError):
                 return None
         time.sleep(0.15)
-    return None
+    return {"error": "等待提权进程超时（%d 秒）——可能是杀软拦下了提权进程" % timeout}
 
 
 # ---------------------------------------------------------------------------

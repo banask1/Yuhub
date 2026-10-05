@@ -34,6 +34,11 @@ from dataclasses import dataclass, field
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_CONSOLE = 0x00000010
 
+# 本模块只跑在 Windows 上（winreg / ctypes.windll 全程依赖）。留一个显式
+# 常量而不是到处写死 True，是为了和 hostsaccel / cleaner 的写法保持一致，
+# 将来若要在别的平台上跑自检也能一眼看出哪里是平台相关的分支。
+IS_WIN = True
+
 # 注册表里的「卸载信息」节点。
 # 四个都要读，缺一不可（跨机踩过：只读前三个会漏掉 32 位用户级安装）：
 #   * HKLM 64 位  —— 常规的机器级安装
@@ -1773,25 +1778,75 @@ def _clear_readonly(path):
         return False
 
 
-def _is_permission_error(exc):
-    """判断一个 OSError 是不是"权限不足"（而不是"被占用"）。
+def _take_ownership(path):
+    """夺取文件/目录所有权并**重置 DACL**（仅管理员有效）。
 
-    为什么要分：MoveFileExW 对**被占用**的文件真能生效（重启后删），
+    为什么必须做：这是"**就算有权限也删不掉残留**"的真正修法。
+    Windows 上有一类目录（安装程序 / 系统组件创建）把 ACL 收紧成
+    "只给 SYSTEM、连 Administrators 都没写/删权限"，或者显式挂了一条
+    `(D)` 拒绝删除 ACE。此时**即使用管理员身份运行，DeleteFile 照样
+    返回 ERROR_ACCESS_DENIED** —— 权限不是"不够高"，而是被 ACL 明确
+    挡在门外。唯一的出路是管理员**先拿到所有权（takeown）再重置权限
+    继承（icacls /reset）**，权限一通，删除就成功了。
+
+    用两个系统自带命令实现（无需第三方库、无需重启）：
+      takeown /F <path> /R /D Y   —— 递归把所有权改成当前管理员
+      icacls  <path> /reset /T /C /Q —— 递归重置为从父目录继承的 ACL
+    `/D Y` 是"遇到目录回答 Yes"，`/C` 是"出错继续"，`/Q` 静默。
+    返回是否**至少执行成功了一条**（不代表删除一定成功，调用方仍需重试）。
+    """
+    if not IS_WIN or not path:
+        return False
+    ok_any = False
+    try:
+        r = subprocess.run(
+            ["takeown", "/F", path, "/R", "/D", "Y"],
+            capture_output=True, text=True,
+            creationflags=_CREATE_NO_WINDOW)
+        ok_any = ok_any or r.returncode == 0
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["icacls", path, "/reset", "/T", "/C", "/Q"],
+            capture_output=True, text=True,
+            creationflags=_CREATE_NO_WINDOW)
+        ok_any = ok_any or r.returncode == 0
+    except Exception:
+        pass
+    # 再摘一次只读：takeown 之后属性可能还在
+    _clear_readonly(path)
+    return ok_any
+
+
+def _is_permission_error(exc):
+    """判断一个 OSError 是不是**真正的权限不足**（而不是"被占用"）。
+
+    ⚠️ 顺序很关键 —— **先看 winerror，再看异常类型**。
+    Python 会把 Windows 的「共享冲突」（WinError 32，文件被别的进程打开着）
+    也映射成 `PermissionError`，它的 `errno` 是 13。如果先判
+    `isinstance(exc, PermissionError)` 就直接 return True，那么"被占用"
+    会被误判成"权限不足"：**MoveFileEx 兜底永远不会被走到**（那本是
+    "被占用"的正解），而且 UI 会一直劝用户"提权"—— 提权对占用毫无用处。
+    这是"删不掉残留"的第二个根因。
+
+    为什么要分这两种：MoveFileExW 对**被占用**的文件真能生效（重启后删），
     但对**权限不足**的文件也会返回成功、却在重启后照样删不掉 —— 用它
     兜底会把"权限失败"伪装成"已处理"，用户看到的就是"说删了其实还在"。
     所以权限类失败必须如实上报，交给提权重试。
 
-    Windows 的 errno 编码：13=EACCES、5=ERROR_ACCESS_DENIED（经
-    winerror 暴露）；Python 在 Windows 上 os.remove 的 PermissionError
-    通常 errno=13 / winerror=5。
+    Windows 编码：5=ERROR_ACCESS_DENIED（真·权限）；
+    32=ERROR_SHARING_VIOLATION、33=ERROR_LOCK_VIOLATION（被占用）；
+    145=ERROR_DIR_NOT_EMPTY（目录非空，也不是权限问题）。
     """
     if exc is None:
         return False
+    winerr = getattr(exc, "winerror", None)
+    if winerr is not None:
+        # 只有 5 是真·权限不足；32/33 是占用，145 是非空 —— 都不算权限
+        return winerr == 5
     if isinstance(exc, PermissionError):
         return True
-    winerr = getattr(exc, "winerror", None)
-    if winerr in (5, 32, 33):            # 拒绝访问 / 共享冲突 / 区域被锁
-        return winerr == 5
     return getattr(exc, "errno", None) in (13, 1)   # EACCES / EPERM
 
 
@@ -1811,12 +1866,17 @@ def _dir_tree_clear_readonly(path):
 def _delete_dir(path):
     """删目录，返回 (是否删净, 已释放字节, 失败文件数, 失败原因样本)。
 
-    先试 shutil.rmtree（快）；失败再逐项删。三项针对性处理：
+    先试 shutil.rmtree（快）；失败再逐项删。四项针对性处理：
 
       1. **先摘只读属性** —— 只读文件连管理员都删不掉，必须先清属性。
       2. **重试一次** —— 刚被卸载程序释放的句柄有延迟，立刻删会失败，
          短暂等待后重试命中率明显提高。
-      3. **MoveFileEx 只当兜底，且要复核** —— 对**被占用**的文件有效；
+      3. **ACL 收紧时夺取所有权 + 重置权限**（v1.0.2 新增）—— 这是"**就算
+         有权限也删不掉残留**"的真正修法。有些目录把 ACL 收成"只给 SYSTEM"
+         或挂了 `(D)` 拒绝 ACE，此时**即使用管理员也报拒绝访问**。管理员
+         可以 takeown + icacls /reset 把权限拿回来再删。只在**已经是管理员**
+         时做（普通用户没这个能力，交给上层提权重试）。
+      4. **MoveFileEx 只当兜底，且要复核** —— 对**被占用**的文件有效；
          对**权限不足**的文件它也会"登记成功"却永远删不掉，所以不能
          把它当成删除成功的凭据，否则会把权限失败误报成"重启后自动删"。
 
@@ -1839,6 +1899,20 @@ def _delete_dir(path):
         pass
     if not os.path.exists(path):
         return True, size, 0, ""
+
+    # 第二道关键修复：ACL 受阻时夺取所有权 + 重置权限，再试一次。
+    # 只在管理员下做 —— 普通用户 takeown 也会被拒，纯属白折腾。
+    acl_reset = False
+    if IS_WIN and is_admin():
+        if _take_ownership(path):
+            acl_reset = True
+            _dir_tree_clear_readonly(path)
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+            if not os.path.exists(path):
+                return True, size, 0, ""
 
     # 逐项删（从最深层往上）
     failed = 0
@@ -1904,9 +1978,21 @@ def _delete_dir(path):
     if not gone:
         # 目录还在：把"待重启删除"的也计入未完成，否则会被误判成"已处理"
         failed += pending
-    # 权限受阻时给一句明确的话，让 UI 能识别"这不是占用，是权限"
+    # 权限受阻时给一句明确的话，让 UI 能识别"这不是占用，是权限"。
+    # ⚠️ 措辞要看**当前是不是管理员**：已经是管理员还删不掉，再说
+    # "需要管理员权限"就是误导（用户会以为再提一次权就行，其实不行）——
+    # 这种情况我们已在上面做过 takeown + icacls /reset，仍失败通常是
+    # "被其他进程占用且连管理员也改不了"，得如实说明。
     if perm_blocked and not gone:
-        reasons.append("权限不足（需要管理员）")
+        if IS_WIN and is_admin():
+            if acl_reset:
+                reasons.append("权限被 ACL 拒绝，已尝试夺取所有权并重置权限仍未删净"
+                               "（可能仍被进程占用）")
+            else:
+                reasons.append("权限被 ACL 拒绝，且无法重置该目录的权限"
+                               "（可能被系统或安全软件保护）")
+        else:
+            reasons.append("权限不足（需要管理员）")
     return gone, (size if gone else 0), failed, "; ".join(reasons)
 
 
@@ -1998,9 +2084,7 @@ def clean_leftovers(items, on_progress=None):
                 res.failed += max(1, failed)
                 # 目录没删净 = 这一项还没完成，登记下来给 UI 做提权重试。
                 res.retryable.append(it.path)
-                if "权限不足" in why:
-                    res.messages.append(f"权限不足，需要管理员权限才能删除 {it.path}")
-                elif failed == 0:
+                if failed == 0:
                     res.messages.append(f"未能删除（被占用或权限受限）{it.path}")
                 else:
                     res.messages.append(
@@ -2018,7 +2102,14 @@ def clean_leftovers(items, on_progress=None):
                 res.failed += 1
                 res.retryable.append(it.path)
                 if _looks_like_permission(why):
-                    res.messages.append(f"权限不足，需要管理员权限才能删除 {it.path}")
+                    # 已经是管理员还说"需要管理员权限"会误导用户 ——
+                    # 那种情况是 ACL 拒绝且重置失败，如实说清楚。
+                    if IS_WIN and is_admin():
+                        res.messages.append(
+                            f"权限被拒绝（已以管理员身份尝试夺取所有权仍失败）{it.path}")
+                    else:
+                        res.messages.append(
+                            f"权限不足，需要管理员权限才能删除 {it.path}")
                 else:
                     res.messages.append(f"删除失败 {it.path}"
                                         + (f"（{why}）" if why else ""))
@@ -2041,10 +2132,10 @@ def _delete_file(path):
     失败短暂重试，最后才用 MoveFileEx 兜底标记重启后删除。
 
     ⚠️ 这里区分两种失败，别混为一谈：
-      * **权限不足** —— 摘掉只读属性后仍然报拒绝访问，说明是 ACL 收紧，
-        必须提权才能删。此时**不能**走 MoveFileEx 兜底（它对权限问题会
-        "登记成功却永远删不掉"，把失败伪装成成功），直接如实返回失败，
-        让上层升级到管理员重试。
+      * **权限不足** —— 摘掉只读属性后仍然报拒绝访问，说明是 ACL 收紧。
+        **已经是管理员**时先夺取所有权 + 重置权限再删（这是"有权限也删不掉"
+        的真正出路）；仍失败才如实上报。此时**不能**走 MoveFileEx 兜底
+        （它对权限问题会"登记成功却永远删不掉"，把失败伪装成成功）。
       * **被占用** —— 文件被别的进程打开着。MoveFileEx 真能生效，
         标记重启后删除是合理的降级。
     """
@@ -2063,6 +2154,14 @@ def _delete_file(path):
                 _clear_readonly(path)
                 time.sleep(0.12)
     if _is_permission_error(last_exc):
+        # 已是管理员仍被拒 → ACL 收紧，夺取所有权 + 重置权限后最后再试一次。
+        # （普通用户不做这步：takeown 一样会被拒，交给上层提权重试。）
+        if IS_WIN and is_admin() and _take_ownership(path):
+            try:
+                os.remove(path)
+                return True, ""
+            except OSError as e:
+                err = str(e)
         # 权限问题：MoveFileEx 会假装成功，这里必须如实报失败
         return False, err
     if _move_file_delayed(path):
@@ -2183,9 +2282,15 @@ def run_elevated_clean(items, timeout=180):
     b64 = base64.b64encode(raw).decode("ascii")
 
     try:
-        r = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", exe, f'--uninstall-elevated {b64}', None, 0)
-        if int(r) <= 32:
+        # ⚠️ ShellExecuteW 返回 HINSTANCE（指针宽度），必须显式声明 restype，
+        # 否则 ctypes 默认按 32 位 c_long 取，高位非零时被截成小值 →
+        # 下面 `int(r) <= 32` 会把成功当失败。
+        fn = ctypes.windll.shell32.ShellExecuteW
+        fn.restype = ctypes.c_void_p
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                       ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+        r = fn(None, "runas", exe, f'--uninstall-elevated {b64}', None, 0)
+        if not r or int(r) <= 32:
             return None          # 用户取消 UAC
     except Exception:
         return None

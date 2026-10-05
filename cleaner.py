@@ -1045,14 +1045,19 @@ def run_elevated_clean(keys, timeout=300.0):
     b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
     exe = _yuhub_exe_path()
+    # ⚠️ ShellExecuteW 返回 HINSTANCE（指针宽度），ctypes.windll 默认按 32 位
+    # c_long 取，高位非零时会被截成负数/小值 → 下面的 `rc <= 32` 误判成
+    # "用户取消 UAC"。显式声明 restype 才是对的（同 hostsaccel 里的写法）。
     try:
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", exe, f"{_ELEVATED_FLAG} {b64}", None, 0,
-        )
-    except OSError:
+        fn = ctypes.windll.shell32.ShellExecuteW
+        fn.restype = ctypes.c_void_p
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                       ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+        rc = fn(None, "runas", exe, f"{_ELEVATED_FLAG} {b64}", None, 0)
+    except Exception:
         return None
-    if rc <= 32:
-        return None                                  # 用户取消了 UAC
+    if not rc or int(rc) <= 32:
+        return None                                  # 用户取消了 UAC / 提权失败
 
     # 轮询等结果文件。提权进程慢慢腾腾地清完才写，给足超时。
     deadline = time.monotonic() + timeout

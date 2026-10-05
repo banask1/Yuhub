@@ -466,7 +466,8 @@ class AccelPage(BasePage):
             self.toast("加速已开启：%d 个域名已写入 hosts（%s模式），DNS 缓存已刷新"
                        % (n, mode_txt))
         else:
-            self.toast(msg)
+            self.toast("未能开启加速：%s。开关已保持为当前真实状态，"
+                       "请重试一次并在 UAC 弹窗里点「是」。" % (msg or "未知原因"))
         self._refresh_status()
 
     # ------------------------------------------------------------ 恢复默认
@@ -514,7 +515,14 @@ class AccelPage(BasePage):
         self._busy[svc] = False
         card = self._cards[svc]
         card._progress.setVisible(False)
-        self.toast("已恢复默认" if ok else msg)
+        if ok:
+            self.toast("已恢复默认")
+        else:
+            # 关不掉时必须说清楚"为什么关不掉、现在是什么状态"——
+            # 只弹一句"未完成"的话，用户会以为开关坏了（而且开关确实会
+            # 因为 hosts 还有条目而弹回"开"，看起来像点击无效）。
+            self.toast("未能关闭加速：%s。开关已保持为当前真实状态，"
+                       "请重试一次并在 UAC 弹窗里点「是」。" % (msg or "未知原因"))
         # 两个服务都没有代理模式条目了 → 停掉代理（端口让出来）
         still_proxy = any(
             ha.entries_mode(ha.current_entries(s)) == "proxy"

@@ -333,6 +333,51 @@ def run(out_file, timeout_sec=60):
             == QPoint(0, win.titlebar.height()),
             glass.widget_origin(win.sidebar, win.backdrop))
 
+        # -------------- ⑩b 边缘缩放：下拉弹出列表不能触发缩放光标 --------------
+        # 回归（v1.0.2）：QComboBox 的下拉列表是**独立顶层窗口**，从 combo
+        # 下方铺下来时会伸到主窗口底边之外。旧 _edge_at 只用 frameGeometry
+        # 判边，于是列表最后几项落在"下边缘带"里 → 鼠标一移过去变成上下缩放
+        # 光标、左键按下被 startSystemResize 吞掉（用户报"其他游戏选不中"）。
+        # 修法：光标不在主窗口上（topLevelAt != self）时不做边缘判定。
+        from PySide6.QtCore import QPoint as _QPt
+        from PySide6.QtWidgets import QApplication as _QApp
+        from ui.main_window import RESIZE_MARGIN as _RM
+        g = win.frameGeometry()
+        # 真·边缘仍然要认（别把修法做过头，把缩放功能修没了）
+        chk("窗口下边缘内侧 1px 仍判为 BottomEdge",
+            (win._edge_at(_QPt(g.center().x(), g.bottom() - 1))
+             & Qt.Edge.BottomEdge) != Qt.Edge(),
+            win._edge_at(_QPt(g.center().x(), g.bottom() - 1)))
+        chk("窗口正中不判为任何边缘",
+            win._edge_at(_QPt(g.center().x(), g.center().y())) == Qt.Edges(),
+            win._edge_at(_QPt(g.center().x(), g.center().y())))
+        # 主窗口之外的"别的顶层窗口"所在点：不该再被判成边缘。
+        #
+        # ⚠️ 必须造一个**真的**顶层窗口来测，不能只在窗口外取个空点：
+        # 空点处 topLevelAt 返回 None，而 None 时守卫不生效（此时按旧逻辑
+        # 仍会判成 BottomEdge）—— 断言的"环境前提"根本没成立，测出来的是
+        # 空气。这里复刻真实场景：一个从主窗口底边往下铺的**无边框弹出窗**
+        # （QComboBox 的下拉列表就是这样），它的最后一项正好落在主窗口
+        # 底边带里。断言两件事：① topLevelAt 确实认到弹出窗（前提升级为
+        # 断言而非假设）；② 该点 _edge_at 不返回边缘。
+        from PySide6.QtWidgets import QWidget as _QW
+        from PySide6.QtCore import Qt as _Qt
+        pop = _QW(None, _Qt.WindowType.Popup | _Qt.WindowType.FramelessWindowHint)
+        pop.setGeometry(g.center().x() - 60, g.bottom() - 20, 120, 80)
+        pop.show()
+        _QApp.processEvents()
+        outside = _QPt(pop.geometry().center().x(), pop.geometry().bottom() - 4)
+        top = _QApp.topLevelAt(outside)
+        chk("下拉弹出区（独立顶层窗口）所在的点认到的是弹出窗而非主窗口",
+            top is pop,
+            "top=%s pop=%s pos=%s" % (top, pop, outside))
+        chk("主窗口外（模拟下拉弹出区）不判为缩放边缘",
+            win._edge_at(outside) == Qt.Edges(),
+            "top=%s edges=%s" % (top, win._edge_at(outside)))
+        pop.close()
+        pop.deleteLater()
+        _QApp.processEvents()
+
         # ---------------- ⑪ 开关形状：椭圆轨道 + 圆形滑块 ----------------
         # 用户要求「所有的功能开关都改成椭圆形和圆形的」。形状断言挂在控件
         # 自己暴露的几何方法上，再用离屏渲染交叉验证像素——只测方法会被

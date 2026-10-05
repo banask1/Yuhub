@@ -1149,6 +1149,30 @@ def _permission_checks(tmp_root):
     chk("每次提权的结果文件路径唯一（防并发互踩）", p1 != p2, (p1, p2))
     chk("结果文件路径带 PID", str(os.getpid()) in os.path.basename(p1), p1)
 
+    # ---- 5. ShellExecuteW 返回值必须按 HINSTANCE（指针宽度）取 --------------
+    # 回归（v1.0.2）：ctypes.windll 默认按 c_long 取 ShellExecuteW 的返回，
+    # 而它实际返回 HINSTANCE（指针宽度）。只要 Windows 给一个高位非零的句柄，
+    # 截断后就会变成负数/小值 → `rc <= 32` 误判成"用户取消了 UAC"，表现为
+    # 「点开关没反应、开关弹回去」（用户报的"hosts 关不掉"）。这里钉住：
+    #   a) 有 shell_execute_runas 这个统一入口；
+    #   b) 它内部显式声明了 restype / argtypes；
+    #   c) 成功/失败的边界判定是"NULL 或 ≤32 才算失败"。
+    chk("hostsaccel 提供 shell_execute_runas 统一入口",
+        callable(getattr(ha, "shell_execute_runas", None)),
+        "存在=%s" % hasattr(ha, "shell_execute_runas"))
+    import inspect as _insp
+    src = _insp.getsource(ha.shell_execute_runas)
+    chk("shell_execute_runas 显式声明 restype（防 32 位截断）",
+        "restype" in src and "c_void_p" in src, "")
+    chk("shell_execute_runas 显式声明 argtypes",
+        "argtypes" in src, "")
+    chk("shell_execute_runas 把 NULL/≤32 判为失败",
+        "<= 32" in src and "if not rc" in src, "")
+    # run_elevated 也必须走统一入口（别又退回裸 ShellExecuteW）
+    esrc = _insp.getsource(ha.run_elevated)
+    chk("run_elevated 改用 shell_execute_runas（不再裸调）",
+        "shell_execute_runas" in esrc and "ShellExecuteW" not in esrc, "")
+
 
 # ---------------------------------------------------------------------------
 def run(out_file):

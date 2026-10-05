@@ -1537,6 +1537,19 @@ class MainWindow(QWidget):
     def _edge_at(self, global_pos):
         if self.isMaximized():
             return Qt.Edges()
+        # ⚠️ 先挡掉"光标不在本窗口上"的情况：QComboBox 的下拉列表、右键菜单
+        # 都是**独立顶层窗口**，会伸到主窗口底边之外（下拉列表尤其明显：列表
+        # 从 combo 下方铺下来，最后几项落在 frameGeometry 的下边缘带里）。
+        # 若只用 frameGeometry 判边，这些项会被判成"下边缘"：鼠标一移过去就
+        # 变成上下缩放光标，左键按下还被 startSystemResize **吞掉** ——
+        # 用户看到的就是"最后一个选项点不动、鼠标变成上下箭头"。
+        # topLevelAt 取到的不是主窗口 ⇒ 光标在别的顶层窗口上，不参与边缘缩放。
+        try:
+            top = QApplication.topLevelAt(global_pos)
+        except Exception:
+            top = None
+        if top is not None and top is not self:
+            return Qt.Edges()
         g = self.frameGeometry()
         m = RESIZE_MARGIN
         left = global_pos.x() <= g.left() + m
