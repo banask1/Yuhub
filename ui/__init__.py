@@ -87,6 +87,28 @@
 #    ④ 异地联机「游戏快连」新增「其他游戏」（无端口）选项：选中后复制的是
 #       **纯 IP**、不带 `:端口`，下拉文案也不显示"（0）"；队友明确选了该选项
 #       时同样只给纯 IP（判据用 game 字段，而不是 `port or 我的端口`）。
-VERSION = "1.0.1"
+# 1.0.2：修三个用户实测出来的问题 ——
+#    ① 联机「其他游戏」下拉最后一项点不中、鼠标移过去变成上下缩放光标：
+#       根因是 `MainWindow._edge_at` 只看 `frameGeometry()` 判边，而 QComboBox
+#       的下拉列表是**独立顶层窗口**，从 combo 下方铺下来时会伸到主窗口
+#       下边缘带（后 5px）里 —— 于是最后几项被判成"下边缘"，光标变
+#       SizeVerCursor，左键按下还被 `startSystemResize` 吞掉（点不动）。
+#       现在用 `QApplication.topLevelAt()` 先确认光标在**主窗口**上，不是就
+#       不做边缘缩放（右键菜单等其它弹出窗同理受益）。
+#    ② Steam / GitHub 加速开关关不掉、拨回就自动弹回：根因是
+#       `ShellExecuteW` 返回 HINSTANCE（指针宽度），`ctypes.windll` 默认按
+#       `c_long`（32 位）取返回，高位非零被截断成小值/负数 → `rc <= 32`
+#       误判成"用户取消了 UAC" → 开关失败回弹。现在统一走
+#       `hostsaccel.shell_execute_runas()`，显式声明 `restype = c_void_p`
+#       与 `argtypes`。
+#    ③ 卸载残留"就算有权限也删不掉"：两个根因 —— (a) 目录 ACL 被收紧，
+#       连管理员都删不掉，需要 `takeown /F … /R /D Y` + `icacls … /reset
+#       /T /C /Q` 先夺回所有权再删（`_take_ownership`）；(b)
+#       `_is_permission_error` 先判 `isinstance(PermissionError)`，而 Python
+#       把 WinError 32（文件被占用）也映射成 PermissionError → 占用被误报
+#       成"权限不足"。现在**先看 winerror**（只有 5 = ERROR_ACCESS_DENIED
+#       才算真权限），32/33 是占用、145 是非空，都不算权限；管理员环境下
+#       再补一次 takeown + icacls 重试。
+VERSION = "1.0.2"
 VERSION_LABEL = f"v{VERSION}"
 APP_NAME = "Yuhub"
