@@ -331,13 +331,6 @@ def fetch_release_by_tag(tag, owner=REPO_OWNER, repo=REPO_NAME,
     return None, last_err
 
 
-def github_latest(owner=REPO_OWNER, repo=REPO_NAME, timeout=HTTP_TIMEOUT,
-                  api_base="https://api.github.com"):
-    """取最新 Release。拿不到返回 None（静默失败，不抛）。"""
-    info, _ = fetch_release(owner, repo, timeout, api_base)
-    return info
-
-
 def check_for_update(current_version, owner=REPO_OWNER, repo=REPO_NAME,
                      timeout=HTTP_TIMEOUT, api_base="https://api.github.com"):
     """检查是否有新版本。

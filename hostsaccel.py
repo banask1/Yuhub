@@ -832,6 +832,31 @@ def commit_hosts(target, text, original=None):
             "error": "写入 hosts 失败：%s。%s" % ("；".join(errors), _AV_HINT)}
 
 
+def _tidy_lines(lines):
+    """落地前整理行列表：去掉尾部空行、把连续空行压成一个。
+
+    为什么需要：`write_service_block` 会在区块前插**一个空行**做分隔，而
+    `clean_service` 只摘掉区块、不会摘掉那个空行 —— 于是每来一次"开 → 关"
+    就在 hosts 尾部多留一个空行。实测反复开关十几次之后，用户的 hosts 尾巴
+    上挂了一串空行（13 个空行 = 26 字节，853 字节里全是它），既不干净，
+    也让"hosts 有没有被改过"没法再用字节数/哈希一眼判断。
+
+    hosts 文件里空行本来就**不参与解析**（不影响任何域名映射），所以收敛成
+    "最多一个空行、且不在末尾"是安全的：功能完全不变，文件回到干净形态。
+    """
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            # 只在"上一行有内容"时保留一个空行；连续空行直接丢弃
+            if out and out[-1].strip():
+                out.append("")
+            continue
+        out.append(ln)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
 def write_service_block(service, entries, hosts_file=None, do_backup=True,
                         proxy=False):
     """清洗旧内容 → 追加本服务新区块 → 写回。
@@ -855,7 +880,7 @@ def write_service_block(service, entries, hosts_file=None, do_backup=True,
     lines, res["removed"] = clean_hosts_lines(raw.splitlines(), service)
     lines += [""] + build_block_lines(
         service, [(ip, d, 0.0) for ip, d in entries], proxy=proxy)
-    text = _newline().join(lines) + _newline()
+    text = _newline().join(_tidy_lines(lines)) + _newline()
     commit = commit_hosts(target, text, original=raw)
     if not commit["ok"]:
         res["error"] = commit["error"]
@@ -881,7 +906,7 @@ def clean_service(service, hosts_file=None, do_backup=True):
     if res["removed"] == 0:
         res["ok"] = True
         return res
-    text = _newline().join(lines) + _newline()
+    text = _newline().join(_tidy_lines(lines)) + _newline()
     commit = commit_hosts(target, text, original=raw)
     if not commit["ok"]:
         res["error"] = commit["error"]

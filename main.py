@@ -50,17 +50,11 @@ from ui import VERSION  # noqa: E402
 from ui import wheel_guard  # noqa: E402
 from ui.main_window import MainWindow, resource_path, init_theme_from_settings  # noqa: E402
 from ui.splash import SplashScreen  # noqa: E402
-import winadmin  # noqa: E402
 
 _bt("全部顶层模块导入完成")
 
 # 装完的翻译对象必须留一个引用，否则会被 GC 掉、翻译当场失效
 _TRANSLATORS = []
-
-# 「以管理员身份重启」时带上的标志（对标 Steam++ 的 requireAdministrator）：
-# 新实例看到它就**不去敲旧实例的门**，而是请旧实例让位、自己接管单实例管道。
-# 详见 single_instance.SingleInstance.acquire_takeover 与 winadmin.relaunch_as_admin。
-RELAUNCH_FLAG = winadmin.RELAUNCH_FLAG
 
 # 给 easytier-core.exe 启动用的标志位。0x08000000 = CREATE_NO_WINDOW，
 # 关键：阻止 Windows 给控制台子系统程序创建 conhost 子进程窗口，
@@ -400,7 +394,20 @@ def main():
             import lan_selftest
             sys.exit(lan_selftest.run(out_path, code=code,
                                       keep=("--keep" in sys.argv)))
+        except SystemExit:
+            raise
         except Exception:
+            # 别把异常吞成一个光秃秃的退出码 —— 那正是本项目反复吃亏的
+            # "静默失败"（rc=5 什么都说明不了，而且冻结态是 GUI 子系统、
+            # 根本没有 stderr 可看）。把 traceback 落到结果文件旁边
+            # <out_path>.err，事后才诊断得动。
+            try:
+                import traceback as _tb
+                with open(str(out_path) + ".err", "w",
+                          encoding="utf-8") as _fh:
+                    _fh.write(_tb.format_exc())
+            except Exception:
+                pass
             sys.exit(5)
 
     # ---- apply-update 模式：替换自己的 exe 并重启（同样早返回） ----
@@ -597,39 +604,15 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
 
     # ---- 单实例：抢不到说明已经有一个在跑，且已被唤醒，自己直接退出 ----
-    #
-    # 两种进入方式要分开处理：
-    #   · 普通启动  → acquire()：敲门唤醒旧窗口，自己退出。
-    #   · 提权重启（带 RELAUNCH_FLAG）→ acquire_takeover()：请旧实例让位，
-    #     等它把管道放掉再自己接管。**绝不能走 acquire()** —— 那会去敲旧
-    #     实例的门，旧窗口被激活、提权的新实例反而退出，用户看到"重启没
-    #     生效、还是普通权限"。
+    # Yuhub 以管理员身份启动（exe 清单 requireAdministrator，见 Yuhub.spec），
+    # 所以每一次启动都是"同一个已提权进程"，不再有"提权重启"这条支线。
     guard = SingleInstance()
-    if RELAUNCH_FLAG in sys.argv:
-        if not guard.acquire_takeover():
-            return 0
-    elif not guard.acquire():
+    if not guard.acquire():
         return 0
-
-    # 旧实例收到「请让位」→ 保存状态、正常退出（aboutToQuit 会把收尾做完）。
-    # 用标志位而不是直接 app.quit()：如果接管请求在主窗口还没建好时就到了，
-    # quit() 在 exec() 之前是不生效的，得在建完窗口后自己检查一次。
-    _takeover = {"requested": False}
-
-    def _on_takeover():
-        _takeover["requested"] = True
-        app.quit()
-
-    guard.takeover_requested.connect(_on_takeover)
 
     app.setQuitOnLastWindowClosed(False)
 
     try:
-        # 接管请求在"建窗口之前"就到达了（提权重启时旧实例退得很快）：
-        # app.quit() 在 exec() 之前不生效，这里补一次检查，别白建一个窗口。
-        if _takeover["requested"]:
-            return 0
-
         # ---- 启动画面：先于主窗口构建弹出（双击 exe 后很快就能看到）----
         # 主题解析依赖 QSettings，这里先做一次（MainWindow 里再做是幂等的），
         # 否则浅色用户会先看到一屏默认深色。

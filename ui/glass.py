@@ -103,36 +103,6 @@ CHROMA_COOL = QColor("#79e2ff")
 CHROMA_WARM = QColor("#ff9ad8")
 
 
-def liquid_colors(palette):
-    """液态玻璃的色组（浅蓝）。
-
-    用户的要求是"选中效果不要原来那种实心蓝，要浅蓝的液态玻璃"。所以这里
-    不直接用 accent 本色，而是把它往白里提两档：
-
-        tint   混 52% 白 —— 玻璃底色，浅蓝
-        edge   混 74% 白 —— 边缘光带色，接近白
-
-    这样用户换主题包时，选中效果仍然是"同一色系的浅色玻璃"，不会突然冒出
-    一块跟整体配色无关的蓝。
-
-    优先读色板里的 `liquid_tint` / `liquid_edge`（theme.build_qss 注入的
-    就是这一套，保证 QSS 画的分段按钮和自绘的指示条是同一种浅蓝）；
-    色板里没有才现推。
-
-    返回 (tint, edge, chroma_a, chroma_b)。
-    """
-    p = palette or {}
-    accent = p.get("accent") or "#3b82f6"
-
-    def _pick(key, t):
-        c = QColor(p.get(key)) if p.get(key) else QColor()
-        return c if c.isValid() else mix(accent, "#ffffff", t)
-
-    return (_pick("liquid_tint", 0.52),
-            _pick("liquid_edge", 0.74),
-            CHROMA_COOL, CHROMA_WARM)
-
-
 def _inner_band(painter, rect, thickness, side, color, alpha):
     """在 rect 的某条**内缘**画一条渐隐色带（等效 CSS 的 inset shadow）。
 

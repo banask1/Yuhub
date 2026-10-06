@@ -1134,43 +1134,18 @@ CASES.append(("stalefix", "结果 seq 落后 → 自动补一轮应用（不靠�
               m_stalefix, r_stalefix, "hosts"))
 
 
-# ---- 43) 「管理员模式」三条：标志位同源 / 接管消息真的送达 / 取消授权不退程序 ----
-# 背景（v1.0.5）：对齐 Steam++ 的 `requireAdministrator` —— 主程序常驻管理员后
-# hosts 由同一个进程直写，不再逐次弹 UAC、也不再让杀软反复审视新进程。
-# 这条路上的三个关键点各切一刀，确认对应断言真的会红。
-def m_badflag():
-    """把"重启标志"改成另一个字面量（且 UI 与 main 各改各的）。
+# ---- 43) 单实例「敲门」：同进程也必须泵事件循环 ----
+# 背景：Yuhub 以管理员身份启动（exe 清单 requireAdministrator），
+# 不再有"提权重启"这条支线；单实例只剩「第二个实例敲门 → 唤醒旧窗口」。
+# 但 `_probe` 的坑还在：客户端与服务端**在同一个进程**里时（自检就是这样），
+# `waitForBytesWritten` / `waitForReadyRead` 都不保证把字节推出去，
+# 紧接着的 disconnect 直接把消息丢了 —— 函数还返回 True（连接确实建过），
+# 旧实例却永远收不到 activate。症状极隐蔽："第二个实例确实退出了，
+# 但第一个实例的窗口根本不弹"，而且不报任何错。
+def m_probenopump():
+    """把 `_probe` 退回成"只 waitFor*、不泵事件循环"的写法。
 
-    期望："winadmin 给出统一的 RELAUNCH_FLAG" 变红 —— 这个常量只能有一个
-    来源，两边不一致时新实例会认不出自己，跑去敲旧实例的门。
-    """
-    import winadmin as _w
-    import main as _m
-    _w._m_orig_flag = _w.RELAUNCH_FLAG
-    _m._m_orig_flag = _m.RELAUNCH_FLAG
-    _w.RELAUNCH_FLAG = "--elevate-now"
-    _m.RELAUNCH_FLAG = "--elevate-now"
-
-
-def r_badflag():
-    import winadmin as _w
-    import main as _m
-    _w.RELAUNCH_FLAG = _w._m_orig_flag
-    _m.RELAUNCH_FLAG = _m._m_orig_flag
-
-
-CASES.append(("badflag", "winadmin 给出统一的 RELAUNCH_FLAG",
-              m_badflag, r_badflag, "hosts"))
-
-
-def m_takeovernopump():
-    """把「递接管消息」退回成只 waitFor* 不泵事件循环的写法。
-
-    这是本次真踩到的坑：客户端与服务端**在同一个进程**里时，
-    `waitForBytesWritten` / `waitForReadyRead` 都不保证把字节推出去，
-    紧接着的 disconnect 直接把消息丢了 —— 函数还返回 True（连接确实建过），
-    旧实例却永远收不到"请让位"，于是"以管理员身份重启"永远重启不了。
-    期望："request_takeover → 旧实例收到 takeover_requested" 变红。
+    期望："_probe 递出 activate（第二个实例敲门 → 旧窗口被唤醒）" 变红。
     """
     import single_instance as _si
 
@@ -1182,7 +1157,7 @@ def m_takeovernopump():
             sock.abort()
             return False
         try:
-            sock.write(_si.MSG_TAKEOVER)
+            sock.write(_si.MSG_ACTIVATE)
             sock.flush()
             sock.waitForBytesWritten(_si.CONNECT_TIMEOUT_MS)
             if sock.waitForReadyRead(_si.ACK_TIMEOUT_MS):
@@ -1193,44 +1168,69 @@ def m_takeovernopump():
                 sock.waitForDisconnected(_si.CONNECT_TIMEOUT_MS)
         return True
 
-    _si.SingleInstance._m_orig_req = _si.SingleInstance.request_takeover
-    _si.SingleInstance.request_takeover = naive
+    _si.SingleInstance._m_orig_probe = _si.SingleInstance._probe
+    _si.SingleInstance._probe = naive
 
 
-def r_takeovernopump():
+def r_probenopump():
     import single_instance as _si
-    _si.SingleInstance.request_takeover = _si.SingleInstance._m_orig_req
+    _si.SingleInstance._probe = _si.SingleInstance._m_orig_probe
 
 
-CASES.append(("takeovernopump", "request_takeover → 旧实例收到 takeover_requested（据此让位）",
-              m_takeovernopump, r_takeovernopump, "hosts"))
+CASES.append(("probenopump",
+              "_probe 递出 activate（第二个实例敲门 → 旧窗口被唤醒）",
+              m_probenopump, r_probenopump, "hosts"))
 
 
-def m_relaunchignore():
-    """「以管理员身份重启」不看 UAC 的返回值：取消也照样退出自己。
+def m_probeackdrop():
+    """`_probe` 不等回执就断开 —— 消息可能还没被读走就随连接消失。
 
-    用户点了「否」→ 程序关了却没重启，比不改还糟。
-    期望："取消管理员授权 → 不重启、按钮恢复可点、给出提示" 变红。
+    期望同上一条（都是"递出去了"与"对端收到了"的区别）。
     """
-    import ui.pages.accel_page as _ap
-    import winadmin as _w
+    import single_instance as _si
 
-    def bad(self):
-        _w.relaunch_as_admin([_w.RELAUNCH_FLAG])      # 返回值直接丢掉
-        self._relaunching = True
-        self._quit_for_relaunch()
+    def ackless(self):
+        from PySide6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        sock.connectToServer(self.name)
+        if not sock.waitForConnected(_si.CONNECT_TIMEOUT_MS):
+            sock.abort()
+            return False
+        sock.write(_si.MSG_ACTIVATE)          # 写完立刻断开，绝不读回执
+        return True
 
-    _ap.AccelPage._m_orig_relaunch = _ap.AccelPage._on_relaunch_clicked
-    _ap.AccelPage._on_relaunch_clicked = bad
+    _si.SingleInstance._m_orig_probe2 = _si.SingleInstance._probe
+    _si.SingleInstance._probe = ackless
 
 
-def r_relaunchignore():
-    import ui.pages.accel_page as _ap
-    _ap.AccelPage._on_relaunch_clicked = _ap.AccelPage._m_orig_relaunch
+def r_probeackdrop():
+    import single_instance as _si
+    _si.SingleInstance._probe = _si.SingleInstance._m_orig_probe2
 
 
-CASES.append(("relaunchignore", "取消管理员授权 → 不重启、按钮恢复可点、给出提示",
-              m_relaunchignore, r_relaunchignore, "hosts"))
+CASES.append(("probeackdrop",
+              "_probe 递出 activate（第二个实例敲门 → 旧窗口被唤醒）",
+              m_probeackdrop, r_probeackdrop, "hosts"))
+
+
+def m_notidy():
+    """落地前不做空行整理 —— 反复开关会在 hosts 尾巴上堆空行。
+
+    期望："反复开关 6 轮后 hosts 逐字节回到原样（不累积空行）" 变红。
+    """
+    import hostsaccel as _ha
+    _ha._m_orig_tidy = _ha._tidy_lines
+    _ha._tidy_lines = lambda lines: list(lines)     # 原样透传，不整理
+
+
+def r_notidy():
+    import hostsaccel as _ha
+    _ha._tidy_lines = _ha._m_orig_tidy
+
+
+CASES.append(("notidy",
+              "反复开关 6 轮后 hosts 逐字节回到原样（不累积空行）",
+              m_notidy, r_notidy, "hosts"))
 
 
 

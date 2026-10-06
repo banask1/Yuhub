@@ -147,32 +147,51 @@
 #       + 「把 Yuhub.exe 加进火绒信任区」的处置指引；残留的
 #       hosts.yuhub.tmp 会被自动清掉。apply 结果新增 admin/method 字段，
 #       下次再出问题一眼能定性（没权限还是被拦）。
-#    ⑤ v1.0.5 常驻管理员模式（对标 Steam++ 的 requireAdministrator）：
+#    ⑤ v1.0.6 常驻管理员启动（对标 Steam++ 的 requireAdministrator）：
 #       读 SteamTools 源码时发现一个容易忽略但很关键的事实 ——
 #       `source/SteamTools/app.manifest` 里写死
 #           <requestedExecutionLevel level="requireAdministrator" />
-#       也就是**它的主程序从启动就常驻管理员**。所以它的 hosts 写入永远
-#       发生在**同一个已提权进程**里：UAC 只在启动弹一次，火绒/360 这类
-#       软件也只需要放行同一个程序一次。
-#       我们原来是普通权限启动 + 每次拨开关 `runas` 拉一个**新的提权子
-#       进程**写盘：UAC 每次都弹，而且 HIPS 类软件会把这个"新来的实例"
-#       重新审视一遍、拦一次就拿 WinError 5（用户看到的"hosts 未被改动"）。
-#       现在加速页多一条权限状态条 + 「以管理员身份重启」按钮：一键换成
-#       管理员模式后，`_ensure_apply` 直接走同进程写盘、退出清理也不再提权，
-#       全程零 UAC。默认仍保持普通权限启动（拖放文件、开机自启都不弹窗），
-#       把选择权交给用户。
-#       配套（都是踩出来的）：
-#         · `winadmin.relaunch_as_admin()` —— `ShellExecuteW` 必须显式
-#           `restype = c_void_p`（HINSTANCE 截断会把"成功"读成"取消了 UAC"）；
-#         · 单实例新增「接管」消息：提权重启的新实例**不能**走 `acquire()`
-#           去敲旧实例的门（那会把旧窗口激活、提权的新实例反而退出），
-#           而是先请旧实例让位（`takeover_requested` → 旧实例退出）再接管
-#           管道；超时则降级成普通 `acquire()`（最坏是"没重启成功"，
-#           绝不能是"程序打不开了"）；
-#         · `SingleInstance._send()` 必须**显式泵事件循环**直到字节发完 ——
-#           客户端与服务端同进程时，`waitForBytesWritten`/`waitForReadyRead`
-#           都不保证把消息推出去，紧接着的 disconnect 会把它丢掉（本次实测：
-#           `request_takeover()` 返回 True 但旧实例永远收不到）。
-VERSION = "1.0.5"
+#       也就是**它的主程序从启动就常驻管理员**：UAC 只在启动弹一次，
+#       hosts 写入永远发生在**同一个已提权进程**里，火绒/360 这类软件也
+#       只需要放行同一个程序一次。
+#       Yuhub 现在直接照做：PyInstaller 的 `uac_admin=True` 把
+#       requireAdministrator 写进 exe 清单。于是 hosts 写入 / 卸载残留清理 /
+#       内存优化 / 进房间拉虚拟网卡全都变成"同一个进程直接做" —— 不再每次
+#       操作都 `runas` 拉一个新进程。那正是两件老毛病的共同根因：
+#         · HIPS 会把每个"新来的实例"重新审视一遍，拦一次就拿 WinError 5
+#           （用户看到的"hosts 未被改动 / 关不掉"）；
+#         · 进房间时那颗 UAC 弹窗会把桌面变暗、等用户点击（用户感知的
+#           "打开联网房间卡顿"）。
+#       v1.0.5 那套"加速页权限状态条 + 以管理员身份重启 + 单实例接管"
+#       因此**整体删除** —— 启动即提权之后，它是多余的一层。
+#    ⑥ v1.0.6 内存与体量优化：
+#       · 九个页面改成**惰性构造**（`main_window._LazyPages`）：启动只建首屏
+#         那一页，其余等你点进去才建。实测构造耗时 149ms → 45ms、构造后
+#         常驻内存 85MB → 70MB；没访问过的页面一分内存都不占。
+#         `_pages[key]` / `_pages.get(key)` 会自动触发构造，所以既有调用点
+#         与自检都无需改动（自检里的 `win._pages["lan"]` 照样能用）。
+#       · hosts 落地前整理行（`hostsaccel._tidy_lines`）：去掉尾部空行、
+#         压缩连续空行。原来 `write_service_block` 在区块前插一个空行、
+#         `clean_service` 不摘它 → 每开关一次就在 hosts 尾巴上多留一个空行
+#         （用户机器上实测累积了 13 个）。现在反复开关后 hosts 逐字节回到原样。
+#       · 打包体量：58.76MB → 42.11MB（-15.9MB / -28%）。真正削得动的只有一块 ——
+#         PySide6 的钩子会**整包收集**一堆本程序一次都用不到的东西：
+#         `collect_extra_binaries()` 无条件收 19.7MB 的软件 OpenGL
+#         （opengl32sw.dll），QML/Quick/Pdf/虚拟键盘 的 DLL 也被未收集的插件
+#         连带拖进来（合计又 ~18MB），另有 96 个 Qt 自带翻译（6.4MB）而
+#         main.py 只会加载 `qtbase_zh_CN.qm` 一个名字。现在按 basename 在
+#         spec 里过滤掉，并保留 offscreen/minimal 平台插件（自检要用）、
+#         tls 后端、qsvg 图标与中文翻译。
+#       · 死代码清理：13 处（cleaner 的 CleanTarget/_empty_dir、uninstaller 的
+#         _enum_values/_registry_value/verify_removed、ui/widgets 的 FeatureCard
+#         64 行、live_monitor.describe_media、updater.github_latest、
+#         ui/glass.liquid_colors），净减 ~480 行。
+#       ⚠️ 踩坑记录（教训写进 spec 与自检）：一开始把 `PySide6.QtTest` 也排掉了，
+#       而 `lan_selftest` 里 `from PySide6.QtTest import QTest` 要驱动分享页点击
+#       → 冻结态炸 ModuleNotFoundError，**十套自检全绿、只有 lan 红**，且 GUI
+#       子系统没有 stderr、异常被兜底吞成 rc=5。现在 ① main 的兜底会把
+#       traceback 落到 `<结果>.err`；② hostsaccel_selftest 增加一条断言，
+#       逐一比对"源码里真正引用的 PySide6 子模块"与 spec 的 excludes。
+VERSION = "1.0.6"
 VERSION_LABEL = f"v{VERSION}"
 APP_NAME = "Yuhub"

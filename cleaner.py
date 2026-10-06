@@ -183,15 +183,6 @@ def measure(path, max_seconds=2.5) -> int:
 # 规则定义
 # ---------------------------------------------------------------------------
 @dataclass
-class CleanTarget:
-    """一条可清理的具体路径（展开通配后的实例）。"""
-
-    path: str
-    kind: str = "dir"        # dir | file | glob
-    note: str = ""
-
-
-@dataclass
 class CleanRule:
     """一条可勾选的清理项。"""
 
@@ -201,7 +192,7 @@ class CleanRule:
     group: str
     level: int = 2           # 0=有风险/需谨慎, 1=轻微风险, 2=安全, 3=非常安全
     admin: bool = False      # 是否需要管理员
-    targets: list = field(default_factory=list)   # list[CleanTarget] 或可调用对象
+    targets: list = field(default_factory=list)   # 具体目标（展开后的路径）或可调用对象
     # 运行期状态
     size: int = 0
     file_count: int = 0
@@ -766,32 +757,11 @@ def _rm_entry(path: str) -> tuple[int, int]:
     return _rm_path(path), size
 
 
-def _empty_dir(path: str) -> tuple[int, int]:
-    """清空目录内容但保留目录本身，返回 (删除成功数, 失败数)。
-
-    注意：某些环境会静默拦截删除（os.remove 不报错但文件仍在），
-    故 _rm_path 会复查存在性，这里据其返回值统计。
-    """
-    ok = fail = 0
-    try:
-        entries = os.listdir(path)
-    except OSError:
-        return 0, 1
-    for name in entries:
-        child = os.path.join(path, name)
-        if _rm_path(child):
-            ok += 1
-        else:
-            fail += 1
-    return ok, fail
-
-
 def _empty_dir_stats(path: str) -> tuple[int, int, int]:
     """清空目录内容，返回 (成功数, 失败数, 被删对象体积合计)。
 
-    与 `_empty_dir` 的区别：额外统计**真实删除的字节数**，
-    用于给出可信的「已清理体积」，而不必依赖磁盘可用空间读数
-    （实测部分环境下删除文件后可用空间读数不会回升）。
+    统计**真实删除的字节数**，用于给出可信的「已清理体积」，而不必依赖磁盘
+    可用空间读数（实测部分环境下删除文件后可用空间读数不会回升）。
     """
     ok = fail = 0
     total = 0

@@ -271,34 +271,6 @@ def _norm(path):
     return p.rstrip("\\").lower()
 
 
-def _registry_value(hive, subkey, name, default=None):
-    """读一个注册表值，任何异常都返回 default。"""
-    try:
-        with winreg.OpenKey(hive, subkey) as k:
-            v, _ = winreg.QueryValueEx(k, name)
-            return v
-    except OSError:
-        return default
-
-
-def _enum_values(hive, subkey):
-    """枚举一个键的全部值 → dict。"""
-    out = {}
-    try:
-        with winreg.OpenKey(hive, subkey) as k:
-            i = 0
-            while True:
-                try:
-                    n, v, _ = winreg.EnumValue(k, i)
-                    i += 1
-                    out[n] = v
-                except OSError:
-                    break
-    except OSError:
-        pass
-    return out
-
-
 def _dir_size(path, budget=4.0):
     """递归统计目录体积（带时间预算，超时返回已统计值）。
 
@@ -2176,25 +2148,6 @@ def _delete_file(path):
         # 登记成功 != 马上消失，但重启后会被系统清掉，算处理完成
         return True, "已标记重启后删除"
     return False, err
-
-
-def verify_removed(items):
-    """清理后复核：统计仍有几项存在。返回 (剩余数, 检查总数)。"""
-    left = 0
-    n = 0
-    for it in items:
-        if not it.checked:
-            continue
-        n += 1
-        if it.kind == "reg":
-            try:
-                winreg.CloseKey(winreg.OpenKey(it.hive_handle, it.subkey))
-                left += 1
-            except OSError:
-                pass
-        elif os.path.exists(it.path):
-            left += 1
-    return left, n
 
 
 # ---------------------------------------------------------------------------

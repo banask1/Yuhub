@@ -874,6 +874,3 @@ BUS_TYPE = {1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "IEEE1394", 5: "SSA", 6: "光纤
             13: "MMC", 14: "虚拟", 15: "文件支持", 16: "存储空间", 17: "NVMe",
             18: "SCM", 19: "UFS"}
 
-
-def describe_media(mediatype):
-    return {3: "HDD（机械硬盘）", 4: "SSD（固态硬盘）", 5: "SCM"}.get(mediatype, "未知")

@@ -779,6 +779,46 @@ class _PageHost(QWidget):
         lay.addWidget(page)
 
 
+class _LazyPages(dict):
+    """惰性页面表：**首次被访问**时才真正构造那一页。
+
+    为什么：九个页面在启动时全量构造要 ~21MB 常驻内存 + ~110ms 构建时间，
+    而用户一次只看一页。改成惰性后启动只建首页（首屏要显示的那一页），
+    其余等你点进去才建 —— 单页构建 3~20ms，被 300ms 的切页动画完全盖住，
+    感知不到；没访问过的页面则一分内存都不占。
+
+    做成 ``dict`` 子类而不是工厂函数，是为了**所有既有调用点都不用改**：
+    `switch_page` 的 `self._pages[key]`、自检里的 `win._pages["lan"]`
+    都会走 ``__missing__`` 自动触发构造。
+    """
+
+    def __init__(self, factories, on_create=None):
+        super().__init__()
+        self._factories = dict(factories)
+        self._on_create = on_create
+
+    def __missing__(self, key):
+        factory = self._factories.pop(key, None)
+        if factory is None:
+            raise KeyError(key)
+        page = factory()
+        dict.__setitem__(self, key, page)
+        if self._on_create is not None:
+            self._on_create(key, page)
+        return page
+
+    def get(self, key, default=None):
+        """``dict.get`` 不会走 ``__missing__`` —— 这里补齐，行为与 ``[]`` 一致。"""
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def knows(self, key):
+        """这个键是否已被构造**或**还有工厂可以构造（判断"页面存不存在"用）。"""
+        return key in self._factories or dict.__contains__(self, key)
+
+
 class MainWindow(QWidget):
     def __init__(self, start_minimized=False, parent=None):
         super().__init__(parent)
@@ -1117,19 +1157,22 @@ class MainWindow(QWidget):
                      max(4, g.height() - PILL_INSET_Y - PILL_INSET_Y))
 
     def _build_pages(self):
-        def make(page_cls):
-            return page_cls(notify=self.notify)
+        """登记九个页面 —— 但**此刻一页都不建**（见 _LazyPages）。
 
-        self._pages = {
-            "home": make(HomePage),
-            "cleaner": make(CleanerPage),
-            "memory": make(MemoryPage),
-            "uninstall": make(UninstallPage),
-            "download": make(DownloadPage),
-            "share": make(SharePage),
-            "lan": make(LanPage),
-            "accel": make(AccelPage),
-            "settings": SettingsPage(
+        只有首页会被立刻构造（首屏就要显示，而且它的「快速跳转」信号要接）。
+        其余页面在第一次切换过去时由 _LazyPages.__missing__ 现场构造，
+        构造完由 _on_page_created 包上 host 挂进堆栈。
+        """
+        self._pages = _LazyPages({
+            "home": lambda: HomePage(notify=self.notify),
+            "cleaner": lambda: CleanerPage(notify=self.notify),
+            "memory": lambda: MemoryPage(notify=self.notify),
+            "uninstall": lambda: UninstallPage(notify=self.notify),
+            "download": lambda: DownloadPage(notify=self.notify),
+            "share": lambda: SharePage(notify=self.notify),
+            "lan": lambda: LanPage(notify=self.notify),
+            "accel": lambda: AccelPage(notify=self.notify),
+            "settings": lambda: SettingsPage(
                 notify=self.notify,
                 theme_setting=self.theme_setting,
                 on_theme_change=self.set_theme_setting,
@@ -1142,16 +1185,23 @@ class MainWindow(QWidget):
                 on_close_to_tray_change=self.set_close_to_tray,
                 tray_available=self.tray_available,
             ),
-        }
-        # 每页套一层 host：切页时动 host 的 pos 做"弹入"。
-        # （为什么不能直接动页面自己的 pos，见 _PageHost 的说明。）
-        for key, page in self._pages.items():
-            host = _PageHost(page)
-            self._hosts[key] = host
-            self.stack.addWidget(host)
+        }, on_create=self._on_page_created)
 
+        # 首页立即就绪（_build_ui 末尾会 switch_page("home")）
         self._pages["home"].navigate.connect(self.switch_page)
         self._apply_keyboard_focus()
+
+    def _on_page_created(self, key, page):
+        """某个页面**第一次**被构造出来时：包 host、挂堆栈、补键盘焦点环。"""
+        host = _PageHost(page)
+        self._hosts[key] = host
+        self.stack.addWidget(host)
+        # 键盘焦点环：只有 Tab 进来才拿焦点（否则鼠标点过的按钮会一直亮着
+        # 主题色描边，看起来像"选中了"）。窗口级那次遍历覆盖不到尚未创建的
+        # 页面，所以每建一页就补一次 —— 限定在本页内，代价可以忽略。
+        for cls in (QPushButton, QCheckBox):
+            for w in page.findChildren(cls):
+                kb_focus(w)
 
     def _apply_keyboard_focus(self):
         """全窗按钮 / 复选框统一改成「只有 Tab 进来才拿焦点」。
@@ -1334,9 +1384,12 @@ class MainWindow(QWidget):
                 pass
 
     def switch_page(self, key):
-        if key not in self._pages:
+        # 注意判据是 knows() 而不是 `key in self._pages` —— 惰性页面表里
+        # 尚未构造的键 `in` 是 False，用它判断会把「第一次切过去」直接吞掉，
+        # 页面永远建不出来。knows() 同时认"已构造"和"还有工厂"。
+        if not self._pages.knows(key):
             return
-        page = self._pages[key]
+        page = self._pages[key]         # ← 首次访问在这里现场构造
         host = self._hosts.get(key)
         if (key == getattr(self, "_current_nav", None)
                 and host is not None

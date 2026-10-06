@@ -546,7 +546,9 @@ class SettingsPage(BasePage):
         if not current:
             return (
                 "未开启。开启后将在登录 Windows 时自动启动，"
-                "并静默驻留系统托盘、不弹出主窗口。",
+                "并静默驻留系统托盘、不弹出主窗口。"
+                "Yuhub 以管理员身份运行，登录时由 Windows 请求一次"
+                "管理员权限（点「是」即通过）。",
                 False,
             )
         if autostart.same_program(current, autostart.launch_command()):

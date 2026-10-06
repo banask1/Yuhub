@@ -20,6 +20,16 @@
 #     Key being added: 'HTTP_PROXY'" (the sandbox exports both spellings, and
 #    .NET Framework's env dictionary is case-insensitive).
 $ErrorActionPreference = "Continue"
+
+# v1.0.6: Yuhub.exe now carries <requestedExecutionLevel level="requireAdministrator">.
+# Without this, every suite below would pop its own UAC dialog (10 prompts), and
+# Start-Process -Verb RunAs is rejected by the command validator in this
+# environment. __COMPAT_LAYER=RunAsInvoker makes Windows ignore the manifest and
+# run the exe with the invoker's token -- no prompt. The selftests do not need
+# admin: --*-selftest makes main.py redirect every hosts / backup / intent / map
+# path into %TEMP%\yuhub_selftest_iso_<pid> before anything else runs.
+$env:__COMPAT_LAYER = "RunAsInvoker"
+
 $exe = Join-Path $PSScriptRoot "Yuhub.exe"
 Set-Location $PSScriptRoot
 
