@@ -1,15 +1,16 @@
 """生成 Yuhub 应用图标 app.ico。
 
-图标源：`resources/app_source.png`（锦鲤 + 祥云，蓝紫粉渐变）。
+图标源：`resources/app_source_alpha.png`（透明底：两条墨鱼），
+没有则退回 `resources/app_source.png`（白底，自动抠白）。
 
 做法要点：
-  * 源图直接缩放成多尺寸 ICO。**不要自己再画圆角遮罩** ——
-    源图本身就是"圆角方形放在白底上"，抠掉白底即可；
-    原逻辑那套"渐变底 + Y 字母"在换成插画后会显得脏。
-  * 源图是白底不是透明底，所以要先做**白底抠透明**，
-    否则任务栏/开始菜单的图标会带一圈白框（深色主题下格外明显）。
-  * 抠底用"从四角洪水填充"而不是"把接近白的都变透明"：
-    后者会把锦鲤身体里的白色高光也一起抠掉，图案会出现空洞。
+  * **等比缩放，绝不拉伸**。插画是"两条鱼"的横幅（约 2.95:1），
+    直接 resize 成正方形会把鱼压扁拉长——2026-10-12 用户报的
+    "图标被过度拉伸"就是这么来的。做法：按内容裁齐 → 按长边
+    等比缩到方形画布内 → 居中留白，多余部分保持**透明**。
+  * 白底源图要先做**白底抠透明**，否则任务栏/开始菜单会带一圈
+    白框（深色主题下格外明显）；用"从四边洪水填充"而不是
+    "把接近白的都变透明"——后者会把鱼身里的高光也抠出洞。
 """
 
 import os
@@ -17,16 +18,23 @@ import sys
 
 from PIL import Image
 
-# 尺寸集：Windows 图标实际会用到的大小，16/24/32 是任务栏与列表视图
+# 尺寸集：Windows 图标实际会用到的所有大小，16/24/32 是任务栏与列表视图
 SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64),
          (128, 128), (256, 256)]
 
 
+def _has_alpha(im):
+    """图片是否自带透明通道（有就直接用，不必抠白）。"""
+    if im.mode in ("RGBA", "LA"):
+        return True
+    return im.mode == "P" and "transparency" in im.info
+
+
 def _white_to_alpha(im, tolerance=18):
-    """把与四角相连的白色背景变透明（保留图案内部的白色）。
+    """把与四边相连的白色背景变透明（保留图案内部的白色）。
 
     用扫描线式的洪水填充（BFS），从四条边所有"接近白"的像素出发，
-    只清除**与边缘连通**的白；被图案包住的白（锦鲤的高光）不会被动到。
+    只清除**与边缘连通**的白；被图案包住的白（鱼身高光）不会被动到。
     """
     im = im.convert("RGBA")
     w, h = im.size
@@ -67,50 +75,58 @@ def _white_to_alpha(im, tolerance=18):
     return im
 
 
-def _trim_to_content(im, pad_ratio=0.0):
-    """按不透明区域裁掉多余空白，让图案在图标里占满。"""
+def _fit_square(im, side, margin=0.05):
+    """按**原始宽高比**等比缩放，居中放进 side×side 透明画布。
+
+    ⚠️ 绝不能直接 resize 成正方形：源图是 2.95:1 的横幅，硬拉成
+    正方形就是"鱼被压扁拉长"的元凶。这里先按内容裁齐，再按**长边**
+    等比缩放，四周留 margin 比例的空白，其余区域保持透明。
+    """
     bbox = im.getbbox()
-    if not bbox:
-        return im
-    im = im.crop(bbox)
-    if pad_ratio > 0:
-        w, h = im.size
-        side = max(w, h)
-        canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-        canvas.paste(im, ((side - w) // 2, (side - h) // 2), im)
-        im = canvas
-    return im
+    if bbox:
+        im = im.crop(bbox)
+    w, h = im.size
+    if w <= 0 or h <= 0:
+        return Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    inner = max(1, int(round(side * (1.0 - 2.0 * margin))))
+    k = min(inner / float(w), inner / float(h))
+    nw, nh = max(1, int(round(w * k))), max(1, int(round(h * k)))
+    im = im.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(im, ((side - nw) // 2, (side - nh) // 2), im)
+    return canvas
 
 
 def _load_source(here):
-    """找图标源图。优先 resources/app_source.png，其次项目根目录的 jpg。"""
-    cands = [
-        os.path.join(here, "resources", "app_source.png"),
-        os.path.join(here, "resources", "app_source.jpg"),
-    ]
-    for c in cands:
-        if os.path.isfile(c):
-            return Image.open(c)
-    return None
+    """取图标源：优先透明底的 app_source_alpha.png（直接用），
+    否则白底的 app_source.png / .jpg（调用方负责抠白）。"""
+    for name in ("app_source_alpha.png", "app_source.png",
+                 "app_source.jpg"):
+        path = os.path.join(here, "resources", name)
+        if os.path.isfile(path):
+            im = Image.open(path)
+            if _has_alpha(im):
+                return im.convert("RGBA"), "alpha"
+            return im, "white"
+    return None, None
 
 
 def make_icon(path):
     here = os.path.dirname(os.path.abspath(__file__))
-    src = _load_source(here)
+    src, kind = _load_source(here)
     if src is None:
-        print("!! 找不到图标源图 resources/app_source.png", file=sys.stderr)
+        print("!! 找不到图标源图 resources/app_source_alpha.png",
+              file=sys.stderr)
         print("   请把插画另存为该路径后重试；本次保留原有 app.ico。",
               file=sys.stderr)
         return False
 
-    img = _white_to_alpha(src, tolerance=20)
-    img = _trim_to_content(img, pad_ratio=0.0)
-
-    # 缩放到 256（ICO 最大尺寸），用 LANCZOS 保证小尺寸下线条不糊
-    img = img.resize((256, 256), Image.LANCZOS)
+    img = src if kind == "alpha" else _white_to_alpha(src, tolerance=20)
+    # 等比缩放进 256 方形画布（透明留白，不拉伸）
+    img = _fit_square(img, 256, margin=0.05)
 
     img.save(path, format="ICO", sizes=SIZES)
-    print(f"icon saved -> {path}  (源图 {src.size[0]}x{src.size[1]})")
+    print(f"icon saved -> {path}  (源图 {src.size[0]}x{src.size[1]}, {kind})")
     return True
 
 
