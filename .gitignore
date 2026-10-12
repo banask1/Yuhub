@@ -50,3 +50,12 @@ desktop.ini
 _st_*.json
 _backup_*.exe
 _*.exe
+
+# ---- 加速框架（C# / .NET 子工程）：只入库源码，构建产物不入库 ----
+accel-framework/bin/
+accel-framework/obj/
+accel-framework/out/
+accel-framework/*.log
+
+# ---- 本地工作目录（开发日志 / 调试截图 / Dism++ 源数据）：不入库 ----
+.workbuddy/

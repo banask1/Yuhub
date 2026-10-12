@@ -12,6 +12,7 @@ UAC 提权 + 独立 watchdog 进程 + 虚拟网卡轮询，**外部脚本没法�
 """
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -227,9 +228,87 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
     #    用户看到的现象就是"一直显示正在启动"，所以这条必须有。
     _check_ui_state(result, mark)
 
+    # ⑧ 链路参数与链路诊断（2026-10-11：异地分屏只有 4fps 的修复）
+    _check_link_args(etier, mark)
+
     result["ok"] = all(c["pass"] for c in result["checks"])
     _dump(result, out_file)
     return 0 if result["ok"] else 1
+
+
+def _check_link_args(etier, mark):
+    """守着"P2P 直连的前提"与链路诊断的解析。
+
+    🔴 回归背景：启动参数里曾有 `--no-listener`（官方含义：不监听任何端口、
+    只连出去）。双方都不监听时 P2P 直连没有打洞落点，流量只能走公共中继
+    —— 社区节点被共享限速，实测有效吞吐约 3.6Mbps，对应分屏 4fps。
+    所以这里把三条钉死：**不许再出现 --no-listener**、**必须有监听端口**、
+    **必须开多线程与 KCP 代理**（都是不加服务器就能提吞吐的手段）。
+    """
+    try:
+        args = etier.core_args("yuhub-check", "secret",
+                               hostname="Nick",
+                               servers=("tcp://public.easytier.cn:11010",))
+    except Exception as exc:                                    # noqa: BLE001
+        mark("core_args 能组装出来", False, repr(exc))
+        return
+
+    mark("★ 启动参数里不许再出现 --no-listener（它是 P2P 直连失效的根因）",
+         "--no-listener" not in args, args)
+    listeners = [args[i + 1] for i, a in enumerate(args) if a == "-l"]
+    mark("★ 必须显式监听固定端口（UDP+TCP，打洞的前提）",
+         any(x.startswith("udp://") for x in listeners)
+         and any(x.startswith("tcp://") for x in listeners)
+         and str(etier.LISTEN_PORT) in " ".join(listeners), listeners)
+    mark("★ 必须开多线程（官方默认单线程＝隧道吞吐天花板）",
+         "--multi-thread-count" in args
+         and int(args[args.index("--multi-thread-count") + 1]) > 2
+         and "--multi-thread" in args, args)
+    mark("★ 必须开 KCP 代理（官方：提高 UDP 丢包网络上的吞吐）",
+         "--enable-kcp-proxy" in args
+         and args[args.index("--enable-kcp-proxy") + 1] == "true", args)
+    mark("仍然保留局域网广播转发（游戏房间发现靠它）",
+         "--enable-udp-broadcast-relay" in args, args)
+    mark("让 EasyTier 自己写日志（链路诊断的数据源，省掉 easytier-cli.exe）",
+         "--file-log-level" in args and "--file-log-dir" in args, args)
+
+    # ---- 链路诊断的解析：拿合成日志验，不依赖真实房间 ----
+    import tempfile
+
+    saved = etier.log_dir
+    tmp = tempfile.mkdtemp(prefix="yuhub_linkdiag_")
+    try:
+        etier.log_dir = lambda: tmp
+        fake = (
+            "2026-10-11T19:00:00 INFO easytier::connector::tcp_hole_punch: "
+            "tcp hole punch client start\n"
+            "2026-10-11T19:00:01 INFO easytier::peers::peer_ospf_route: "
+            "connect to peer error dst=tcp://relay.example:11010\n"
+            "2026-10-11T19:00:02 INFO CORE::INSTANCE: using relay for peer 42\n"
+            "2026-10-11T19:00:03 DEBUG noise line that should be ignored\n"
+        )
+        with open(os.path.join(tmp, "easytier.log"), "w",
+                  encoding="utf-8") as f:
+            f.write(fake)
+        info = etier.link_diagnostics()
+        mark("★ 链路诊断能识别打洞行", bool(info["punch"]), info["punch"][:1])
+        mark("★ 链路诊断能识别中继行", bool(info["relay"]), info["relay"][:1])
+        mark("★ 链路诊断能识别连接错误行", bool(info["error"]), info["error"][:1])
+        mark("无关行不会混进诊断结果",
+             all("noise" not in x for x in
+                 info["punch"] + info["relay"] + info["error"]), info)
+        # 空目录要如实返回空，而不是假装一切正常
+        etier.log_dir = lambda: os.path.join(tmp, "nope")
+        empty = etier.link_diagnostics()
+        mark("读不到日志时如实返回空（不把「没读到」当成「没问题」）",
+             not empty["punch"] and not empty["relay"] and not empty["error"],
+             empty)
+    except Exception as exc:                                    # noqa: BLE001
+        mark("链路诊断解析", False, repr(exc))
+    finally:
+        etier.log_dir = saved
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _check_nick_beacon(etier_mod, ip, mark):
@@ -544,6 +623,10 @@ def _check_share_live(page, mark, app):
 
     page._share_remote = {"10.126.126.9": [dict(remote_row)]}
     page._tracker.rows = []
+    # 真退出 = 广播停了：信标条目过期（15 秒新鲜期）+ 跟踪器也没他。
+    # ⚠️ 不能只清跟踪器——信标还新鲜的队友是"ARP 没生成条目、但人确实
+    #    在房间里"（用户实测"看不到好友"的那个场景），那时撤行才是 bug。
+    beacon._peers["10.126.126.9"]["until"] = time.monotonic() - 1
     page._share_watch()
     mark("★ 分享者退出房间 -> 他的文件行当场从列表撤下",
          "10.126.126.9" not in page._share_remote, page._share_remote)
@@ -882,6 +965,8 @@ def _check_join_validation(page, mark):
     mark("进入房间有明确日志", joined_log, "log 含「已进入房间」=%s" % joined_log)
 
     _check_member_tracker(page, mark)
+    _check_member_discovery(page, mark)
+    _check_core_feed(page, mark)
 
     # 收尾：停掉后台线程，别让信标/跟踪器留着轮询
     page._stop_room_threads()
@@ -940,6 +1025,293 @@ def _check_member_tracker(page, mark):
          "confirmed刷新=%s fail=%d"
          % (tr._peers["10.126.126.9"]["confirmed"] > time.monotonic() - 5,
             tr._peers["10.126.126.9"]["ping_fail"]))
+
+
+def _check_member_discovery(page, mark):
+    """成员发现：ARP 之外的第二条到场信号（信标新鲜表）。
+
+    🔴 回归背景（用户实测的两个症状）：
+       * "在线成员的列表看不到好友"；
+       * "好友在联机房间里往临时云盘放文件，我看不到"。
+    根因是成员发现只认 `arp -a`：
+       * ARP 条目要**本机先有出站流量**才生成——刚进房时谁也不认识谁，
+         只 ping 已知成员 = 新成员永远进不了列表；
+       * 条目会随时间老化，而 ping 要对方应答 ICMP（wintun 网卡默认被
+         归为「公用网络」，入站 ICMP 默认被 Windows 防火墙拦着）。
+    云盘轮询的 peer 列表又来自 MemberTracker：跟踪器看不见人，文件就永远
+    拉不回来。修复：信标广播（入站 UDP、按端口放行、每 3 秒一轮）作为第二条
+    到场信号接进跟踪器；云盘的"在线"判定改「跟踪器 ∪ 信标」。
+    """
+    import etier as etier_mod
+
+    # ---- 引擎层：信标新鲜的 IP 能进列表，且 ping 全失败也不误删 ----
+    hint_ips = {"10.126.126.9"}
+    real_list, real_probe = etier_mod.list_members, etier_mod.probe_host
+    etier_mod.list_members = lambda my_ip="": []          # 模拟"ARP 还没有他"
+    etier_mod.probe_host = lambda ip, timeout=2.0, attempts=2: False
+    try:
+        tr = etier_mod.MemberTracker(
+            "10.126.126.7",
+            name_lookup=lambda ip: {"name": "队友"},
+            alive_hints=(lambda: iter(hint_ips),))
+        tr._round()
+        snap = [m["ip"] for m in tr.snapshot()]
+        mark("★ 信标新鲜的 IP 能进成员列表（不等 ARP 生成条目）",
+             "10.126.126.9" in snap, snap)
+
+        # 信标还新鲜 → 连续 ping 失败也不判离线（ICMP 被防火墙挡着时靠这个）
+        tr._peers["10.126.126.9"]["confirmed"] = time.monotonic() - 60.0
+        for _ in range(6):
+            tr._on_ping_result("10.126.126.9", False)
+        tr._round()
+        tr._sweep()
+        mark("★ 信标新鲜时 ping 全失败也不误判离线（ICMP 被拦的场景）",
+             "10.126.126.9" in [m["ip"] for m in tr.snapshot()],
+             [m["ip"] for m in tr.snapshot()])
+
+        # 信标过期 + ping 不通 → 正常判离线（不能永远挂着）。
+        # 注意要跑满 4 轮：离线判定是"连续 4 次 ping 失败 + 超过宽限"，
+        # 真实系统里这是 4×3 秒。
+        hint_ips.clear()
+        tr._peers["10.126.126.9"]["confirmed"] = time.monotonic() - 60.0
+        for _ in range(4):
+            tr._round()
+        tr._sweep()
+        mark("信标过期且 ping 不通 -> 正常判离线（不会永远挂着）",
+             "10.126.126.9" not in [m["ip"] for m in tr.snapshot()],
+             [m["ip"] for m in tr.snapshot()])
+    finally:
+        etier_mod.list_members = real_list
+        etier_mod.probe_host = real_probe
+
+    # ---- 页面层：云盘的"在线"判定 ∪ 信标 ----
+    class _Hub:
+        running = True
+        port = 41777
+
+        def __init__(self):
+            self.calls = []
+
+        def collect(self, peers, timeout=0):
+            self.calls.append(list(peers))
+            return []
+
+    class _EmptyTracker:
+        def snapshot(self):
+            return []          # 跟踪器这一拍没有他（ARP 没生成条目）
+
+    hub = _Hub()
+    beacon = etier_mod.NickBeacon("10.126.126.5", "SelfNick")
+    beacon._peers["10.126.126.9"] = {
+        "info": {"name": "队友", "share": 41800, "srev": 3},
+        "until": time.monotonic() + 10}
+    page._hub = hub
+    page._running = True
+    page._refresh_paused = False
+    page._my_ip = "10.126.126.5"
+    page._tracker = _EmptyTracker()
+    page._beacon = beacon
+    page._share_remote = {}
+    page._share_seen = {}
+
+    alive = page._room_alive_ips()
+    mark("★ 云盘在场判定 = 跟踪器 ∪ 信标（跟踪器没有他也算在场）",
+         "10.126.126.9" in alive, sorted(alive))
+
+    page._poll_shares()
+    time.sleep(0.3)           # 轮询在工作线程里，给它跑完 collect 的时间
+    page._share_polling = False                # 不等事件循环，手动复位
+    mark("★ 信标新鲜但跟踪器没有的队友，云盘照样去拉他的清单",
+         bool(hub.calls)
+         and hub.calls[-1] == [{"ip": "10.126.126.9", "port": 41800}],
+         hub.calls)
+
+    # 他的文件行不该因为"跟踪器慢一拍"被撤掉（用户看到的就是一闪一闪）
+    page._share_remote = {"10.126.126.9": [{"id": "f1", "name": "x.zip",
+                                            "size": 1, "mtime": 1}]}
+    page._share_watch()
+    mark("★ 跟踪器慢一拍不会把队友的文件行撤掉（防一闪一闪）",
+         "10.126.126.9" in page._share_remote, page._share_remote)
+
+    # 收尾：把注入的状态撤掉，别影响后面的检查
+    page._hub = None
+    page._beacon = None
+    page._tracker = None
+    page._running = False
+    page._share_remote = {}
+    page._share_seen = {}
+
+
+def _check_core_feed(page, mark):
+    """权威成员表通道（easytier-cli → core 的管理 RPC）。
+
+    🔴 这一条是"看不到好友 / 好友云盘的文件看不到"的**根治**：ARP 与信标
+    都是旁路推断，而 core 内部有一张协议内的权威表（握手过的人在表里）。
+    自检要守住的四件事：
+      1. 解析要**宽容**——EasyTier 升版改字段时不能整块失效（这是最怕的
+         回归：接口一变，成员表整块消失而界面看不出原因）；
+      2. 缺 cli / core 没起时**静默降级**，不能抛异常、不能拦联机；
+      3. 三条到场信号是并集，质量数据只并进"已在表里"的成员；
+      4. 启动参数里 portal 端口必须显式指定（core 的 portal 绑定失败 =
+         core 直接退出，而官方默认的 15888 可能被用户自装的 EasyTier 占着）。
+    """
+    import json as _json
+
+    import etier as etier_mod
+
+    # ---- ① 解析：真实形状的 fixture（本机行 + 直连 + 中继 + 缺字段行）----
+    fixture = _json.dumps([
+        {"cidr": "10.126.126.5/24", "ipv4": "10.126.126.5", "hostname": "我",
+         "cost": "Local", "lat_ms": "-", "loss_rate": "-", "rx_bytes": "-",
+         "tx_bytes": "-", "tunnel_proto": "-", "nat_type": "Unknown",
+         "id": "111", "version": "2.6.4"},
+        {"cidr": "10.126.126.9/24", "ipv4": "10.126.126.9", "hostname": "队友甲",
+         "cost": "1", "lat_ms": "12.34", "loss_rate": "0.0%",
+         "rx_bytes": "1.5 MiB", "tx_bytes": "2.0 MiB", "tunnel_proto": "udp",
+         "nat_type": "PortRestricted", "id": "222", "version": "2.6.4"},
+        {"cidr": "10.126.126.11/24", "ipv4": "10.126.126.11",
+         "hostname": "队友乙", "cost": "2", "lat_ms": "208.50",
+         "loss_rate": "3.0%", "rx_bytes": "0 B", "tx_bytes": "0 B",
+         "tunnel_proto": "tcp", "nat_type": "Symmetric", "id": "333",
+         "version": "2.6.4"},
+        {"cidr": "10.126.126.99/24", "hostname": "没有 ipv4 的行", "cost": "1"},
+    ])
+    rows = etier_mod.parse_peer_list_json(fixture)
+    mark("★ 解析 peer list JSON：本机行 + 直连 + 中继 + 缺字段行（丢弃）",
+         isinstance(rows, list) and len(rows) == 3, rows)
+    if isinstance(rows, list) and len(rows) == 3:
+        me, direct, relayed = rows
+        mark("★ 直连/中继判定（cost 1 = 直连，2 = 未直连）",
+             me["relayed"] is False and direct["relayed"] is False
+             and relayed["relayed"] is True,
+             [(r["ipv4"], r["cost"], r["relayed"]) for r in rows])
+        mark("延迟是数字、丢包/隧道/NAT/主机名齐全",
+             direct["lat_ms"] == 12.34 and relayed["lat_ms"] == 208.5
+             and direct["loss_rate"] == "0.0%"
+             and direct["tunnel"] == "udp"
+             and direct["nat"] == "PortRestricted"
+             and direct["hostname"] == "队友甲",
+             direct)
+        mark("本机行（cost=Local）延迟是 None 而不是崩溃",
+             me["lat_ms"] is None and me["cost"] == "Local", me)
+
+    mark("非 JSON / 不是数组 → None（走降级，而不是抛异常）",
+         etier_mod.parse_peer_list_json("not json") is None
+         and etier_mod.parse_peer_list_json('{"a":1}') is None
+         and etier_mod.parse_peer_list_json("") is None)
+    mark("空数组 → 空列表（合法的\"房间里只有我\"）",
+         etier_mod.parse_peer_list_json("[]") == [])
+    # 多实例时 CLI 会包一层 {"instance_id","instance_name","result"}：
+    # 我们只起一个实例一般拿不到这种形态，但要能解开——多一层封装就整块
+    # 失效是最不该发生的失败模式。
+    wrapped = _json.dumps([
+        {"instance_id": "abc", "instance_name": "default",
+         "result": [{"ipv4": "10.126.126.9", "hostname": "队友甲",
+                     "cost": "1", "lat_ms": "5.00"}]}])
+    rows_w = etier_mod.parse_peer_list_json(wrapped)
+    mark("★ 多实例包装形态能被解开（result 里的行照常解析）",
+         isinstance(rows_w, list) and len(rows_w) == 1
+         and rows_w[0]["ipv4"] == "10.126.126.9"
+         and rows_w[0]["lat_ms"] == 5.0, rows_w)
+
+    # ---- ② 缺 cli：静默降级，不抛、不拦联机 ----
+    feed = etier_mod.CorePeerFeed(rpc_port=etier_mod.RPC_PORT)
+    feed._stop.set()          # 不真起线程，直接手工调一次
+    ok = feed._poll_once()
+    mark("★ 没有 easytier-cli 时不抛异常、available() 为假",
+         ok is False and feed.available() is False and feed.cli_missing(),
+         (ok, feed.available(), feed.cli_missing()))
+    mark("缺 cli 时快照为空（界面表现为\"没有链路质量\"，其余照常）",
+         feed.snapshot() == [] and feed.by_ip() == {}
+         and feed.quality_map() == {} and feed.hostname_of("10.0.0.1") == "")
+
+    # ---- ③ 有 cli：把 subprocess 打桩，跑真实的 _poll_once ----
+    real_cli, real_run = etier_mod.cli_path, subprocess.run
+    real_size, real_isfile = os.path.getsize, os.path.isfile
+    etier_mod.cli_path = lambda: __file__
+    os.path.getsize = lambda p: (10_000_000 if p == __file__ else real_size(p))
+    os.path.isfile = lambda p: True if p == __file__ else real_isfile(p)
+    captured = {}
+
+    def _fake_run(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=fixture, stderr="")
+
+    subprocess.run = _fake_run
+    try:
+        feed2 = etier_mod.CorePeerFeed(rpc_port=15899)
+        feed2._stop.set()
+        ok2 = feed2._poll_once()
+    finally:
+        etier_mod.cli_path, subprocess.run = real_cli, real_run
+        os.path.getsize, os.path.isfile = real_size, real_isfile
+    mark("★ 能跑通 CLI 并置位 available()", ok2 is True and feed2.available(),
+         (ok2, feed2.available()))
+    mark("★ 命令行参数正确（-p <port> -o json peer list）",
+         captured.get("cmd", [])[1:] == ["-p", "127.0.0.1:15899",
+                                         "-o", "json", "peer", "list"],
+         captured.get("cmd"))
+    by_ip = feed2.by_ip()
+    mark("by_ip / hostname_of / quality_map 都按 IP 索引",
+         "10.126.126.9" in by_ip
+         and feed2.hostname_of("10.126.126.9") == "队友甲"
+         and feed2.quality_map()["10.126.126.11"]["relayed"] is True,
+         (sorted(by_ip), feed2.hostname_of("10.126.126.9")))
+
+    # ---- ④ 跟踪器：质量并进快照；名字走 name_hint 兜底 ----
+    tr = etier_mod.MemberTracker(
+        "10.126.126.5",
+        name_lookup=lambda ip: {},               # 信标什么都没给
+        alive_hints=(lambda: feed2.by_ip().keys(),),
+        name_hint=feed2.hostname_of,
+        quality_hint=feed2.quality_map)
+    real_list, real_probe = etier_mod.list_members, etier_mod.probe_host
+    etier_mod.list_members = lambda my_ip="": []
+    etier_mod.probe_host = lambda ip, timeout=2.0, attempts=2: False
+    try:
+        tr._round()
+    finally:
+        etier_mod.list_members, etier_mod.probe_host = real_list, real_probe
+    snap = {m["ip"]: m for m in tr.snapshot()}
+    mark("★ core 表里的成员进了成员列表（含本机行被排除）",
+         "10.126.126.9" in snap and "10.126.126.5" not in snap, sorted(snap))
+    row = snap.get("10.126.126.9") or {}
+    mark("★ 延迟/丢包/隧道/NAT 并进成员记录（界面据此显示链路质量）",
+         row.get("lat_ms") == 12.34 and row.get("loss_rate") == "0.0%"
+         and row.get("tunnel") == "udp" and row.get("nat") == "PortRestricted",
+         row)
+    mark("★ 信标没给名字时用 core 的 hostname 兜底（= 用户昵称）",
+         row.get("name") == "队友甲", row.get("name"))
+    mark("中继标记并进快照（成员行据此显示「中继」贴片）",
+         (snap.get("10.126.126.11") or {}).get("relayed") is True,
+         (snap.get("10.126.126.11") or {}).get("relayed"))
+
+    # ---- ⑤ 启动参数：portal 端口必须显式指定，且避开官方默认口 ----
+    args = etier_mod.core_args("yuhub-check", "secret")
+    joined = " ".join(args)
+    mark("★ core 启动参数显式指定 rpc-portal（否则默认 15888 可能被占死）",
+         "--rpc-portal" in args
+         and "127.0.0.1:%d" % etier_mod.RPC_PORT in joined
+         and etier_mod.RPC_PORT != 15888,
+         [a for a in args if "rpc" in a or "127.0.0.1" in a])
+    mark("随包文件清单里有 easytier-cli.exe，且它是**可选件**",
+         "easytier-cli.exe" in etier_mod.BIN_NAMES
+         and "easytier-cli.exe" in etier_mod.OPTIONAL_BIN_NAMES,
+         etier_mod.BIN_NAMES)
+
+    # ---- ⑥ 端口探测：被占用的口要跳过 ----
+    import socket as _socket
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        busy = srv.getsockname()[1]
+        picked = etier_mod.pick_rpc_port(busy, tries=4)
+        mark("★ 端口探测会跳过已被占用的端口",
+             picked != busy and picked in range(busy, busy + 4),
+             (busy, picked))
+    finally:
+        srv.close()
 
 
 def _check_nickname(page, mark):

@@ -12,23 +12,26 @@
 异地联机（EasyTier）已经给了双方一个能互通的虚拟局域网，局域网模式下双方
 本来就在同一个路由器下。两条链路都只需要**一条 TCP 连接**。于是改成：
 
-    发送端 抓屏 → 缩放 → JPEG → 一条 TCP 流广播
-    接收端 收流 → 解成图片 → 显示
+    发送端 抓屏 → 缩放 → H.264 → 一条 TCP 流广播
+    接收端 收流 → 解码成图片 → 显示
 
 随包不再多任何一个二进制，界面也回到 Yuhub 自己的主题里。
 
 代价要说清楚：这条路子没有 WebRTC 的自适应码率，异地经中继时带宽有限，
-所以走"降分辨率 + 限帧率 + 画面没变就不重发"来省流量（见 `push`）。
+所以走"降码率 / 降分辨率 + 画面没变就不重发"来省流量（见 `push` 与页面里
+的 AdaptiveBitrate 闭环）。
 
 协议
 ----
-握手一行文本：   `YUHUB-SHARE/1 <观看码>\n`
+握手一行文本：   `YUHUB-SHARE/1 <观看码>[ h264]\n`
 服务端回一行：   `OK <主机名>\n`  或  `ERR <原因>\n`
 之后是二进制帧，每帧 17 字节头 + 负载（大端）：
 
-    b"YSH1" | type(1) | seq(4) | w(2) | h(2) | len(4)
-    type = 1  JPEG 帧（len = 负载长度）
-    type = 2  画面没变（心跳，len = 0）
+   b"YSH1" | type(1) | seq(4) | w(2) | h(2) | len(4)
+   type = 1  JPEG 帧（**2026-10-11 起发送端已删除，仅为兼容旧版而保留解析**）
+   type = 2  画面没变（心跳，len = 0）
+   type = 3  H.264 关键帧（Annex-B，前面重复了 SPS/PPS）
+   type = 4  H.264 差帧（Annex-B）
 
 一条连接只传"我的屏幕"，所以不做多路复用。
 """
@@ -55,8 +58,20 @@ MAGIC = b"YSH1"
 #: 用 ">"（大端标准尺寸）保证跨平台不会有对齐填充。
 HEADER = struct.Struct(">4sBIHHI")
 
-TYPE_FRAME = 1
-TYPE_IDLE = 2
+#: 帧类型。协议版本号**故意不升**：新增的类型号对旧版客户端是"未知类型"，
+#: 它会走自己的兜底分支（忽略该包）而不是整条流崩掉，所以新旧可以共存。
+#: 但**编码格式必须双方一致**：JPEG 编码已于 2026-10-11 从发送端删除，
+#: 观看端握手时不声明 h264 能力的（旧版客户端）会被直接回绝——没有
+#: "发送端改发 JPEG"这条兼容路了（见 ShareServer.offer 的 ERR codec）。
+TYPE_FRAME = 1        # JPEG 帧（旧协议遗留；发送端已不再产生，仅保留解析）
+TYPE_IDLE = 2         # 心跳/画面无变化
+TYPE_H264_KEY = 3     # H.264 关键帧（Annex-B，前面重复了 SPS/PPS）
+TYPE_H264 = 4         # H.264 差帧（Annex-B）
+
+#: 握手行里的能力声明：`YUHUB-SHARE/1 <token> h264`。
+#: 观看端带 `h264` 表示"我会解 H.264"，发送端才敢发 3/4 号包。
+#: 老客户端不带这个标记 → 握手即被回绝（ERR codec），请对方更新 Yuhub。
+CAP_H264 = "h264"
 
 #: 默认端口。固定下来是为了"异地联机"里能免输入——房间里的人只要知道
 #: 对方开了共享，直接连这个端口就行（观看码另算）。
@@ -69,27 +84,29 @@ MAX_VIEWERS = 8
 #: 握手行最长长度，防止有人往这里灌垃圾。
 MAX_HELLO = 256
 
-#: 画质挡位：(名称, 最长边, 帧率, JPEG 质量)。
+#: 画质挡位：(名称, 最长边, 目标码率(bit/s))。
 #:
-#: 帧率能开到 30，靠的是界面层把「抓屏」和「JPEG 编码」拆成两条线程：
-#: 实测抓屏 18.2ms、编码 12.3ms（1600px），串行只能跑 32.8fps（几乎没有
-#: 余量，系统稍一忙就掉帧）；流水线后吞吐取两者最大值 → 54~60fps，30 帧
-#: 才有真正的冗余。单纯把这里的数字改大是没用的，串行那条路撑不住。
-#:
-#: 带宽参考（桌面内容，实测量级）：流畅约 1.5MB/s、标准约 3.4MB/s、
-#: 清晰约 5.5MB/s、原画可到 9MB/s。异地经中继时上限通常只有几 MB/s，
-#: 所以异地共享建议停在「标准」；局域网随便选。
+#: 2026-10-11 第二次改版（用户要求）：**JPEG 编码模式已删除，只保留 H.264**。
+#: 挡位只描述"分辨率 + 起步码率"，帧率不设上限（抓屏能跑多快就多快），
+#: 自适应码率在目标上下浮动（ADAPT_MIN_RATIO ~ ADAPT_MAX_RATIO）。
 QUALITY_PRESETS = [
-    ("流畅", 1280, 20, 58),
-    ("标准", 1600, 30, 65),
-    ("清晰", 1920, 30, 72),
-    ("原画", 2560, 30, 78),
+    ("480p", 854, 1_000_000),
+    ("720p", 1280, 2_500_000),
+    ("1080p", 1920, 5_000_000),
 ]
 DEFAULT_QUALITY = 1
 
-#: 各挡位的带宽提示，界面拿来做 tooltip。数值是桌面内容的实测中位数，
-#: 换成游戏/视频会更高 —— 所以文案里写"约"。
-QUALITY_BANDWIDTH = ["约 1.5 MB/s", "约 3.4 MB/s", "约 5.5 MB/s", "约 9 MB/s"]
+#: 各挡位的带宽提示（界面 tooltip）。H.264 下的实测量级。
+QUALITY_BANDWIDTH = ["约 1 MB/s", "约 2.5 MB/s", "约 5 MB/s"]
+
+#: 自适应码率的可调范围（相对目标码率的比例）。
+#: 下探到 0.25 是因为"保帧率"优先：宁可画质糊一点，也不要 4fps。
+ADAPT_MIN_RATIO = 0.25
+ADAPT_MAX_RATIO = 1.6
+#: 采样窗口（秒）与判定阈值：低了就降，高了要**连续两次**才升（防抖）。
+ADAPT_WINDOW = 2.0
+ADAPT_DOWN_RATIO = 0.72
+ADAPT_UP_RATIO = 1.25
 
 #: 判定"这一帧和上一帧是不是同一个画面"时的采样步长（字节）。
 #:
@@ -105,11 +122,38 @@ SAMPLE_STEP = 4
 #: 采样终究是概率性的：万一漏掉了一处真实变化，观看端最多等这么久就
 #: 自己纠正回来，不会永久停在旧画面上。
 IDLE_REFRESH = 1.0
-
 #: 画面没变时，心跳的最小发送间隔（秒）。
-#: 心跳唯一的作用是"告诉对端我还活着"，30/s 是浪费：接收端判死要连续 3 次
-#: 超时（socket 超时 15 秒），2/s 已经绰绰有余。
+#: 心跳唯一的作用是"告诉对端我还活着"：30/s 是浪费，接收端连续 3 次超时才
+#: 判死（单次超时见 RECV_TIMEOUT），2/s 已经绰绰有余。
 HEARTBEAT_INTERVAL = 0.5
+
+#: 观看端的**单次** socket 超时（秒）。连续 3 次超时才判死，所以最坏 15 秒
+#: 就能发现"对方没了"。以前这里是 15 秒 × 3 = 45 秒：发送端崩溃/拔网线这类
+#: 没有 FIN 的断线，用户要盯着卡住的画面等 45 秒才看到断开提示。
+#: 不会误杀慢链路：发送端静止时每 0.5 秒一个心跳，而 `_recv_exact` 是分块
+#: 读的，只要单次 recv 能回来就不会触发超时（大帧在慢链路上是"多次小 recv"，
+#: 不是"一次大 recv"）。
+RECV_TIMEOUT = 5.0
+
+#: 判死前允许的连续超时次数。
+STALE_LIMIT = 3
+
+#: 给观看者连接的**发送**超时（秒）。
+#: 🔴 以前握手成功后是 `conn.settimeout(None)`，`sendall` 可以永久阻塞：
+#: 对端 TCP 窗口填满又不再排空（拔网线、中继断了、进程被挂起）时，那条观看
+#: 线程会永远卡在 sendall —— `alive` 一直为真、`on_died` 永不触发，界面上
+#: "N 人正在观看"再也降不下来，还白占一个观看名额。
+#: 给一个够大的上限（20 秒）：正常慢链路一帧也只要几百毫秒，只有真死了才超。
+VIEWER_SEND_TIMEOUT = 20.0
+
+#: 单帧负载的**硬上限**（字节）。用来挡异常/恶意帧头：
+#: 帧头里的 length 是 32 位，直接拿去 recv 的话，对方（或一个写坏的对端）
+#: 只要声明 4GB，客户端就会按 4GB 收 —— 内存爆掉或长时间卡死。
+#: 真实帧远小于它：2560px 原画质量约 1~2MB，留足余量取 32MB。
+MAX_PAYLOAD = 32 * 1024 * 1024
+
+#: 画面宽高的合理上限（像素）。同样用来挡坏帧头（见 MAX_PAYLOAD）。
+MAX_FRAME_EDGE = 16384
 
 
 def frame_signature(raw):
@@ -129,18 +173,35 @@ def frame_signature(raw):
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
+def _room_code_key(room_code):
+    """房间码归一化：**必须与「加入房间」和临时云盘完全一致**。
+
+    加入房间时送给 EasyTier 的名字是 `"yuhub-" + code.lower().replace(" ", "")`，
+    大小写与空格都不参与房间判定——`ABC123` 与 `abc 123` 是同一个房间。
+    观看码若直接吃原始输入，这两台机器就会算出不同的观看码、彼此都看不了，
+    而房间明明是通的（同一个 bug 用户在临时云盘上遇到过）。
+    """
+    return (room_code or "").strip().lower().replace(" ", "")
+
+
+def _room_password_key(password):
+    """密码归一化：去掉首尾看不见的空白（与加入房间一致）。"""
+    return (password or "").strip()
+
+
 def make_token(room_code, password):
     """由「房间码 + 密码」派生观看码。
 
-    刻意和 `lan_share.make_token` 保持同一口径：同一个房间的人算出来必然
-    一致（两边输入本来就要求完全相同），虚拟网外的请求拿不到这个值，因此
-    房间成员点「看屏幕」不需要手输观看码。
+    刻意和 `lan_share.make_token` 保持同一口径（含同一套归一化）：同一个
+    房间的人算出来必然一致，虚拟网外的请求拿不到这个值，因此房间成员点
+    「看屏幕」不需要手输观看码。
 
     为什么不去 import 那个函数：屏幕共享和临时云盘是两件独立的事，一个的
     改动不该悄悄改掉另一个的准入规则。两边口径一致这件事由自检守着
     （`screenshare_selftest` 里有一条专门断言两者结果相等）。
     """
-    raw = ("%s|%s" % (room_code or "", password or "")).encode("utf-8")
+    raw = ("%s|%s" % (_room_code_key(room_code),
+                      _room_password_key(password))).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
@@ -529,6 +590,107 @@ def _same_space(a, b):
     return True
 
 
+def screen_dc_scale():
+    """物理像素 → 屏幕 DC 坐标 的比例（1.0 = 两者一致）。
+
+    🔴 这是"只共享某个窗口抓错区域"的**另一个**根因（2026-10-11 自检抓到）：
+    GDI 的屏幕 DC 会被系统虚拟化（本机 125% 缩放下，2560 宽的屏幕在 DC 里是
+    2048），而 `GetWindowRect` / DWM 回的是**物理像素**。两者混用 → 窗口矩形是
+    物理像素、而 `GdiCapture` 的 StretchBlt 按虚拟化坐标抓 → 抓到旁边那块区域。
+
+    基准的选择很讲究（第一版用同一个 DC 上的 HORZRES/DESKTOPHORZRES 相比，
+    实测**不稳定**：同一个 exe 两次运行分别得出 1.0 和 0.8，取决于那一刻进程
+    的 DPI 感知状态）：
+      * 分子用 `list_screens()` 的并集宽度 —— 它与屏幕 DC 同空间
+        （EnumDisplayMonitors 与 StretchBlt 走同一套虚拟化规则，实测两处一致）；
+      * 分母用 `DESKTOPHORZRES(118)` —— 它是**始终物理**的真实分辨率。
+    两者之比就是该乘上去的系数，且与"这一刻进程感知与否"无关。
+    打包后的 exe 若最终是物理感知，两者相等 → 返回 1.0，行为与以前一致。
+    """
+    try:
+        screens = list_screens()
+        if not screens:
+            return 1.0
+        union_w = (max(s["x"] + s["w"] for s in screens)
+                   - min(s["x"] for s in screens))
+        u32 = ctypes.windll.user32
+        g32 = ctypes.windll.gdi32
+        hdc = u32.GetDC(0)
+        if not hdc:
+            return 1.0
+        try:
+            phys = int(g32.GetDeviceCaps(hdc, 118))       # DESKTOPHORZRES
+        finally:
+            u32.ReleaseDC(0, hdc)
+        if union_w <= 0 or phys <= 0 or abs(union_w - phys) < 2:
+            return 1.0
+        return union_w / float(phys)
+    except Exception:
+        return 1.0
+
+
+#: 常见的 DPI 缩放档。用来把"窗口矩形比显示器并集大出的比例"认出来。
+_DPI_SCALES = (1.25, 1.3333, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0)
+
+
+def _snap_scale(ratio):
+    for s in _DPI_SCALES:
+        if abs(ratio - s) < 0.03:
+            return s
+    return None
+
+
+def _to_screen_space(rect):
+    """把窗口矩形换算到**屏幕 DC 坐标系**（GdiCapture 实际使用的空间）。
+
+    ⚠️ 为什么不继续用 GetDeviceCaps 求缩放系数：它在"进程 DPI 感知状态发生过
+    变化"时会给出一对自相矛盾的值 —— 实测同一个 exe 两次运行，
+    `screen_dc_scale()` 分别得到 0.8 和 1.0，于是窗口矩形有时归一、有时不归一，
+    「共享某个窗口」就会**偶发**抓到旁边那块区域（自检里那条坐标系断言因此
+    时红时绿）。
+
+    改成**自校准**：拿窗口矩形和显示器并集直接比。窗口正常都在屏幕内，
+    一旦超出、且超出比例恰好是某个常见缩放档（1.25/1.5/2.0…），就说明两个
+    来源差了一个倍率，按比例归一回去即可。不依赖任何全局状态，也就不受
+    感知状态变化的影响。
+    """
+    screens = list_screens()
+    if not rect or not screens:
+        return rect
+    left = min(s["x"] for s in screens)
+    top = min(s["y"] for s in screens)
+    right = max(s["x"] + s["w"] for s in screens)
+    bottom = max(s["y"] + s["h"] for s in screens)
+    rx = rect[0] + rect[2]
+    ry = rect[1] + rect[3]
+    ratio_x = rx / float(right) if right > 0 and rx > right else 1.0
+    ratio_y = ry / float(bottom) if bottom > 0 and ry > bottom else 1.0
+    ratio = max(ratio_x, ratio_y)
+    if ratio <= 1.05:
+        return rect
+    scale = _snap_scale(ratio)
+    if scale is None:
+        return rect                      # 不是缩放档差异（窗口真被拖出屏幕）→ 不动
+    k = 1.0 / scale
+    return (int(round(rect[0] * k)), int(round(rect[1] * k)),
+            int(round(rect[2] * k)), int(round(rect[3] * k)))
+
+
+def window_minimized(hwnd):
+    """窗口当前是不是最小化状态。
+
+    为什么要单独判一下（用户会遇到的场景）：下拉列表**已经**滤掉了最小化的
+    窗口，但"共享中把窗口最小化"以前没人管 —— `window_rect` 照样返回坐标，
+    而最小化的窗口不在屏幕上绘制，于是 GDI 抓到的是**那块屏幕区域上的其它
+    内容**（通常是桌面）。对方看到的是"画面莫名其妙变成桌面了"，完全不知道
+    发生了什么。有了这个判据，抓屏端就能给出准确的说法。
+    """
+    try:
+        return bool(ctypes.windll.user32.IsIconic(hwnd))
+    except Exception:
+        return False
+
+
 def window_rect(hwnd):
     """窗口在**抓屏坐标系**里的矩形 (x, y, w, h)。拿不到返回 None。
 
@@ -539,11 +701,29 @@ def window_rect(hwnd):
       * 不感知的进程（源码态的 python.exe）：GDI 一路是**逻辑**像素（150%
         缩放下 2560 宽的屏幕报告成 1707），而 DWM **无论进程怎样**都回物理像素。
 
-    所以这里把两个来源对一下：量级一致就用 DWM 的更精确边界（没有 DWM 那圈
-    看不见的调整边框，抓出来不会多黑边）；量级差一个缩放倍率就退回
-    `GetWindowRect`，宁可多几像素黑边，也不能抓错地方。
+    做法分两层：
+      ① 两个来源（DWM / GetWindowRect）量级一致时取 DWM 的更精确边界（没有
+         那圈看不见的调整边框，抓出来不会多黑边）；量级不一致就退回
+         `GetWindowRect`。
+      ② 最后统一乘上 `screen_dc_scale()` —— 把物理像素换算回屏幕 DC 的坐标。
+         ⚠️ 这一层是 2026-10-11 补的：自检在 125% 缩放的机器上抓到
+         `list_screens()` 报 2048×1152（虚拟化）而这里报 2560×1380（物理），
+         两者混用就会"共享某个窗口时抓到旁边那块区域"。感知进程里该系数
+         恒为 1.0，行为与以前一致。
     """
     rect = _Rect()
+    # 最小化的窗口没有可抓的内容：返回 None 让上层按"内容不可用"处理，
+    # 而不是把窗口原来位置上的桌面内容当成它发出去（见 window_minimized）。
+    if window_minimized(hwnd):
+        return None
+
+    def _out(v):
+        # 统一归一到屏幕 DC 坐标系（见 _to_screen_space 的注释）
+        if v is None:
+            return None
+        fit = _to_screen_space(v)
+        return fit
+
     try:
         u32 = ctypes.windll.user32
         u32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(_Rect)]
@@ -565,12 +745,12 @@ def window_rect(hwnd):
                                      ctypes.sizeof(fb)) == 0:
             dr = (fb.left, fb.top, fb.right - fb.left, fb.bottom - fb.top)
             if gr is None:
-                return dr
+                return _out(dr)
             if _same_space(dr, gr):
-                return dr
+                return _out(dr)
     except Exception:
         pass
-    return gr
+    return _out(gr)
 
 
 class GdiCapture(object):
@@ -722,13 +902,16 @@ class _Viewer:
     发送端的 socket 缓冲区越积越多（那是内存泄漏的经典姿势）。
     """
 
-    def __init__(self, conn, addr, name, on_died=None):
+    def __init__(self, conn, addr, name, on_died=None, caps=()):
         self.conn = conn
         self.addr = addr
         self.name = name
+        self.caps = set(caps or ())     # 握手时声明的能力（如 h264）
         self.frames = 0
         self.bytes = 0
+        self.dropped = 0            # 被新帧顶掉的旧画面帧（链路吃不下当前帧率）
         self.alive = True
+        self.error = ""             # 退出原因（发送超时 / 对端关闭），诊断用
         self.on_died = on_died
         self._lock = threading.Lock()
         self._slot = None
@@ -754,6 +937,11 @@ class _Viewer:
         with self._lock:
             if (not is_frame and self._slot is not None and self._slot[1]):
                 return                        # 有画面帧还没发出去，心跳让位
+            # 统计"被新帧顶掉的旧画面帧"：这是判"链路不够"最直接的证据
+            # （画面帧还没发出去就被下一帧替换 = 这条连接吃不下当前帧率）。
+            # 只数画面帧，心跳被顶掉不算（它本来就没信息）。
+            if is_frame and self._slot is not None and self._slot[1]:
+                self.dropped += 1
             self._slot = (packet, is_frame)
         self._event.set()
 
@@ -795,6 +983,12 @@ class _Viewer:
             packet, is_frame = slot
             try:
                 self.conn.sendall(packet)
+            except socket.timeout:
+                # 发送超时 = 对端在 VIEWER_SEND_TIMEOUT 内一个字节都没收走。
+                # 记账后退出，让 on_died 把这条连接从名单里摘掉（否则界面上
+                # 会一直挂着"N 人正在观看"）。
+                self.error = "发送超时"
+                break
             except OSError:
                 break
             if is_frame:
@@ -833,7 +1027,34 @@ class ShareServer(object):
         self._accept_thread = None
         self._stop = threading.Event()
         self._seq = 0
-        self._last_frame = None
+        # 观看码错误计数：{ip: [次数, 首次时间]} —— 用于握手限速（见
+        # `_note_bad_token`）。只记在内存里、随共享结束消失。
+        self._bad_tokens = {}
+
+    # ------------------------------------------------------------------ 握手防爆破
+    def _note_bad_token(self, ip):
+        """记一次观看码错误，返回本次应当**延迟**的秒数（0 = 不延迟）。
+
+        为什么要限速：局域网模式的观看码是 6 位数字（100 万组合）、端口
+        固定 45890，而错误应答几乎是即时的 —— 同一网段的人可以在几分钟内
+        枚举完。延迟策略让每多试一次都要真的等，枚举从"几分钟"变成"几小时
+        以上"；前两次不加延迟，所以正常用户输错一两次毫无感觉。
+        """
+        now = time.monotonic()
+        with self._lock:
+            rec = self._bad_tokens.get(ip)
+            if rec is None or now - rec[1] > 300.0:      # 5 分钟窗口
+                rec = [0, now]
+            rec[0] += 1
+            self._bad_tokens[ip] = rec
+            # 顺手清理过期记录，避免被大量来源刷成内存泄漏
+            if len(self._bad_tokens) > 64:
+                self._bad_tokens = {k: v for k, v in self._bad_tokens.items()
+                                    if now - v[1] <= 300.0}
+            n = rec[0]
+        if n <= 2:
+            return 0.0
+        return min(1.5, 0.25 * (n - 2))
 
     # ------------------------------------------------------------------ 生命周期
     def start(self, bind_ip, port=DEFAULT_PORT, name=""):
@@ -860,7 +1081,6 @@ class ShareServer(object):
         self.port = sock.getsockname()[1]
         self.name = name or socket.gethostname()
         self._seq = 0
-        self._last_frame = None
         self.frames_sent = 0
         self.bytes_sent = 0
         self._stop.clear()
@@ -891,7 +1111,8 @@ class ShareServer(object):
             v.stop()
         for v in viewers:
             v.join(1.0)
-        self._last_frame = None
+        with self._lock:
+            self._bad_tokens.clear()
 
     @property
     def viewers(self):
@@ -903,37 +1124,50 @@ class ShareServer(object):
             return [v.label for v in self._viewers]
 
     def viewer_stats(self):
-        """[{label, frames, bytes}]，界面拿它显示"谁在看"。"""
+        """[{label, frames, bytes, dropped}]，界面拿它显示"谁在看"。
+
+        frames/bytes 是**送达口径**（`sendall` 成功之后才计数），而
+        `ShareServer.frames_sent` 是**投递口径**。两者一对比就知道瓶颈
+        是不是链路：投递 30 帧/秒而送达只有 4 帧/秒 = 链路不够。
+        """
         with self._lock:
-            return [{"label": v.label, "frames": v.frames, "bytes": v.bytes}
+            return [{"label": v.label, "frames": v.frames, "bytes": v.bytes,
+                     "dropped": v.dropped, "h264": CAP_H264 in v.caps}
                     for v in self._viewers]
 
-    # ------------------------------------------------------------------ 收发
-    def push(self, jpeg, w, h):
-        """投递一帧 JPEG。没有观看者时立刻返回（不白干活）。
+    def all_viewers_h264(self):
+        """是不是**所有**观看者都声明支持 H.264。
 
-        **画面没变就不重发**：JPEG 编码是确定性的，屏幕静止时编出来的字节
-        与上一帧逐字节相同。这时只发一个 17 字节的心跳头，观看端据此知道
-        "连接还活着，画面就是没变"——异地走中继时这一条能省掉绝大部分流量
-        （看文档、看桌面时几乎为 0）。
+        JPEG 编码删除后，握手时就会把不声明 h264 的客户端挡掉，所以这个
+        方法在正常流程里恒为真。保留它作为**不变量自检**：万一将来又出现
+        "有人不懂 H.264 却连上了"，日志/自检能立刻发现，而不是让某个观众
+        对着黑屏发呆还查不出原因。
+        """
+        with self._lock:
+            return all(CAP_H264 in v.caps for v in self._viewers)
+
+    # ------------------------------------------------------------------ 收发
+    def push(self, payload, w, h, kind="h264"):
+        """投递一帧。没有观看者时立刻返回（不白干活）。
+
+        kind（2026-10-11 起 JPEG 编码模式已删除，只有这三种）：
+          * `"h264"` / `"h264_key"` —— H.264 差帧/关键帧（Annex-B）。
+            "画面没变"由**编码线程**用采样签名判定后改发心跳，这里永远是真帧。
+          * `"idle"` —— 心跳（抓屏失败保活、画面静止时由页面编码线程发）。
         """
         with self._lock:
             viewers = list(self._viewers)
         if not viewers:
             return False
         self._seq = (self._seq + 1) & 0xFFFFFFFF
-        if jpeg is not None and jpeg == self._last_frame:
+        if kind == "idle":
             packet = HEADER.pack(MAGIC, TYPE_IDLE, self._seq, w, h, 0)
             is_frame = False
         else:
-            if jpeg is None:
-                packet = HEADER.pack(MAGIC, TYPE_IDLE, self._seq, w, h, 0)
-                is_frame = False
-            else:
-                self._last_frame = jpeg
-                packet = HEADER.pack(MAGIC, TYPE_FRAME, self._seq, w, h,
-                                     len(jpeg)) + jpeg
-                is_frame = True
+            typ = TYPE_H264_KEY if kind == "h264_key" else TYPE_H264
+            packet = HEADER.pack(MAGIC, typ, self._seq, w, h,
+                                 len(payload or b"")) + (payload or b"")
+            is_frame = True
         if is_frame:
             self.frames_sent += 1
         self.bytes_sent += len(packet)
@@ -1001,11 +1235,31 @@ class ShareServer(object):
             _safe_send(conn, b"ERR protocol\n")
             conn.close()
             return
-        got = parts[1].strip()
+        bits = parts[1].split()
+        got = bits[0] if bits else ""
+        caps = set(bits[1:])
         if not self.token or not hmac.compare_digest(got, self.token):
+            delay = self._note_bad_token(addr[0])
+            if delay:
+                # 局域网观看码只有 6 位数字（100 万组合）、端口还是固定的，
+                # 不减速的话同网段几分钟就能枚举完。这里按失败次数**逐次
+                # 加长响应延迟**：攻击者每试一次都要真的等，枚举成本被拉高；
+                # 正常用户输错一两次完全感觉不到（前两次不加延迟）。
+                # 代价：这段 sleep 占着 accept 线程（一次最多约 1.5 秒）。
+                time.sleep(delay)
             _safe_send(conn, b"ERR token\n")
             conn.close()
             self.on_event("rejected", {"label": "%s:%d" % (addr[0], addr[1])})
+            return
+        if CAP_H264 not in caps:
+            # 2026-10-11：JPEG 编码模式已删除，共享**只发 H.264**。
+            # 不声明 h264 能力的客户端（旧版本）看不懂流，让它连上只会
+            # 得到一块黑屏 —— 与其如此，不如在握手阶段就明确拒绝，
+            # 观看端会给出"请更新"的准确提示（见 FrameClient 的错误映射）。
+            _safe_send(conn, b"ERR codec\n")
+            conn.close()
+            self.on_event("rejected", {"label": "%s:%d" % (addr[0], addr[1]),
+                                       "reason": "codec"})
             return
         with self._lock:
             full = len(self._viewers) >= MAX_VIEWERS
@@ -1014,12 +1268,15 @@ class ShareServer(object):
             conn.close()
             return
         _safe_send(conn, ("OK %s\n" % self.name).encode("utf-8"))
-        conn.settimeout(None)
+        # ⚠️ 这里**不能**是 settimeout(None)：见 VIEWER_SEND_TIMEOUT 的注释 ——
+        # 无超时的 sendall 会把观看线程永久卡死在半死连接上。
+        conn.settimeout(VIEWER_SEND_TIMEOUT)
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        viewer = _Viewer(conn, addr, self.name, on_died=self._on_viewer_died)
+        viewer = _Viewer(conn, addr, self.name, on_died=self._on_viewer_died,
+                         caps=caps)
         with self._lock:
             self._viewers.append(viewer)
         self.on_event("viewer_join", {"label": viewer.label,
@@ -1034,10 +1291,14 @@ class FrameClient(object):
     后台线程含糊地报出来。
     """
 
-    def __init__(self, host, port, token, on_frame, on_event=None, timeout=6.0):
+    def __init__(self, host, port, token, on_frame, on_event=None, timeout=6.0,
+                 caps=()):
         self.host = host
         self.port = int(port)
         self.token = token or ""
+        #: 声明给发送端的能力（如 ("h264",)）。发送端据此决定发 3/4 号包
+        #: 还是退回 JPEG —— 不带这个标记的老客户端天然只收到 JPEG。
+        self.caps = tuple(caps or ())
         self.on_frame = on_frame
         self.on_event = on_event or (lambda kind, payload: None)
         self.timeout = timeout
@@ -1071,7 +1332,10 @@ class FrameClient(object):
             return False, msg
         sock.settimeout(self.timeout)
         try:
-            sock.sendall(("%s %s\n" % (PROTOCOL, self.token)).encode("utf-8"))
+            hello = "%s %s" % (PROTOCOL, self.token)
+            if self.caps:
+                hello += " " + " ".join(self.caps)
+            sock.sendall((hello + "\n").encode("utf-8"))
             line = _recv_line(sock, MAX_HELLO)
         except OSError as exc:
             sock.close()
@@ -1093,6 +1357,9 @@ class FrameClient(object):
                 msg = "对方观看人数已满（上限 %d 人）" % MAX_VIEWERS
             elif reason == "protocol":
                 msg = "对方版本不匹配，双方都要升级到同一版 Yuhub"
+            elif reason == "codec":
+                msg = ("对方使用新版 H.264 编码，你的 Yuhub 版本过旧，"
+                       "请更新后再试")
             else:
                 msg = "对方拒绝了连接（%s）" % (reason or "未知原因")
             self.error = msg
@@ -1107,7 +1374,7 @@ class FrameClient(object):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        sock.settimeout(15.0)
+        sock.settimeout(RECV_TIMEOUT)
         self._sock = sock
         self.running = True
         self.error = ""
@@ -1149,9 +1416,10 @@ class FrameClient(object):
             except socket.timeout:
                 stale += 1
                 # 画面静止时发送端也会每帧发一个心跳，所以长时间收不到东西
-                # 就是真的断了。给足 3 次机会再判死，避免误杀网络抖动。
-                if stale >= 3:
-                    self.error = "连接已断开（长时间没有收到数据）"
+                # 就是真的断了。给足 STALE_LIMIT 次机会再判死，避免误杀抖动。
+                if stale >= STALE_LIMIT:
+                    self.error = ("连接已断开（%d 秒没有收到数据）"
+                                  % int(RECV_TIMEOUT * STALE_LIMIT))
                     break
                 continue
             except OSError as exc:
@@ -1165,6 +1433,18 @@ class FrameClient(object):
             if magic != MAGIC:
                 self.error = "数据流损坏（版本不匹配？）"
                 break
+            # ---- 帧头合法性校验（挡坏帧头，见 MAX_PAYLOAD 的注释）----
+            # 没有这几行的后果：对端声明 length = 4GB，`_recv_exact` 就会按
+            # 4GB 去收（内存爆掉 / 长时间卡死），而这里只校验了 magic。
+            if length > MAX_PAYLOAD:
+                self.error = ("数据异常（帧头声明 %s，超过上限 %s）"
+                              % (human_size(length), human_size(MAX_PAYLOAD)))
+                break
+            if typ == TYPE_FRAME and (w <= 0 or h <= 0
+                                      or w > MAX_FRAME_EDGE
+                                      or h > MAX_FRAME_EDGE):
+                self.error = "数据异常（画面尺寸 %dx%d 不合理）" % (w, h)
+                break
             payload = b""
             if length:
                 try:
@@ -1175,7 +1455,7 @@ class FrameClient(object):
                 if payload is None:
                     self.error = "对方结束了共享"
                     break
-            if typ == TYPE_FRAME:
+            if typ in (TYPE_FRAME, TYPE_H264, TYPE_H264_KEY):
                 self.frames += 1
             self.packets += 1
             self.bytes += len(head) + len(payload)
@@ -1224,6 +1504,151 @@ def _recv_line(sock, limit):
 # ---------------------------------------------------------------------------
 # 统计小工具（界面与自检共用，放这里免得两处各写一遍）
 # ---------------------------------------------------------------------------
+def human_size(n):
+    """字节数 → 可读文本（与 lan_share.human_size 同一口径）。"""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "--"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+# ---------------------------------------------------------------------------
+# 自适应码率
+# ---------------------------------------------------------------------------
+class AdaptiveBitrate(object):
+    """按实测**送达速率**调目标码率的闭环。
+
+    为什么需要它：MJPEG 每帧成本固定、没有码率旋钮，带宽不够时唯一的出口
+    就是掉帧（用户实测掉到 4fps）；H.264 有码率旋钮，能把"带宽不够"转成
+    "画质降一点、帧率保住"。这个类就是那个"测 → 判 → 调"的闭环。
+
+    输入（每秒喂一次，用**送达口径**——不是投递口径）：
+        delivered_bps  对端真正收到的字节/秒
+        delivered_fps  对端真正收到的帧率
+    输出 action：
+        "down"         已把码率目标调低（调用方让编码器 set_bitrate）
+        "preset_down"  已经压到下限还是不够 → 调用方应**降一档分辨率**
+        "up"           已把码率目标调高（带宽恢复）
+        None           保持
+
+    迟滞设计：降得快（一个窗口不达标就降），升得慢（连续两个窗口富余才升），
+    否则会在临界点来回抖，画面一会儿清一会儿糊。
+    """
+
+    def __init__(self, target_bps, min_ratio=ADAPT_MIN_RATIO,
+                 max_ratio=ADAPT_MAX_RATIO, window=ADAPT_WINDOW,
+                 down_ratio=ADAPT_DOWN_RATIO, up_ratio=ADAPT_UP_RATIO,
+                 log=None):
+        self.base = max(120_000, int(target_bps))
+        self.target = self.base
+        self.floor = int(self.base * float(min_ratio))
+        self.ceil = int(self.base * float(max_ratio))
+        self.window = float(window)
+        self.down_ratio = float(down_ratio)
+        self.up_ratio = float(up_ratio)
+        self._log = log or (lambda msg: None)
+        self._t0 = None
+        self._acc_bytes = 0
+        self._acc_frames = 0
+        self._samples = 0
+        self._up_streak = 0
+        # 诊断用（界面/自检可以读）
+        self.last_bps = 0.0
+        self.last_fps = 0.0
+        self.actions = 0
+
+    # ---------------------------------------------------------------- 内部
+    def _decide(self):
+        # ⚠️ 单位必须统一：喂进来的是**字节/秒**（socket 计数天然是字节），
+        # 而码率目标按惯例是**比特/秒**。第一版拿字节直接和比特比，
+        # 结果"链路明明富余"也被判成不够，一路把码率压到下限。
+        avg_bytes = self._acc_bytes / max(0.001, self.window)
+        avg_bits = avg_bytes * 8.0
+        fps = self._acc_frames / max(0.001, self.window)
+        self.last_bps, self.last_fps = avg_bytes, fps
+        if avg_bytes <= 0:
+            return None                      # 一个字节都没到：等下一窗口
+        if avg_bits < self.target * self.down_ratio:
+            self._up_streak = 0
+            if self.target > self.floor:
+                # 按实测能过的水平往下压（留 5% 余量），一步到位比慢慢试好：
+                # 用户等的是"画面别卡"，不是"慢慢收敛"
+                new = max(self.floor, int(avg_bits * 0.95))
+                if new < self.target:
+                    self._log("链路只有 %.2f MB/s，码率目标 %.2f → %.2f Mbps"
+                              % (avg_bytes / 1048576.0, self.target / 1e6,
+                                 new / 1e6))
+                    self.target = new
+                    self.actions += 1
+                    return "down"
+            # 已经在下限还是不行 → 该降分辨率了（调用方负责重建编码器）
+            if self.target <= self.floor \
+                    and avg_bits < self.floor * self.down_ratio:
+                self.actions += 1
+                return "preset_down"
+            return None
+        if avg_bits > self.target * self.up_ratio and self.target < self.ceil:
+            self._up_streak += 1
+            if self._up_streak < 2:           # 连续两个窗口富余才升，防抖
+                return None
+            self._up_streak = 0
+            new = min(self.ceil, int(self.target * 1.35))
+            if new > self.target:
+                self._log("链路已富余（%.2f MB/s），码率目标 %.2f → %.2f Mbps"
+                          % (avg_bytes / 1048576.0, self.target / 1e6,
+                             new / 1e6))
+                self.target = new
+                self.actions += 1
+                return "up"
+        else:
+            self._up_streak = 0
+        return None
+
+    # ---------------------------------------------------------------- 对外
+    def feed(self, delivered_bps, delivered_fps=0.0, now=None):
+        """喂一个采样点；窗口满了才做决策。返回 action（见类注释）。"""
+        now = time.monotonic() if now is None else float(now)
+        if self._t0 is None:
+            self._t0 = now
+        self._acc_bytes += max(0.0, float(delivered_bps))
+        self._acc_frames += max(0.0, float(delivered_fps))
+        self._samples += 1
+        if now - self._t0 < self.window:
+            return None
+        self._acc_bytes = self._acc_bytes * self.window / max(
+            0.001, now - self._t0)
+        self._acc_frames = self._acc_frames * self.window / max(
+            0.001, now - self._t0)
+        self._t0 = now
+        action = self._decide()
+        self._acc_bytes = 0
+        self._acc_frames = 0
+        self._samples = 0
+        return action
+
+    def reset(self, target_bps=None, now=None):
+        """换挡/换编码器后重置（保留迟滞状态没意义了）。"""
+        if target_bps:
+            self.base = max(120_000, int(target_bps))
+            self.ceil = int(self.base * ADAPT_MAX_RATIO)
+        self.target = self.base
+        self.floor = int(self.base * ADAPT_MIN_RATIO)
+        self._t0 = now
+        self._acc_bytes = 0
+        self._acc_frames = 0
+        self._samples = 0
+        self._up_streak = 0
+
+    def describe(self):
+        return ("码率目标 %.2f Mbps（区间 %.2f~%.2f）· 实测 %.2f MB/s / %.1f 帧"
+                % (self.target / 1e6, self.floor / 1e6, self.ceil / 1e6,
+                   self.last_bps / 1048576.0, self.last_fps))
+
+
 class RateMeter(object):
     """按秒采样单调计数器，算出帧率与字节率。
 

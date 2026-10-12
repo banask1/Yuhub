@@ -149,7 +149,25 @@ def node_address(key):
 VIRTUAL_NET_PREFIX = "10.126.126."
 
 RESOURCE_DIR_NAME = "easytier"
-BIN_NAMES = ("easytier-core.exe", "wintun.dll", "Packet.dll")
+#: 随包携带的 EasyTier 文件。easytier-cli.exe 是「成员表」这一版新增的：
+#: 它和 core 由**同一个 crate** 构建、在官方 zip 里本来就有（构建 workflow
+#: 把 easytier-{core,cli,web,web-embed} 四个都打进去），所以我们只是多解压
+#: 一个文件——换来的是 core 内部那张**权威成员表**（见 CorePeerFeed）。
+BIN_NAMES = ("easytier-core.exe", "easytier-cli.exe", "wintun.dll", "Packet.dll")
+
+#: 缺了也**不拦着启动**的文件：core 照常跑，只是少一条能力（成员表退回
+#: ARP + 信标的旁路推断）。老安装包里没有 cli，不能因为这个就把房间堵死。
+OPTIONAL_BIN_NAMES = ("easytier-cli.exe",)
+
+#: EasyTier 管理 RPC portal 的端口（core 与 cli 两边都要用同一个）。
+#:
+#: 🔴 **不能跟着用官方默认的 15888**：core 的 portal 是**无条件启动**的
+#: （v2.6.4 的 core.rs 里 `ApiRpcServer::new(...)?.serve().await?` 带 `?`），
+#: 绑定失败会让整个 easytier-core 直接退出——用户要是自己装过 EasyTier
+#: （或开着它的 GUI），15888 就在别人手里，我们的房间会"起不来"而且看不出
+#: 原因。所以启动前先探一个空闲口（pick_rpc_port），再用 --rpc-portal 显式
+#: 交给 core，CLI 侧用同一个口，与用户的实例彻底隔离。
+RPC_PORT = 15889
 
 # 停止信号文件（普通权限可写，提权看门狗可读）
 _STOP_FILE = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "Yuhub", "etier_stop")
@@ -160,8 +178,192 @@ def install_dir():
     return os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "Yuhub", "etier")
 
 
+#: EasyTier 的固定监听端口。
+#:
+#: 🔴 **这是"异地分屏只有 4 帧"的根因所在**：以前启动参数里带 `--no-listener`
+#: （官方含义：**不监听任何端口，只连接到对等节点**；另一页文档补充说它
+#: "will affect the establishment of non-hole-punching connections"）。
+#: 双方都不监听时，P2P 直连根本没有可打洞的落点，流量只能整体走公共中继
+#: —— 而公共节点是社区共享的、常被限速，实测有效吞吐只有约 3.6Mbps，
+#: 对应分屏 4fps。改成**固定端口监听**后：端口可预测，UDP/TCP 打洞才有
+#: 成立的前提（日志里能看到 `tcp hole punch client start`）。
+#: 防火墙不受影响：`_preflight_silence_windows()` 是按**程序**放行的
+#: （protocol=any），新端口不会弹窗。
+LISTEN_PORT = 11010
+
+
+def log_dir():
+    """EasyTier 自己的日志目录（链路诊断靠解析它）。"""
+    return os.path.join(install_dir(), "logs")
+
+
+def core_args(name, secret, hostname="", ipv4="", servers=(), rpc_port=RPC_PORT):
+    """组装 easytier-core 的启动参数。
+
+    抽成独立函数是为了**可测试**：想验证"不许再出现 --no-listener""必须带
+    监听端口"这类回归，不该真去起一个需要管理员权限的房间（自检里就断言
+    这个返回值，见 lan_selftest）。
+    """
+    args = [
+        "--network-name", name,
+        "--network-secret", secret,
+        "--latency-first",
+        # 管理 RPC portal（成员表的数据源）。core 默认会起在 15888，而那个
+        # 口可能被用户自装的 EasyTier 占着——绑定失败会让 core 直接退出，
+        # 所以这里**显式**指定一个我们探过的空闲口（见 RPC_PORT / pick_rpc_port）。
+        # 绑 127.0.0.1：RPC 只对本机开放，局域网里的别人连不上。
+        "--rpc-portal", "127.0.0.1:%d" % int(rpc_port),
+        # 固定端口监听（见 LISTEN_PORT 的注释：这是 P2P 直连的前提）
+        "-l", "udp://0.0.0.0:%d" % LISTEN_PORT,
+        "-l", "tcp://0.0.0.0:%d" % LISTEN_PORT,
+        # EasyTier 默认单线程运行（官方 help：default is single-threaded），
+        # 单核吞吐就是整条隧道（分屏 + 云盘 + 游戏流量）的天花板。
+        # count 必须 > 2。两种写法都带上：官方 help 里是 `--multi-thread`
+        # 开关 + `--multi-thread-count` 数字，而 TOML 回显只打印 count，
+        # 所以不敢只写一个。
+        "--multi-thread", "true",
+        "--multi-thread-count", "4",
+        # 把隧道里的 TCP 流交给 KCP 承载：官方说明是"提高在 UDP 丢包网络上的
+        # 延迟和吞吐量"。异地链路几乎必然丢包，而内层 TCP（分屏、云盘下载）
+        # 叠在外层 TCP 上会互相拖累（经典 TCP-over-TCP meltdown）。
+        # 对端默认允许 KCP 输入，所以只开我们这侧就够。
+        "--enable-kcp-proxy", "true",
+        # 捕获物理网卡上的 UDP 广播包并转发给对等节点：让依赖局域网广播发现
+        # 房间的游戏（Minecraft 等）能看到彼此。仅 Windows 生效，需要管理员
+        # 权限——watchdog 本来就是提权进程。
+        "--enable-udp-broadcast-relay", "true",
+        # 让 EasyTier 自己写日志：链路诊断（打洞/连接错误）靠解析它，
+        # 比往包里再塞一个 easytier-cli.exe（约 10MB）划算得多。
+        "--file-log-level", "info",
+        "--file-log-dir", log_dir(),
+        "--file-log-size", "8",
+        "--file-log-count", "2",
+    ]
+    if hostname:
+        # 队友在成员列表里看到的名字（不传就是计算机名 DESKTOP-XXXX）
+        args += ["--hostname", hostname]
+    if ipv4:
+        # 固定虚拟 IP：只给 -i、不加 -d，否则 DHCP 会覆盖它（-d 与 -i 互斥）
+        args += ["-i", ipv4]
+    else:
+        # 不指定 IP 时用 DHCP 自动分配（并自动创建虚拟网卡）
+        args += ["-d", "true"]
+    for srv in servers:
+        args += ["-p", srv]
+    return args
+
+
+#: 链路诊断关心的日志特征（EasyTier 是 Rust tracing，行首带时间戳与模块路径）。
+_LINK_PUNCH = ("hole punch", "hole_punch", "打洞")
+_LINK_RELAY = ("relay", "relaying", "中继")
+_LINK_ERROR = ("connect to peer error", "connecterror", "connection refused",
+               "handshake failed", "timeout")
+
+
+def link_diagnostics(max_lines=4, tail_bytes=262144):
+    """读 EasyTier 自己的日志，摘出链路线索。
+
+    返回 {"log": 日志路径, "punch": [...], "relay": [...], "error": [...]}，
+    每类最多 max_lines 条（最近优先，已去重）。读不到就全空 —— 调用方据此
+    显示"暂无链路日志"，而不是把"没读到"当成"一切正常"。
+    """
+    out = {"log": "", "punch": [], "relay": [], "error": []}
+    try:
+        d = log_dir()
+        if not os.path.isdir(d):
+            return out
+        cands = [os.path.join(d, fn) for fn in os.listdir(d)
+                 if fn.lower().endswith(".log")]
+        if not cands:
+            return out
+        newest = max(cands, key=lambda p: os.path.getmtime(p))
+        out["log"] = newest
+        with open(newest, "rb") as f:
+            try:
+                f.seek(-tail_bytes, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return out
+
+    buckets = {"punch": _LINK_PUNCH, "relay": _LINK_RELAY, "error": _LINK_ERROR}
+    # 去重集合**必须按分类各一份**：一行同时含 "relay" 和 "connect to peer error"
+    # 时两个分类都该收到它。第一版用了全局 seen，第二个分类会因为
+    # 「这行已经在 seen 里」被静默丢掉（自检里那条连接错误就是这么漏的）。
+    seen = {k: set() for k in buckets}
+    for raw in reversed(text.splitlines()):
+        low = raw.lower()
+        for key, marks in buckets.items():
+            if len(out[key]) >= max_lines:
+                continue
+            if any(m in low for m in marks):
+                short = raw.strip()
+                if len(short) > 220:                 # 日志行可能极长（带结构体 dump）
+                    short = short[:220] + "…"
+                if short in seen[key]:
+                    continue
+                seen[key].add(short)
+                out[key].append(short)
+    return out
+
+
+
 def core_path():
     return os.path.join(install_dir(), "easytier-core.exe")
+
+
+def cli_path():
+    """管理 CLI 的路径（成员表的数据源，见 CorePeerFeed）。
+
+    和 core 同目录、同一个发布包里；没装（或被杀软删了）时成员表退回
+    ARP + 信标的旁路推断，不影响联机本身。
+    """
+    return os.path.join(install_dir(), "easytier-cli.exe")
+
+
+def cli_health():
+    """管理 CLI 是否就位。返回 (ok, detail)。
+
+    ⚠️ 它是**可选件**：缺了只是成员表少一条能力（退回 ARP + 信标），
+    联机/云盘/分屏全都不受影响。所以它不参与 core_health()——那条判据
+    决定"房间能不能起"，这里只决定"有没有权威成员表"。
+    """
+    cli = cli_path()
+    if not os.path.isfile(cli):
+        return False, "缺少 easytier-cli.exe（成员表退回 ARP + 信标）"
+    try:
+        if os.path.getsize(cli) < 1_000_000:
+            return False, "easytier-cli.exe 大小异常（文件可能损坏）"
+    except OSError:
+        return False, "easytier-cli.exe 读不到"
+    return True, cli
+
+
+def cli_available():
+    ok, _ = cli_health()
+    return ok
+
+
+def pick_rpc_port(preferred=RPC_PORT, tries=8):
+    """挑一个空闲的本机管理端口（见 RPC_PORT 的注释：默认口会被用户自装的
+    EasyTier 占着，而 portal 绑定失败 = core 直接退出）。
+
+    探测方式是对 127.0.0.1:port 做一次 connect：**连得上 = 有人在用 →
+    换下一个；连不上 = 可用**。非破坏性（不发任何数据），也足够快。
+    """
+    for i in range(max(1, int(tries))):
+        port = int(preferred) + i
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if s.connect_ex(("127.0.0.1", port)) != 0:
+                    return port
+            finally:
+                s.close()
+        except OSError:
+            return port
+    return int(preferred)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +395,8 @@ def release_binaries(force=False):
         s = os.path.join(src, name)
         d = os.path.join(dst, name)
         if not os.path.exists(s):
+            if name in OPTIONAL_BIN_NAMES:
+                continue        # 可选件：没有就少一条能力，不拦启动
             return False, f"缺少 {name}"
         if force or not os.path.exists(d) or os.path.getsize(d) != os.path.getsize(s):
             try:
@@ -316,7 +520,9 @@ def repair_binaries(progress=None, timeout=600):
                 if base in BIN_NAMES and base not in extracted:
                     z.extract(entry, tmpdir)
                     extracted[base] = os.path.join(tmpdir, entry)
-        missing = [w for w in BIN_NAMES if w not in extracted]
+        # 可选件不算"上游资产变更"：老包里没有 cli 时照样修得动 core
+        missing = [w for w in BIN_NAMES
+                   if w not in extracted and w not in OPTIONAL_BIN_NAMES]
         if missing:
             return False, "压缩包里缺少 %s（上游资产可能已变更）" % "、".join(missing)
 
@@ -662,6 +868,260 @@ def probe_host(host_ip, timeout=2.0, attempts=2):
 
 
 # ---------------------------------------------------------------------------
+# 权威成员表：借 easytier-cli 读 core 的管理 RPC（第三条到场信号）
+# ---------------------------------------------------------------------------
+def _to_float(v):
+    """宽容转 float：core 的表格值是预格式化字符串，可能是 "-" / "" / None。"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_peer_list_json(text):
+    """解析 `easytier-cli peer list -o json` 的输出。
+
+    输出是**一个数组**：第一行是本机（cost = "Local"），其余每行一个成员。
+    v2.6.4 的字段（PeerTableItem）：cidr / ipv4 / hostname / cost / lat_ms /
+    loss_rate / rx_bytes / tx_bytes / tunnel_proto / nat_type / id / version。
+
+    ⚠️ 两点很重要：
+      1. 值大多是**预格式化的字符串**（"1.23"、"12.5%"、"1.5 MiB"），不是
+         数字；这里只把 lat_ms 转成 float（界面要算/要比较），其余原样留着；
+      2. EasyTier 升版可能增删字段——所以**宽容解析**：只有 ipv4 是必需的，
+         其余缺了就留空。绝不因为多了/少了字段让整块失效（这是这一版最怕的
+         回归：接口一变，成员表整块消失，而界面上看不出原因）。
+    解析不了（不是 JSON / 不是数组）返回 None，调用方据此走降级。
+    """
+    try:
+        rows = json.loads(text or "")
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    # 多实例时 CLI 会把每个实例的结果包一层：
+    #   [{"instance_id":..., "instance_name":..., "result": [...]}, ...]
+    # 我们只起一个实例，正常情况下拿到的是裸数组（CLI 在只有一个结果时
+    # 直接打印它）。但**顺手支持包装形态**——多一层封装就让成员表整块
+    # 失效，正是这里最不该发生的失败模式。
+    if rows and all(isinstance(r, dict) and "result" in r for r in rows):
+        merged = []
+        for r in rows:
+            if isinstance(r.get("result"), list):
+                merged.extend(r["result"])
+        rows = merged
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ip = str(r.get("ipv4") or "").strip()
+        if not ip:
+            continue
+        cost = str(r.get("cost") or "").strip()
+        low = cost.lower()
+        out.append({
+            "peer_id": str(r.get("id") or ""),
+            "ipv4": ip,
+            "hostname": str(r.get("hostname") or "").strip()[:32],
+            "cost": cost,
+            # 是不是"没直连"（多跳/走中继）：直连的 cost 是 1 或 Local。
+            # 这一条直接回答"异地分屏为什么只有 4 帧"——中继带宽是共享的。
+            "relayed": bool(low) and low not in ("local", "1", "direct"),
+            "lat_ms": _to_float(r.get("lat_ms")),
+            "loss_rate": str(r.get("loss_rate") or "").strip(),
+            "tunnel": str(r.get("tunnel_proto") or "").strip(),
+            "nat": str(r.get("nat_type") or "").strip(),
+            "version": str(r.get("version") or "").strip(),
+        })
+    return out
+
+
+class CorePeerFeed:
+    """成员表：借 easytier-cli 读 core 内部那张**权威**成员表。
+
+    为什么要它
+    ----------
+    到 v0.12 为止，成员发现靠两条**旁路**信号（见 MemberTracker）：操作系统
+    ARP 表 + 我们自己的应用层昵称广播。两条都能用，但都是推断——ARP 条目是
+    出站流量的副作用、会随时间老化；广播是我们自己维护的一套协议、还受
+    丢包影响。core 内部本来就有一张权威表：**握手过的人在表里，表里的人都
+    握过手**，每条还带虚拟 IP、主机名、延迟、丢包、隧道协议、NAT 类型，
+    以及 OSPF 同步来的多跳成员。这些数据一直存在，只是藏在管理 RPC 后面。
+
+    为什么是"起进程"而不是自己调 RPC
+    -------------------------------
+    那套 RPC 跑在 EasyTier 自己的 TCP 隧道 + prost 编解码上（不是 HTTP 或
+    标准 gRPC），自己实现等于把它的私有协议抄一遍，版本一升就碎。官方给的
+    客户端就是 easytier-cli.exe——和 core **同一个 crate** 构建、同一个发布
+    包里（官方 zip 里本来就有），整包解压时顺手带上即可，约 9.5MB。
+
+    三条纪律
+    --------
+      1. **只是"多加一条"**：ARP 与信标通道一行不删。cli 不在、core 没起、
+         超时、解析失败——任何一步失败都静默降级，成员列表仍有旁路兜底。
+      2. **不阻塞、不刷屏**：轮询在后台线程里；失败只在"第一次失败"和
+         "从成功转为失败"时各记一条日志，其余静默重试。
+      3. **数据带时间戳**：快照有新鲜期，过期就当没有——不给界面看旧数据。
+    """
+
+    POLL_INTERVAL = 2.5      # 轮询间隔（秒）。cli 是进程，不能跟着 800ms 的 tick 走
+    FRESH_TTL = 8.0          # 记录新鲜期（秒）：超过当这一轮没数据
+    CALL_TIMEOUT = 4.0       # 单次 CLI 调用超时（连不上时它退得很快）
+
+    def __init__(self, rpc_port=RPC_PORT, on_log=None):
+        self._rpc_port = int(rpc_port or RPC_PORT)
+        self._on_log = on_log or (lambda msg: None)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._records = {}       # ipv4 -> record（含 at=monotonic）
+        self._ok = False         # 上一次调用成功过（成功过才敢说"权威表可用"）
+        self._failed = False     # 上一次是失败（用于日志只在状态翻转时打一条）
+        self._cli_missing = False
+
+    # ---------------------------------------------------------------- 生命周期
+    def start(self):
+        """起轮询线程。重复调用无害。"""
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop,
+                                        name="CorePeerFeed", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        """停轮询线程。瞬时返回。"""
+        self._stop.set()
+        t, self._thread = self._thread, None
+        if t is not None and t.is_alive():
+            t.join(1.5)
+
+    @property
+    def running(self):
+        t = self._thread
+        return t is not None and t.is_alive()
+
+    def available(self):
+        """权威表现在可用吗（cli 在 + 上一次调用成功）。"""
+        with self._lock:
+            return bool(self._ok) and not self._cli_missing
+
+    def cli_missing(self):
+        with self._lock:
+            return self._cli_missing
+
+    # ---------------------------------------------------------------- 读快照
+    def _fresh_locked(self, now):
+        ttl = self.FRESH_TTL
+        return {ip: dict(r) for ip, r in self._records.items()
+                if now - float(r.get("at") or 0.0) <= ttl}
+
+    def snapshot(self):
+        """当前成员记录（新鲜期内）。UI/跟踪器调用，零阻塞。"""
+        now = time.monotonic()
+        with self._lock:
+            return list(self._fresh_locked(now).values())
+
+    def by_ip(self):
+        """{ipv4: record}（新鲜期内）。"""
+        now = time.monotonic()
+        with self._lock:
+            return self._fresh_locked(now)
+
+    def quality_map(self):
+        """{ipv4: 链路质量}：给 MemberTracker 并进成员记录用。"""
+        now = time.monotonic()
+        out = {}
+        with self._lock:
+            for ip, r in self._fresh_locked(now).items():
+                out[ip] = {"lat_ms": r.get("lat_ms"),
+                           "loss_rate": r.get("loss_rate") or "",
+                           "tunnel": r.get("tunnel") or "",
+                           "nat": r.get("nat") or "",
+                           "relayed": bool(r.get("relayed")),
+                           "peer_id": r.get("peer_id") or ""}
+        return out
+
+    def hostname_of(self, ip):
+        """某个虚拟 IP 的主机名（= 我们传给 core 的 --hostname）。
+
+        它就是用户填的昵称——所以信标万一没到，昵称还有权威表兜底。
+        """
+        rec = self.by_ip().get(ip or "")
+        return (rec or {}).get("hostname") or ""
+
+    # ---------------------------------------------------------------- 轮询
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self._poll_once()
+            except Exception:
+                pass                # 任何意外都不该弄死这条辅助通道
+            self._stop.wait(self.POLL_INTERVAL)
+
+    def _poll_once(self):
+        cli = cli_path()
+        if not (os.path.isfile(cli) and os.path.getsize(cli) > 1_000_000):
+            # 源码态 / 老安装包里没有 cli：只记一次，之后安静降级
+            with self._lock:
+                first = not self._cli_missing
+                self._cli_missing = True
+            if first:
+                self._log("没找到 easytier-cli.exe：成员表退回 ARP + 信标"
+                          "（联机本身不受影响）")
+            return False
+        cmd = [cli,
+               "-p", "127.0.0.1:%d" % self._rpc_port,
+               "-o", "json",
+               "peer", "list"]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=self.CALL_TIMEOUT,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self._mark_fail("调用 easytier-cli 失败")
+            return False
+        rows = parse_peer_list_json(proc.stdout or "")
+        if rows is None:
+            if (proc.returncode or 0) != 0:
+                err = (proc.stderr or "").strip().splitlines()
+                self._mark_fail(err[0] if err else
+                                "easytier-cli 返回码 %s" % proc.returncode)
+            else:
+                self._mark_fail("easytier-cli 输出无法解析")
+            return False
+        now = time.monotonic()
+        with self._lock:
+            self._records = {r["ipv4"]: dict(r, at=now) for r in rows}
+            was_fail = self._failed
+            self._ok = True
+            self._failed = False
+        if was_fail:
+            self._log("成员表已连上 core（权威表可用）")
+        return True
+
+    def _mark_fail(self, why):
+        """失败：只在"第一次失败"或"从成功转为失败"时记一条日志。"""
+        with self._lock:
+            first = not self._failed
+            was_ok = self._ok
+            self._failed = True
+        if first or was_ok:
+            self._log("读取成员表失败（不影响联机，继续用 ARP + 信标）：%s"
+                      % why)
+
+    def _log(self, msg):
+        try:
+            self._on_log(msg)
+        except Exception:
+            pass
+
+
+
+# ---------------------------------------------------------------------------
 # 成员在线跟踪：解决"在线人数断断续续"
 # ---------------------------------------------------------------------------
 # 根因：以前直接拿 `arp -a` 的结果当在线名单。Windows 的 ARP 条目受
@@ -678,6 +1138,11 @@ def probe_host(host_ip, timeout=2.0, attempts=2):
 #      从列表里闪没。
 # 名称解析（gethostbyaddr，每个最长 0.8s）也挪进这个后台线程，解析一次
 # 就缓存——UI 线程从此只读快照，一个子进程都不起、零阻塞。
+#
+# v0.13 起「到场信号」变成三条并集（见 _hint_ips / _round）：ARP、昵称信标、
+# core 权威成员表（CorePeerFeed）。前两条各有硬伤（ARP 要出站流量才生成条目
+# 且会老化；信标是应用层广播、会丢），第三条是协议内权威数据——任一条算数，
+# 于是"看不到好友"这类问题从"靠推断"变成"有权威来源 + 旁路兜底"。
 class MemberTracker:
     """一个跨网房间对应一个实例。UI 通过 snapshot() 拿稳定视图。"""
 
@@ -686,7 +1151,8 @@ class MemberTracker:
     PING_FAIL_EVICT = 4      # 连续 ping 失败次数达到该值才可能判离线
     CONFIRM_GRACE = 12.0     # 最后一次确认（ARP 见到 / ping 通）后的宽限（秒）
 
-    def __init__(self, my_ip, on_log=None, name_lookup=None):
+    def __init__(self, my_ip, on_log=None, name_lookup=None, alive_hints=(),
+                 name_hint=None, quality_hint=None):
         self._my_ip = my_ip
         self._on_log = on_log or (lambda msg: None)
         # 可选的「成员信息」查询回调（NickBeacon.get_info）：一次拿到
@@ -694,13 +1160,28 @@ class MemberTracker:
         # EasyTier 虚拟网里基本解析不出 --hostname。回调允许只返回昵称
         # 字符串（旧写法），本类会兼容。
         self._name_lookup = name_lookup
+        #: 「第三方到场线索」列表：每个回调返回一组"此刻该算在场"的 IP。
+        #: 联机页接了两条——昵称信标的新鲜表、core 权威成员表
+        #: （CorePeerFeed）。为什么必须有它们：只认 ARP 会让新成员永远
+        #: 进不了列表（ARP 条目要本机先有出站流量才生成），ICMP 被防火墙
+        #: 挡着时还会把老成员陆续误判成离线——用户实测过这两个症状。
+        self._alive_hints = tuple(h for h in (alive_hints or ()) if h)
+        #: 昵称兜底：ip -> 名字。接的是 core 的 hostname（= 我们传给 core 的
+        #: --hostname，也就是用户昵称）。信标没到、gethostbyaddr 也查不出时
+        #: 靠它兜底——比"（未识别昵称）"体面得多。
+        self._name_hint = name_hint
+        #: 链路质量：返回 {ip: {"lat_ms","loss_rate","tunnel","nat","relayed",
+        #: "peer_id"}}，并进成员记录给界面显示（core 权威表独有）。
+        self._quality_hint = quality_hint
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
         # refresh_now() 用它打断 PING_INTERVAL 的等待，立刻再跑一轮
         self._wake = threading.Event()
         self._thread = None
-        # ip -> {"confirmed": monotonic, "ping_fail": int,
-        #        "name": str, "game": str, "port": int}
+        # ip -> {"confirmed": monotonic, "ping_fail": int, "name": str,
+        #        "game": str, "port": int, "share": int, "srev": int, "ss": int,
+        #        "lat_ms": float|None, "loss_rate": str, "tunnel": str,
+        #        "nat": str, "relayed": bool, "peer_id": str}
         self._peers = {}
 
     # ------------------------------------------------ 对外接口（UI 用）
@@ -730,14 +1211,19 @@ class MemberTracker:
     def snapshot(self):
         """当前在线成员，按 IP 排序。UI 线程调用，零阻塞。
 
-        返回 [{"ip", "name", "game", "port", "share", "srev", "ss"}]。game / port 是对端在
-        「游戏快连」里选的那款游戏（由昵称信标一起广播过来），队友的
-        成员行据此显示"他在玩什么"，复制按钮也用**他的**端口拼地址。
+        返回 [{"ip", "name", "game", "port", "share", "srev", "ss",
+              "lat_ms", "loss_rate", "tunnel", "nat", "relayed", "peer_id"}]。
+        game / port 是对端在「游戏快连」里选的那款游戏（由昵称信标一起
+        广播过来），队友的成员行据此显示"他在玩什么"，复制按钮也用**他的**
+        端口拼地址。
         share 是对端「临时云盘」的服务端口（0 = 没开 / 旧版本），拉文件
         清单时直接拿它拼地址，不用先猜再试；srev 是对端云盘清单的版本号，
         一变就说明对方增删了分享文件（见 NickBeacon.live_shares）。
         ss 是对端「屏幕共享」的服务端口（0 = 没在共享），成员行据此决定
         要不要显示「看屏幕」按钮。
+        lat_ms / loss_rate / tunnel / nat / relayed 是**链路质量**，来源是
+        core 的权威成员表（CorePeerFeed，见 _apply_quality）：没接上那份
+        数据时这些字段为空/False，界面照常工作（这就是"保留旁路通道"）。
         """
         with self._lock:
             return [{"ip": ip,
@@ -746,7 +1232,13 @@ class MemberTracker:
                      "port": int(p.get("port") or 0),
                      "share": int(p.get("share") or 0),
                      "srev": int(p.get("srev") or 0),
-                     "ss": int(p.get("ss") or 0)}
+                     "ss": int(p.get("ss") or 0),
+                     "lat_ms": p.get("lat_ms"),
+                     "loss_rate": (p.get("loss_rate") or ""),
+                     "tunnel": (p.get("tunnel") or ""),
+                     "nat": (p.get("nat") or ""),
+                     "relayed": bool(p.get("relayed")),
+                     "peer_id": (p.get("peer_id") or "")}
                     for ip, p in sorted(self._peers.items())]
 
     # ------------------------------------------------ 后台线程主体
@@ -761,19 +1253,74 @@ class MemberTracker:
                 pass                    # 单轮失败不影响下一轮
             self._wake.wait(self.PING_INTERVAL)
 
+    def _hint_ips(self):
+        """把所有「第三方到场线索」合成一个 IP 集合（见 _round 的注释）。
+
+        单个线索抛异常只丢它自己——不能让一条辅助通道把整轮扫描带崩。
+        """
+        ips = set()
+        for hint in self._alive_hints:
+            try:
+                ips.update(hint() or ())
+            except Exception:
+                pass
+        ips.discard(self._my_ip)
+        return ips
+
+    def _apply_quality(self):
+        """把链路质量并进成员记录（core 权威表提供；没接上就保持原样）。
+
+        只对**已经在表里**的成员赋值：质量数据不负责决定"谁在场"，那是
+        `_round` 里三条到场信号的职责——两者分开，免得某次质量查询失败
+        就把成员弄丢。
+        """
+        if not self._quality_hint:
+            return
+        try:
+            q = self._quality_hint() or {}
+        except Exception:
+            return
+        if not q:
+            return
+        with self._lock:
+            for ip, info in q.items():
+                p = self._peers.get(ip)
+                if p is None or not isinstance(info, dict):
+                    continue
+                for key in ("lat_ms", "loss_rate", "tunnel", "nat",
+                            "relayed", "peer_id"):
+                    if key in info:
+                        p[key] = info[key]
+
     def _round(self):
         now = time.monotonic()
-        # ① ARP 扫描：新面孔入场 + 老成员确认在场
+        # ① 到场信号有三条，**任一即算**：
+        #   a. ARP 扫描（老机制）。硬伤：条目要本机先有出站流量才生成——
+        #      刚进房时谁也不认识谁，只 ping 已知成员等于新成员永远进不了
+        #      列表；条目还会随时间老化，而 ping 要对方应答 ICMP，wintun
+        #      网卡默认「公用网络」入站 ICMP 是被防火墙拦着的。
+        #   b. 昵称信标新鲜表（应用层广播，入站 UDP 按端口放行，与 ICMP、
+        #      与有没有出站流量都无关；房间里每 3 秒一轮，再闲也在响）。
+        #   c. **core 权威成员表**（CorePeerFeed 读 easytier-cli 的管理 RPC）：
+        #      握手过的人在表里、表里的人都握过手，还带虚拟 IP / 主机名 /
+        #      延迟 / 丢包 / 隧道 / NAT。协议内的数据，不靠推断。
+        # 🔴 用户实测"成员列表看不到好友 / 好友云盘的文件看不到"两条症状，
+        #    根因都是只认 a：云盘轮询的 peer 列表同样来自本跟踪器，跟踪器
+        #    看不见人，文件就永远拉不回来。b 是应用层补丁，c 是根治。
+        #    三条并集：任何一条算数，任何一条坏掉都还有另外两条。
         try:
             arp = set(list_members(self._my_ip))
         except Exception:
             arp = set()
+        hinted = self._hint_ips()
         with self._lock:
-            for ip in arp:
+            for ip in (arp | hinted):
                 p = self._peers.setdefault(
                     ip, {"confirmed": now, "ping_fail": 0,
                          "name": "", "game": "", "port": 0, "share": 0,
-                         "srev": 0, "ss": 0})
+                         "srev": 0, "ss": 0, "lat_ms": None, "loss_rate": "",
+                         "tunnel": "", "nat": "", "relayed": False,
+                         "peer_id": ""})
                 p["confirmed"] = now
                 p["ping_fail"] = 0
         # ② 逐个 ping：保活 ARP + 主动确认活性
@@ -786,7 +1333,9 @@ class MemberTracker:
             self._on_ping_result(ip, alive, now)
         # ③ 离线判定（双信号失效才移除）
         self._sweep(now)
-        # ④ 昵称 + 游戏快连：信标里随名字一起广播过来
+        # ④ 链路质量（延迟/丢包/隧道/是否中继）：core 权威表独有，有就并进去
+        self._apply_quality()
+        # ⑤ 昵称 + 游戏快连：信标里随名字一起广播过来
         self._resolve_info()
 
     def _on_ping_result(self, ip, alive, now=None):
@@ -843,6 +1392,14 @@ class MemberTracker:
             name = (info.get("name") or "").strip()
             if not name:
                 name = p.get("name") or ""
+            if not name and self._name_hint:
+                # core 的 hostname = 我们传给 core 的 --hostname = 用户昵称。
+                # 信标没到（丢包/被防火墙拦）时，这条比 gethostbyaddr 靠谱得多
+                # ——后者在 EasyTier 虚拟网里基本查不出东西。
+                try:
+                    name = (self._name_hint(ip) or "").strip()
+                except Exception:
+                    name = ""
             if not name:
                 name = _resolve_name(ip, timeout=0.8)
             with self._lock:
@@ -908,6 +1465,12 @@ class MemberTracker:
 # 传播，不往物理局域网泄漏一个字节。
 NICK_PORT = 41234
 _NICK_MAGIC = "yuhub-nick-v1"
+# 房间聊天（room_chat.py）的广播端口。与昵称信标同一机制：UDP 广播，
+# 靠 EasyTier 的 --enable-udp-broadcast-relay 跨到房间里所有节点。
+# 为什么不复用 41234：信标是 3 秒一轮的结构化小报文，聊天是低频突发报文，
+# 混在一个口上就要在同一路解析里分岔，边界情况变多；代价只是防火墙多放行
+# 一个端口（见 _preflight_silence_windows，watchdog 提权时一起加）。
+CHAT_PORT = 41235
 # 「游戏快连」跟昵称搭同一班车广播：队友的「在线成员」里就能直接看到
 # 每个人选的是哪款游戏，点「复制」也用**对方**的端口拼地址。
 # 报文是 JSON 字典，多带两个键对旧版是透明的（旧版只读 _NICK_MAGIC），
@@ -927,6 +1490,26 @@ _NICK_SHARE_REV = "srev"
 # 不广播观看码：那东西由「房间码 + 密码」两边各自算，广播出去等于把
 # 准入凭证贴在广播包里，虚拟网里任何一台机器都能收到。
 _NICK_SS = "ss"
+
+
+# ---------------------------------------------------------------------------
+# 房间码 / 密码的归一化（**唯一口径**）
+# ---------------------------------------------------------------------------
+def room_key(code):
+    """房间码 → 送给 EasyTier 的网络名骨架。
+
+    🔴 归一化是**房间判定的一部分**：大小写与空格都不参与。也就是说
+    `ABC123`、`abc123`、`abc 123` 是同一个房间、成员列表里互相可见。
+    凡是"由房间码派生"的东西（云盘 token、屏幕共享观看码）都**必须**走
+    这里，否则会出现"房间进得去、成员看得见，但云盘/看屏幕读不出对方的
+    数据"——用户反馈的"临时云盘看不到朋友分享的文件"正是这个。
+    """
+    return (code or "").strip().lower().replace(" ", "")
+
+
+def room_secret(password):
+    """密码 → secret。只去掉首尾看不见的空白，其余原样（区分大小写）。"""
+    return (password or "").strip()
 
 
 class NickBeacon:
@@ -1039,6 +1622,32 @@ class NickBeacon:
                     sock.close()
                 except OSError:
                     pass
+
+    def live_peers(self):
+        """{ip: info}：信标缓存里**新鲜期内**的各成员信息。
+
+        与 `live_shares` 是同一份数据的两个视角（那个只取云盘两个字段）。
+        单独要一个全量视图，是因为成员发现不能只靠 ARP：
+
+          * ARP 条目要**本机先有出站流量**才生成。刚进房时谁也不认识谁，
+            只 ping 已知成员 = 新成员永远进不了列表；
+          * ARP 条目会随时间老化，而 ping 需要对方应答 ICMP——wintun 网卡
+            默认被归为「公用网络」，入站 ICMP 默认被 Windows 防火墙拦着
+            （`enforce_virtual_net_trust` 能修好，但它是 best-effort）。
+
+        信标广播是入站 UDP、按端口放行（见 _preflight_silence_windows），
+        房间里每 3 秒一轮，再闲也在响——比 ARP 可靠得多。用户实测的
+        "成员列表看不到好友 / 好友云盘的文件看不到"两条症状，根因都是
+        只认 ARP（云盘轮询的 peer 列表同样来自 MemberTracker）。
+        """
+        now = time.monotonic()
+        out = {}
+        with self._lock:
+            for ip, hit in self._peers.items():
+                if float(hit.get("until") or 0.0) <= now:
+                    continue
+                out[ip] = dict(hit.get("info") or {})
+        return out
 
     def live_shares(self):
         """{ip: (云盘端口, 清单版本号)}：信标缓存里各成员此刻的云盘状态。
@@ -1155,6 +1764,13 @@ class NickBeacon:
                             "info": info,
                             "until": time.monotonic() + self.PEER_FRESH,
                         }
+        except OSError as exc:
+            # 绑定失败（端口被占 / 虚拟 IP 还没就绪）必须**说出来**：收不到
+            # 广播的表现是"昵称不更新、云盘端口永远是 0、聊天没动静"，界面上
+            # 却毫无线索——正是最难查的那类静默故障。TCP 那条路一直有日志
+            # （见 _tcp_serve_loop），UDP 这条补上。
+            self._on_log("昵称信标监听失败（此后收不到队友广播：昵称、云盘"
+                         "端口、聊天都会停更）：%s" % exc)
         except Exception:
             pass
         finally:
@@ -1546,20 +2162,24 @@ def _preflight_silence_windows(core_exe_path):
         pass
 
 
-    # 4) **昵称信标端口**：Yuhub.exe 要在虚拟网卡上收 UDP 广播、接受
-    #    TCP 昵称查询（NickBeacon，端口 NICK_PORT）。虚拟网卡默认是
-    #    "公共网络"配置文件，Windows 默认拦入站——没有这条规则，
-    #    广播收不到、TCP 查询应不上，昵称就显示不出来。watchdog 正好
-    #    是提权进程，顺手放行；范围严格限定"本程序 + 该端口"。
-    beacon_rule = "Yuhub 联机昵称信标"
+    # 4) **昵称信标 + 房间聊天端口**：Yuhub.exe 要在虚拟网卡上收 UDP 广播、
+    #   接受 TCP 查询（NickBeacon 端口 NICK_PORT，RoomChat 端口 CHAT_PORT）。
+    #   虚拟网卡默认是"公共网络"配置文件，Windows 默认拦入站——没有这条规则，
+    #   广播收不到、TCP 查询应不上，昵称和聊天都会**静默失效**（界面正常、
+    #   就是收不到别人的东西）。watchdog 正好是提权进程，顺手放行；范围严格
+    #   限定"本程序 + 这两个端口"。
+    #    旧规则名一并删掉：改名是为了让规则名说得清是干什么的，但只加不删
+    #    会在升级用户的机器上留下一条永远没人管的孤儿规则。
+    beacon_rule = "Yuhub 联机信标与聊天"
     own_exe = os.path.abspath(sys.executable)
-    for direction in ("in", "out"):
-        subprocess.run(
-            ["netsh", "advfirewall", "firewall", "delete", "rule",
-             "name=" + beacon_rule],
-            capture_output=True, encoding="gbk", errors="replace",
-            timeout=8, creationflags=_CREATE_NO_WINDOW,
-        )
+    for stale in ("Yuhub 联机昵称信标", beacon_rule):
+        for direction in ("in", "out"):
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule",
+                 "name=" + stale],
+                capture_output=True, encoding="gbk", errors="replace",
+                timeout=8, creationflags=_CREATE_NO_WINDOW,
+            )
     for proto in ("udp", "tcp"):
         subprocess.run(
             ["netsh", "advfirewall", "firewall", "add", "rule",
@@ -1568,7 +2188,7 @@ def _preflight_silence_windows(core_exe_path):
              "action=allow",
              "program=" + own_exe,
              "protocol=" + proto,
-             "localport=" + str(NICK_PORT),
+             "localport=%d,%d" % (NICK_PORT, CHAT_PORT),
              "enable=yes"],
             capture_output=True, encoding="gbk", errors="replace",
             timeout=10, creationflags=_CREATE_NO_WINDOW,
@@ -1628,6 +2248,13 @@ class EasyTier:
         self._on_log = on_log or (lambda msg: None)
         self._started_at = 0.0
         self._base_fingerprint = None    # 启动时的物理网络指纹（用于检测切换网络）
+        #: 本次房间的管理 RPC portal 端口（启动时探得的空闲口）。
+        #: CorePeerFeed 要用同一个口去连 CLI——两边必须一致。
+        self._rpc_port = RPC_PORT
+
+    def rpc_port(self):
+        """本次房间的管理 portal 端口（成员表数据源用）。"""
+        return int(self._rpc_port)
 
     def _cleanup_residual(self):
         """清理上次会话残留的 easytier-core 进程。返回是否已清理干净。
@@ -1706,35 +2333,26 @@ class EasyTier:
             # 把"启动 easytier-core + 轮询停止信号"打包成一个 base64 payload，
             # 通过 `Yuhub.exe --watchdog <payload>` 提权启动。watchdog 是 GUI
             # 子系统进程 + 用 CREATE_NO_WINDOW 启 easytier-core，**不闪窗**。
-            args = [
-                "--network-name", name,
-                "--network-secret", secret,
-                "--latency-first",
-                "--no-listener",
-                # 捕获物理网卡上的 UDP 广播包并转发给对等节点：让依赖
-                # 局域网广播发现房间的游戏（Minecraft 等）能看到彼此。
-                # 仅 Windows 生效，需要管理员权限——watchdog 本来就是提权进程。
-                "--enable-udp-broadcast-relay", "true",
-            ]
-            if hostname:
-                # 队友在成员列表里看到的名字（不传就是计算机名 DESKTOP-XXXX）
-                args += ["--hostname", hostname]
-            if ipv4:
-                # 固定虚拟 IP：只给 -i、不加 -d，否则 DHCP 会覆盖它（-d 与 -i 互斥）
-                args += ["-i", ipv4]
-            else:
-                # 不指定 IP 时用 DHCP 自动分配（并自动创建虚拟网卡）
-                args += ["-d", "true"]
+            #
+            # 🔴 参数一律走 core_args() 一个出口。曾经这里手搓过一份 args，
+            # 里面带着 `--no-listener`——虽然紧接着就被下面的 core_args 覆盖
+            # （死代码），但留着它就是留着雷：LISTEN_PORT 的注释记载着
+            # `--no-listener` 是"异地分屏只有 4 帧"的根因（没有监听端口，
+            # P2P 打洞没有落点，流量全走限速的公共中继）。谁要是"清理"时
+            # 留错那一份， bug 就回来了。组装只认 core_args。
+            servers = (node,) if node else tuple(PUBLIC_SERVERS)
             if node:
                 # 确定性节点选择（MCTier 实践）：用户选了哪个就只连哪个
-                servers = (node,)
                 self._on_log("中继节点（手动指定）：%s" % node)
             else:
-                servers = PUBLIC_SERVERS
                 self._on_log("中继节点：自动（共 %d 个，失败自动换下一个）"
                              % len(servers))
-            for srv in servers:
-                args += ["-p", srv]
+            # 管理 portal 端口：先探一个空闲的。用户自装的 EasyTier 会占着
+            # 官方默认的 15888，而 core 的 portal 绑定失败 = core 直接退出
+            # （v2.6.4 core.rs 里那行的 `?`），所以必须显式挑一个空闲口。
+            self._rpc_port = pick_rpc_port()
+            args = core_args(name, secret, hostname=hostname, ipv4=ipv4,
+                             servers=servers, rpc_port=self._rpc_port)
             payload = build_watchdog_payload(
                 core_path(), args, _STOP_FILE, install_dir(),
                 parent_pid=os.getpid(),

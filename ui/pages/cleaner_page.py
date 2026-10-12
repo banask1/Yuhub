@@ -10,7 +10,6 @@
 """
 
 import os
-import threading
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QColor
@@ -101,11 +100,6 @@ class CleanRow(QFrame):
         self.name = QLabel(rule.name)
         self.name.setObjectName("CleanName")
         name_row.addWidget(self.name)
-        if rule.admin and not cl.is_admin():
-            tag = QLabel("需管理员")
-            tag.setObjectName("Warn")
-            tag.setStyleSheet("font-size: 10px; font-weight: 700;")
-            name_row.addWidget(tag)
         if rule.risky:
             tag = QLabel("不可恢复")
             tag.setObjectName("Danger")
@@ -114,7 +108,11 @@ class CleanRow(QFrame):
         name_row.addStretch(1)
         text.addLayout(name_row)
 
-        self.desc = QLabel(rule.desc)
+        # Dism++ Data.xml 的 <Warning> 原样展示（高风险条目的不可逆后果提示）
+        desc_text = rule.desc
+        if getattr(rule, "warning", ""):
+            desc_text = f"{rule.desc}\n⚠ {rule.warning}"
+        self.desc = QLabel(desc_text)
         self.desc.setObjectName("CleanDesc")
         self.desc.setWordWrap(True)
         text.addWidget(self.desc)
@@ -171,8 +169,7 @@ class ConfirmDialog(QDialog):
 
     confirmed = Signal()
 
-    def __init__(self, rows, total_bytes, parent=None, explorer_hint=False,
-                 admin_count=0):
+    def __init__(self, rows, total_bytes, parent=None, explorer_hint=False):
         super().__init__(parent)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -227,18 +224,6 @@ class ConfirmDialog(QDialog):
             hint.setStyleSheet("font-size: 11px;")
             root.addWidget(hint)
 
-        if admin_count:
-            hint = QLabel(
-                f"ℹ️ 其中 <b>{admin_count}</b> 项需要管理员权限（系统更新缓存、"
-                "系统日志等）。清理到它们时会弹一次 <b>UAC 授权框</b>，"
-                "点「是」即可继续——期间没有任何额外窗口，清理完自动回到这里。"
-            )
-            hint.setTextFormat(Qt.RichText)
-            hint.setWordWrap(True)
-            hint.setObjectName("Warn")
-            hint.setStyleSheet("font-size: 11px;")
-            root.addWidget(hint)
-
         box = QVBoxLayout()
         box.setSpacing(4)
         for name, size in rows[:12]:
@@ -272,7 +257,7 @@ class ConfirmDialog(QDialog):
         self.setStyleSheet(theme.build_qss())
         theme.bus.changed.connect(lambda _: self.setStyleSheet(theme.build_qss()))
         # 提示条会占高度，按数量动态给窗口尺寸，避免内容被截断
-        extra = (62 if explorer_hint else 0) + (78 if admin_count else 0)
+        extra = 62 if explorer_hint else 0
         self.resize(520, 420 + extra)
 
     def _on_ok(self):
@@ -302,11 +287,11 @@ class CleanerPage(BasePage):
     BADGE = "已上线"
 
     _scanned = Signal(object)           # 单条规则扫描完成
+    _scan_fast_done = Signal(object, object)  # 除慢条目外全部扫完（可先清理）
     _scan_done = Signal(object, object)  # (total_bytes, rules) —— 字节数可能超 32 位
     _clean_rule_done = Signal(object)
     _clean_done = Signal(object)
     _clean_status = Signal(str, str)
-    _clean_elevated_done = Signal(object)   # 提权清理返回（None = UAC 被取消）
 
     def __init__(self, notify=None, parent=None):
         super().__init__(
@@ -324,17 +309,15 @@ class CleanerPage(BasePage):
         self._clean_total = 0
         self._confirm_dlg = None
         self._results = []
-        self._pending_elevated = []       # 待提权清理的规则（普通清理跑完再处理）
-        self._elevated_rules = []         # 本次提权清理涉及的规则
         self._auto_scanned = False       # 首次进入自动扫描一次
         self._has_scan_result = False    # 本次进入是否已有扫描数据
 
         self._scanned.connect(self._on_rule_scanned)
+        self._scan_fast_done.connect(self._on_scan_fast_done)
         self._scan_done.connect(self._on_scan_done)
         self._clean_rule_done.connect(self._on_clean_rule_done)
         self._clean_done.connect(self._on_clean_done)
         self._clean_status.connect(self._on_clean_status)
-        self._clean_elevated_done.connect(self._on_elevated_done)
 
         self._build_content()
         self._refresh_disk()
@@ -412,8 +395,7 @@ class CleanerPage(BasePage):
 
         # ---- 分组列表 ----
         self._group_rows = {}
-        order = [cl.GROUP_TEMP, cl.GROUP_CACHE, cl.GROUP_GPU,
-                 cl.GROUP_SYSTEM, cl.GROUP_DRIVER]
+        order = list(cl.GROUP_ORDER)
         groups = {}
         for r in self.rules:
             groups.setdefault(r.group, []).append(r)
@@ -479,6 +461,7 @@ class CleanerPage(BasePage):
             self.rules,
             on_progress=lambda rule: self._scanned.emit(rule),
             on_done=lambda total, rules: self._scan_done.emit(total, rules),
+            on_fast_done=lambda total, rules: self._scan_fast_done.emit(total, rules),
         )
         if not ok:
             self._busy = False
@@ -494,6 +477,32 @@ class CleanerPage(BasePage):
                 row.check.setEnabled(False)
         self._bar.setValue(self._bar.value() + 1)
         self._status.setText(f"正在扫描　{rule.name}")
+
+    def _on_scan_fast_done(self, total, rules):
+        """除「慢条目」（DISM 组件分析）以外全部扫完 —— 先让用户能动手。
+
+        为什么单独有这么一拍：Dism /AnalyzeComponentStore 单项就要几十秒到
+        两分钟，而其余几十条规则（并行扫）通常几秒内就完了。以前所有按钮都
+        要等整轮扫描结束才解禁，用户体感就是"扫描特别慢"。现在这里先把结果
+        put 上去、按钮解禁，慢条目那一行继续在后台分析。
+        """
+        self._busy = False
+        self.btn_scan.setEnabled(True)
+        self.btn_scan.setText("重新扫描")
+        found = sum(1 for r in rules if r.size > 0)
+        slow_pending = [r for r in rules
+                        if getattr(r, "slow_scan", False) and not r.scanned]
+        self._update_group_sums()
+        self._update_selection()
+        if slow_pending:
+            self._status.setText(
+                "已扫完 %d / %d 项，共约 %s；正在分析组件存储（较慢，"
+                "可先清理已扫出的项）…"
+                % (found, len(rules), cl.human_bytes(total)))
+        else:
+            self._status.setText(
+                f"已扫完 {found} / {len(rules)} 项，共可释放约 "
+                f"{cl.human_bytes(total)}")
 
     def _on_scan_done(self, total, rules):
         self._busy = False
@@ -554,10 +563,8 @@ class CleanerPage(BasePage):
         total = sum(r.size for r in sel)
         # 提前告知可能重启资源管理器（任务栏会短暂消失）
         explorer_hint = any(cl.may_restart_explorer(r) for r in sel)
-        # 提前告知会弹 UAC（有需要管理员权限的项、且当前不是管理员）
-        admin_count = 0 if cl.is_admin() else sum(1 for r in sel if r.admin)
         dlg = ConfirmDialog(rows, total, parent=self.window(),
-                            explorer_hint=explorer_hint, admin_count=admin_count)
+                            explorer_hint=explorer_hint)
         self._confirm_dlg = dlg
         dlg.confirmed.connect(lambda: self._run_clean(sel))
         dlg.show()
@@ -582,78 +589,14 @@ class CleanerPage(BasePage):
         self._status.setText("正在清理")
         self._results = []
 
-        # 拆分选中项：
-        #   direct   —— 普通权限就能清（非 admin 项；或用户本来就是管理员）
-        #   elevated —— 只有管理员权限才清得动，交给提权子进程（弹一次 UAC）
-        if cl.is_admin():
-            direct, elevated = list(sel), []
-        else:
-            direct = [r for r in sel if not r.admin]
-            elevated = [r for r in sel if r.admin]
-        self._pending_elevated = elevated
-
-        if not direct:
-            # 全是需要提权的项，不必白跑一趟普通清理
-            self._on_clean_done([])
-            return
+        # 程序本身由 exe 清单保证管理员启动，全部选中项直接清，
+        # 不做任何拆分与二次提权；个别条目权限不足会逐项计入 failed。
         self._worker.start(
-            direct,
+            list(sel),
             on_rule_done=lambda res: self._clean_rule_done.emit(res),
             on_done=lambda results: self._clean_done.emit(results),
             on_status=lambda rule, text: self._clean_status.emit(rule.name, text),
         )
-
-    # ------------------------------------------------------ 提权清理（UAC）
-    def _start_elevated_clean(self, rules):
-        """对需要管理员权限的规则走提权清理。
-
-        普通权限的 worker 先把能清的清完，剩下这些交给
-        `Yuhub.exe --clean-elevated` 提权子进程（弹一次 UAC、无窗口静默执行），
-        结果通过临时 JSON 文件回传。
-        """
-        self._elevated_rules = list(rules)
-        names = "、".join(r.name for r in rules[:3])
-        if len(rules) > 3:
-            names += f" 等 {len(rules)} 项"
-        self._status.setText(f"需管理员权限：{names}　请在 UAC 弹窗点「是」")
-        self._clean_status.emit("", "等待管理员授权…")
-        keys = [r.key for r in rules]
-        threading.Thread(target=self._do_elevated_clean, args=(keys,),
-                         daemon=True).start()
-
-    def _do_elevated_clean(self, keys):
-        try:
-            data = cl.run_elevated_clean(keys)
-        except Exception:
-            data = None
-        self._clean_elevated_done.emit(data)
-
-    def _on_elevated_done(self, data):
-        """提权清理返回（主线程）。data 为 None 表示 UAC 被取消或超时。"""
-        results = []
-        for rule in getattr(self, "_elevated_rules", []):
-            d = (data or {}).get(rule.key)
-            if d is None:
-                res = cl.CleanResult(key=rule.key, name=rule.name)
-                res.messages.append(
-                    "需要管理员权限，未清理（授权被取消或失败）"
-                    if data is None else "未清理")
-                results.append(res)
-                continue
-            res = cl.CleanResult(
-                key=d.get("key", rule.key), name=d.get("name", rule.name),
-                freed=d.get("freed", 0), estimated=d.get("estimated", 0),
-                removed_bytes=d.get("removed_bytes", 0),
-                removed_count=d.get("removed_count", 0),
-                failed=d.get("failed", 0), verified=d.get("verified", True),
-            )
-            res.messages.extend(d.get("messages") or [])
-            results.append(res)
-        self._elevated_rules = []
-        # 逐条刷 UI（进度条 / 行文案）——和普通清理走同一条更新路径
-        for res in results:
-            self._on_clean_rule_done(res)
-        self._finish_clean()
 
     def _on_clean_status(self, name, text):
         if name:
@@ -675,12 +618,7 @@ class CleanerPage(BasePage):
                 row.set_size("无可清理", muted=True)
 
     def _on_clean_done(self, results):
-        """普通权限清理完成。若还有待提权的项，接着走提权流程。"""
-        if getattr(self, "_pending_elevated", None):
-            rules = self._pending_elevated
-            self._pending_elevated = []
-            self._start_elevated_clean(rules)
-            return
+        """全部选中项清理完成。"""
         self._finish_clean()
 
     def _finish_clean(self):

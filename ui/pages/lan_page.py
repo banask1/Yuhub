@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -36,9 +37,10 @@ from PySide6.QtWidgets import (
 import etier
 import lan_share
 import node_probe
+import room_chat
 import screenshare
 from .. import theme
-from ..widgets import ghost_button, info_card, primary_button
+from ..widgets import ghost_button, primary_button
 from .base_page import BasePage
 
 
@@ -57,12 +59,11 @@ _NODE_COMBO_MAX_W = 360
 # 25565 是它开专用服务器(dedicated server)的默认端口，所以保留在列表里。
 # 神力科莎：acServer 默认 9600（TCP+UDP，赛车主数据）——局域网里可直接
 #           用（在线列表的 LAN 标签页会自己发现，或手动填 IP:9600）。
-# 以撒的结合：⚠️ 官方明确不支持 LAN/局域网联机（只有同屏合作 + Steam 在线
-#           联机/远程同乐串流），虚拟局域网里没有可填的 IP:端口，列出来只为
-#           提醒，别让队友白找地址。
 # **其他游戏**：端口填 0 = "没有固定端口/用不上端口"（用户 2026-10-05 要求）。
 #           这类游戏（自建服、非标准端口的、或者只是想让队友拿到纯 IP 的）
 #           复制出来只给**纯 IP**，不拼 `:端口`，UI 里也不显示端口后缀。
+# 以撒的结合：官方不支持局域网联机（只有同屏 + Steam 在线），列出来只会
+#           让队友白找地址，已按用户 2026-10-11 要求移除。
 GAME_PORTS = (
     ("Minecraft 服务器", 25565),
     ("泰拉瑞亚", 7777),
@@ -70,7 +71,6 @@ GAME_PORTS = (
     ("神力科莎", 9600),
     ("饥荒联机版", 10999),
     ("CS 2 / 起源引擎", 27015),
-    ("以撒的结合（无局域网联机）", 27015),
     ("七日杀", 26900),
     ("其他游戏", 0),
 )
@@ -93,6 +93,19 @@ def game_addr(ip, port):
     if not ip:
         return ""
     return "%s:%s" % (ip, port) if port else str(ip)
+
+
+def _lat_bucket(ms):
+    """延迟分档（5ms 一档），只用于"要不要重画成员行"的签名比较。
+
+    为什么要分档而不是直接用精确值：成员行是整体重建的，拿精确延迟当签名
+    等于"延迟每抖 0.1ms 就重建一次"。分档之后只有跨档（用户能看出差别）才
+    重画。没有延迟数据返回 -1（与 0ms 区分开）。
+    """
+    try:
+        return int(float(ms) // 5)
+    except (TypeError, ValueError):
+        return -1
 
 
 def random_room_code():
@@ -148,7 +161,7 @@ class _DropZone(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumHeight(70)
+        self.setMinimumHeight(64)
         self.setToolTip("把文件 / 文件夹拖到这里分享；也可以直接点一下选文件")
         self._active = False
         self._armed = False      # 房间已开启（拖拽/点击才真的能用）
@@ -251,6 +264,10 @@ class LanPage(BasePage):
     # 引擎回调发生在后台线程，必须经信号排队回主线程再碰控件
     _event = Signal(str, object)
 
+    #: 房间聊天消息（room_chat 的接收线程 → 主线程 → 屏幕共享页渲染）。
+    #: payload 是一条消息记录，字段见 room_chat.RoomChat 的 docstring。
+    chat_message = Signal(dict)
+
     def __init__(self, notify=None, parent=None):
         super().__init__(
             "异地联机",
@@ -265,6 +282,17 @@ class LanPage(BasePage):
         self._my_ip = ""              # 本机虚拟 IP（运行中）
         self._tracker = None          # etier.MemberTracker：成员在线稳定视图
         self._beacon = None           # etier.NickBeacon：昵称信标（广播+TCP）
+        # etier.CorePeerFeed：借 easytier-cli 读 core 的**权威成员表**
+        # （第三条到场信号 + 链路质量）。cli 不在就静默降级，见该类注释。
+        self._core_feed = None
+        # 房间聊天（room_chat.RoomChat）：进房才创建，退房即销毁。
+        # _chat_file_ids 记着"哪个云盘文件对应哪条聊天消息"——取消分享时
+        # 靠它把那条消息广播成「已撤回」。
+        self._chat = None
+        self._chat_file_ids = {}
+        # 链路诊断：已写进日志面板的行（去重）、上次扫描时间
+        self._link_seen = set()
+        self._link_check_at = 0.0
         self._members_row = []        # 当前渲染出来的成员 IP 顺序（用于增删行）
         self._host_nick = ""          # 本次启动用的昵称（成员列表第一行显示）
         self._started_wall = 0.0      # 本次进房的时间戳（time.time，给温和提示用）
@@ -277,6 +305,12 @@ class LanPage(BasePage):
         self._share_widgets = {}      # key -> {"prog","btn"}：进度只改这两个控件
         self._share_remote = {}       # ip -> [文件]（上一次轮询拉回来的）
         self._share_peer_ports = {}   # ip -> 对方云盘端口
+        # ip -> 本轮拉清单失败的原因（未开启 / 超时 / 令牌不匹配…）。
+        # 为什么要留住它：以前失败是**静默**的——对方文件一个都不显示、
+        # 也没有任何提示，用户只能得出"云盘坏了"的结论（反馈原话：
+        # "看不到我朋友分享的软件"）。现在把它渲染成一行可见的故障行。
+        self._share_errors = {}
+        self._share_seen_errors = {}   # 已写进日志的错误（防每 3 秒刷屏）
         self._share_polling = False   # 上一轮清单还没拉完，别叠加
         self._share_peers = {}        # ip -> 昵称（渲染来源用）
         self._share_rev = 0           # 我这份清单的版本号（增删文件就 +1）
@@ -349,12 +383,26 @@ class LanPage(BasePage):
 
     # ------------------------------------------------------------------ 构建
     def _build_content(self):
-        self.add(self._build_mode_card())
-        self.add(self._build_members_card())
-        self.add(self._build_share_card())
-        self.add(self._build_log_card())
-        self.add(self._build_help_card())
-        self.add_stretch()
+        # 四区块布局（用户 2026-10-12 要求）：
+        #   上 1/3 高度   跨网房间设置（房间码 / 密码 / 昵称 / 节点 / 进入房间）
+        #   左下 2/3 高度 在线成员
+        #   右中 1/3 高度 临时云盘
+        #   右下 1/3 高度 运行日志
+        # 用 stretch 1:2 分上下；底部行内左侧 2、右侧上下各 1，
+        # 于是右侧两块各占 1/4 + 间距，视觉上就是"右中 / 右下"。
+        self.add(self._build_mode_card(), 1)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(12)
+        bottom.addWidget(self._build_members_card(), 2)
+
+        right = QVBoxLayout()
+        right.setSpacing(12)
+        right.addWidget(self._build_share_card(), 1)
+        right.addWidget(self._build_log_card(), 1)
+        bottom.addLayout(right, 1)
+
+        self.add_layout(bottom, 2)
 
     def _label(self, text):
         lb = QLabel(text)
@@ -374,7 +422,7 @@ class LanPage(BasePage):
         card.setObjectName("Card")
         v = QVBoxLayout(card)
         v.setContentsMargins(18, 16, 18, 16)
-        v.setSpacing(12)
+        v.setSpacing(8)
 
         head = QHBoxLayout()
         head.setSpacing(10)
@@ -393,7 +441,7 @@ class LanPage(BasePage):
         #   2. 让"房间码"看起来像房主生成的凭据，其实是双方自己约定的一组字符串。
         # 所以统一成一句话：**填同一组房间码 + 密码，就在同一个房间里**。
 
-        # 昵称：队友在「在线成员」里看到的就是它（比 DESKTOP-XXXX 好认）
+        # 第一行：我的昵称 + 房间码（合并成一行，四区块布局下省高度）
         rn = QHBoxLayout()
         rn.setSpacing(8)
         rn.addWidget(self._label("我的昵称"))
@@ -402,31 +450,27 @@ class LanPage(BasePage):
         saved_nick = str(self._settings.value("lan_nickname", "") or "").strip()
         self.nick_edit.setText(sanitize_nickname(saved_nick) or default_nickname())
         self.nick_edit.setPlaceholderText("队友看到的名字")
-        self.nick_edit.setMaximumWidth(180)
+        self.nick_edit.setMaximumWidth(150)
         self.nick_edit.setMaxLength(16)
         rn.addWidget(self.nick_edit)
         btn_nick_reset = ghost_button("恢复默认")
         btn_nick_reset.clicked.connect(self._on_reset_nick)
         rn.addWidget(btn_nick_reset)
-        rn.addStretch(1)
-        v.addLayout(rn)
-        # 昵称实时驱动启动按钮可用态（必须在 btn_start 建好之后再连，
-        # 所以放到卡片最后统一接一次信号）
-
-        r1 = QHBoxLayout()
-        r1.setSpacing(8)
-        r1.addWidget(self._label("房间码"))
+        rn.addSpacing(16)
+        rn.addWidget(self._label("房间码"))
         self.code_edit = QLineEdit()
         self.code_edit.setPlaceholderText("点「随机」生成，或自己起一个")
-        self.code_edit.setMaximumWidth(160)
-        r1.addWidget(self.code_edit)
+        self.code_edit.setMaximumWidth(150)
+        rn.addWidget(self.code_edit)
         self.btn_random = ghost_button("随机")
         self.btn_random.clicked.connect(
             lambda: self.code_edit.setText(random_room_code())
         )
-        r1.addWidget(self.btn_random)
-        r1.addStretch(1)
-        v.addLayout(r1)
+        rn.addWidget(self.btn_random)
+        rn.addStretch(1)
+        v.addLayout(rn)
+        # 昵称实时驱动启动按钮可用态（必须在 btn_start 建好之后再连，
+        # 所以放到卡片最后统一接一次信号）
 
         # 唯一的引导文案（不再有身份之分，所以是静态的一句话）
         self.mode_note = self._note(
@@ -490,7 +534,7 @@ class LanPage(BasePage):
         self.status_note = self._note("")
         v.addWidget(self.status_note)
 
-        # 本机虚拟 IP + 复制（方便游戏里直接输 IP 联机）
+        # 运行中的直连信息放同一行：本机虚拟 IP + 游戏快连
         rip = QHBoxLayout()
         rip.setSpacing(8)
         rip.addWidget(self._label("本机虚拟 IP"))
@@ -504,16 +548,13 @@ class LanPage(BasePage):
         self.btn_copy_ip.setEnabled(False)
         self.btn_copy_ip.clicked.connect(self._on_copy_ip)
         rip.addWidget(self.btn_copy_ip)
-        rip.addStretch(1)
-        v.addLayout(rip)
+        rip.addSpacing(16)
 
         # 游戏快连（参考 MCTier）：常见联机游戏端口预设，
         # 运行中一键拼出「虚拟 IP:端口」复制，省得现查端口表。
-        qk = QHBoxLayout()
-        qk.setSpacing(8)
-        qk.addWidget(self._label("游戏快连"))
+        rip.addWidget(self._label("游戏快连"))
         self.game_combo = QComboBox()
-        self.game_combo.setMaximumWidth(220)
+        self.game_combo.setMaximumWidth(200)
         for i, (name, port) in enumerate(GAME_PORTS):
             self.game_combo.addItem(game_label(name, port), port)
             # 纯游戏名单独存一份（纯展示用：成员行里的贴片 + 广播给队友）
@@ -522,25 +563,24 @@ class LanPage(BasePage):
             "选你这次要玩的游戏：会广播给队友（成员行显示贴片），\n"
             "每行的「复制」也给那个人的「IP:端口」。\n"
             "选「其他游戏」时不带端口，复制的是纯 IP。进房间后也能改。")
-        qk.addWidget(self.game_combo)
+        rip.addWidget(self.game_combo)
         self.btn_copy_addr = ghost_button("复制 IP:端口")
         self.btn_copy_addr.setEnabled(False)
         self.btn_copy_addr.clicked.connect(self._on_copy_game_addr)
-        qk.addWidget(self.btn_copy_addr)
-        qk.addStretch(1)
-        v.addLayout(qk)
+        rip.addWidget(self.btn_copy_addr)
+        rip.addStretch(1)
+        v.addLayout(rip)
 
         # 放在最后连：addItem 填充期间也会发 currentIndexChanged，
         # 那时 _beacon / 成员行还没建起来，提前连会打到空对象上。
         self.game_combo.currentIndexChanged.connect(self._on_game_changed)
 
+        # 用法浓缩（原「怎么用」大卡片的要点，四区块布局后并到这里）
         v.addWidget(self._note(
-            "约定一组房间码 + 密码发给大家，各自填好点「进入房间」，"
-            "几台电脑就进了同一个虚拟局域网（首次弹一次 UAC，之后不再弹）。"
-            "\n"
-            "昵称必填，队友靠它在「在线成员」里认你。虚拟 IP 不固定，"
-            "变化时这里会提示；也可随时点「刷新」重读本机 IP 并重扫成员，"
-            "不用「停止 → 再进入」。",
+            "用法：各自填同一组房间码 + 密码，点「进入房间」（首次弹一次 UAC）；"
+            "游戏里点「对局域网开放」即可在多人游戏列表互相看到。\n"
+            "文件拖进右侧「临时云盘」与队友互传，退房即失效；"
+            "虚拟 IP 变了会提示，也可点「刷新」重读。",
             warn=False
         ))
 
@@ -567,6 +607,7 @@ class LanPage(BasePage):
     def _build_members_card(self):
         card = QFrame()
         card.setObjectName("Card")
+        card.setMinimumHeight(170)
         v = QVBoxLayout(card)
         v.setContentsMargins(18, 16, 18, 16)
         v.setSpacing(8)
@@ -611,8 +652,9 @@ class LanPage(BasePage):
         v.addWidget(self.members_box)
         return card
 
-    def _make_member_row(self, name, ip, is_self=False, game="", port=0, ss=0):
-        """构造一行成员：色块 + 昵称 + IP + 游戏快连贴片 + 看屏幕 + 复制按钮。
+    def _make_member_row(self, name, ip, is_self=False, game="", port=0, ss=0,
+                         core=None):
+        """构造一行成员：色块 + 昵称 + IP + 游戏快连贴片 + 链路质量 + 看屏幕 + 复制。
 
         is_self 为真时高亮并标注"（我）"，方便用户一眼分清
         "哪个地址是我自己的"——填进游戏别填错了。
@@ -624,6 +666,11 @@ class LanPage(BasePage):
 
         ss 是**这个人**在「屏幕共享」页开的服务端口（0 = 没在共享），
         同样由信标广播过来。有它就有「看屏幕」按钮。
+
+        core 是这条链路的**权威质量数据**（来自 EasyTier 自己的成员表，
+        见 etier.CorePeerFeed）：延迟/丢包/隧道协议/NAT 类型/是否直连。
+        没有它（cli 没装、core 没起）就什么都不显示——这一行照旧能用，
+        这是"保留旁路通道"的意思。
         """
         p = theme.current()
         row = QFrame()
@@ -676,6 +723,23 @@ class LanPage(BasePage):
                     "（端口 %d）" % port if port else ""))
             h.addWidget(tag)
 
+        # 「中继」标记：core 的成员表说这条链路**没有直连**（多跳/走中继）。
+        # 为什么值得单独摆一个贴片：公共中继是社区共享带宽（实测有效吞吐
+        # 约 3.6Mbps），异地分屏帧率低十有八九就是它——把这一条摆在成员行
+        # 上，用户不用翻日志就知道该换个中继节点、或者让两边别挡着 UDP。
+        if core and core.get("relayed") and not is_self:
+            relay_tag = QLabel("中继")
+            relay_tag.setStyleSheet(
+                "font-size: 11px; color: %s; background: transparent;"
+                " border: 1px solid %s; border-radius: 4px; padding: 1px 6px;"
+                % (p["red"], p["red"]))
+            relay_tag.setToolTip(
+                "这条链路没有直连（走公共中继或多跳）。中继带宽是社区共享的，"
+                "屏幕共享/传文件的速率会被它限制。\n可以试试：\n"
+                "· 在「中继节点」里换一个（下拉里显示的是本机实测延迟）；\n"
+                "· 确认两边都没被防火墙/路由器挡着 UDP（打洞靠它）。")
+            h.addWidget(relay_tag)
+
         h.addStretch(1)
 
         # 「看屏幕」：对方正在共享屏幕时才有。点击跳到屏幕共享页并直接连上
@@ -717,13 +781,35 @@ class LanPage(BasePage):
         btn.setToolTip("复制直连地址 %s" % addr)
         btn.clicked.connect(lambda _=False, v=addr: self._copy_text(v, "直连地址"))
         h.addWidget(btn)
+
+        # 链路质量详情放 tooltip：行要能一眼扫过去，精确数字按需看。
+        # （数据来自 core 的成员表；没接上时 core 为空，这一行照旧可用。）
+        if core:
+            bits = []
+            lat = core.get("lat_ms")
+            if lat is not None:
+                try:
+                    bits.append("延迟 %.1f ms" % float(lat))
+                except (TypeError, ValueError):
+                    pass
+            if core.get("loss_rate"):
+                bits.append("丢包 %s" % core["loss_rate"])
+            if core.get("tunnel"):
+                bits.append("隧道 %s" % core["tunnel"])
+            if core.get("nat"):
+                bits.append("NAT %s" % core["nat"])
+            if core.get("relayed"):
+                bits.append("未直连（中继/多跳）")
+            if bits:
+                row.setToolTip("链路：%s\n（数据来自 EasyTier 自己的成员表）"
+                               % " · ".join(bits))
         return row
 
     def _render_members(self, entries):
         """按 entries 重建成员行。
 
-        entries: [{"ip","name","self","game","port","ss"}]。每次都整体重建而不是
-        做差量更新：成员数量是个位数，重建几个小控件的开销可以忽略，
+        entries: [{"ip","name","self","game","port","ss","core"}]。每次都整体重建
+        而不是做差量更新：成员数量是个位数，重建几个小控件的开销可以忽略，
         换来的是"不会漏删/重影"。
         """
         while self.members_layout.count():
@@ -742,7 +828,8 @@ class LanPage(BasePage):
                                       is_self=bool(e.get("self")),
                                       game=e.get("game", ""),
                                       port=int(e.get("port") or 0),
-                                      ss=int(e.get("ss") or 0))
+                                      ss=int(e.get("ss") or 0),
+                                      core=e.get("core") or {})
             )
         self.members_box.setVisible(bool(entries))
 
@@ -796,6 +883,7 @@ class LanPage(BasePage):
         """
         card = QFrame()
         card.setObjectName("Card")
+        card.setMinimumHeight(140)
         v = QVBoxLayout(card)
         v.setContentsMargins(18, 16, 18, 16)
         v.setSpacing(8)
@@ -818,9 +906,10 @@ class LanPage(BasePage):
         v.addWidget(self.drop_zone)
 
         self.share_hint = QLabel(
-            "进入房间后可用：拖进来的文件，队友在「在线成员」里就能看到并下载。\n"
-            "文件不会上传到任何服务器——它在你的电脑上，队友直接从你这里取。\n"
-            "退出房间（或点「停止」）服务立即关闭，之后谁都下不到。"
+            "进入房间后可用：把文件拖进上面的框（或点一下选文件），"
+            "队友在左侧「在线成员」里就能看到并下载。\n"
+            "文件只在你自己的电脑上，不经任何服务器；"
+            "退出房间（或点「停止」）服务立即关闭。"
         )
         self.share_hint.setObjectName("Faint")
         self.share_hint.setWordWrap(True)
@@ -855,17 +944,25 @@ class LanPage(BasePage):
 
         dot = QFrame()
         dot.setFixedSize(9, 9)
+        if entry.get("problem"):
+            dot_color = p["amber"]
+        else:
+            dot_color = p["accent"] if entry["mine"] else p["text_faint"]
         dot.setStyleSheet(
-            "background: %s; border: none; border-radius: 2px;"
-            % (p["accent"] if entry["mine"] else p["text_faint"]))
+            "background: %s; border: none; border-radius: 2px;" % dot_color)
         h.addWidget(dot)
 
         name = QLabel(entry["name"])
         name.setToolTip(entry["name"])
-        name.setStyleSheet(
-            "font-size: 12px; font-weight: %s; color: %s; background: transparent;"
-            " border: none;" % ("700" if entry["mine"] else "400",
-                               p["text"] if entry["mine"] else p["text_dim"]))
+        if entry.get("problem"):
+            name.setStyleSheet(
+                "font-size: 12px; font-weight: 400; color: %s;"
+                " background: transparent; border: none;" % p["amber"])
+        else:
+            name.setStyleSheet(
+                "font-size: 12px; font-weight: %s; color: %s; background: transparent;"
+                " border: none;" % ("700" if entry["mine"] else "400",
+                                   p["text"] if entry["mine"] else p["text_dim"]))
         h.addWidget(name, 1)
 
         prog = QLabel("")
@@ -882,19 +979,28 @@ class LanPage(BasePage):
             % (p["text_dim"], p["border_strong"]))
         h.addWidget(tag)
 
-        size = QLabel(lan_share.human_size(entry["size"]))
+        size = QLabel(lan_share.human_size(entry["size"]) if not entry.get("problem")
+                      else "—")
         size.setStyleSheet(
             "font-size: 11px; color: %s; background: transparent; border: none;"
             % p["text_faint"])
         h.addWidget(size)
 
-        busy = bool(self._download and self._download.get("key") == entry["key"])
-        btn = QPushButton("取消" if busy else ("移除" if entry["mine"] else "下载"))
-        btn.setObjectName("MiniButton")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedHeight(26)
-        btn.setMinimumWidth(56)
-        btn.clicked.connect(lambda _=False, e=entry: self._on_share_action(e))
+        if entry.get("problem"):
+            btn = QPushButton("重试")
+            btn.setObjectName("MiniButton")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(26)
+            btn.setMinimumWidth(56)
+            btn.clicked.connect(lambda _=False: self._poll_shares())
+        else:
+            busy = bool(self._download and self._download.get("key") == entry["key"])
+            btn = QPushButton("取消" if busy else ("移除" if entry["mine"] else "下载"))
+            btn.setObjectName("MiniButton")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(26)
+            btn.setMinimumWidth(56)
+            btn.clicked.connect(lambda _=False, e=entry: self._on_share_action(e))
         h.addWidget(btn)
 
         self._share_widgets[entry["key"]] = {"prog": prog, "btn": btn}
@@ -919,6 +1025,14 @@ class LanPage(BasePage):
                                 "name": f["name"], "size": f["size"],
                                 "owner": owner, "mine": False,
                                 "ip": ip, "port": port})
+        # 拉清单失败的队友：列一行**看得见**的故障行（带原因 + 重试按钮）。
+        # 以前这里是静默的，用户只能看到"一个文件都没有"，无法判断是自己
+        # 没分享、还是对方不可达、还是令牌对不上。
+        for ip, err in (self._share_errors or {}).items():
+            owner = (self._share_peers or {}).get(ip) or ip
+            entries.append({"key": "err:" + ip, "fid": "", "name": err,
+                            "size": 0, "owner": owner, "mine": False,
+                            "ip": ip, "port": 0, "problem": True})
         sig = [(e["key"], e["name"], e["size"], e["owner"]) for e in entries]
         self._share_entries = entries
         if sig != self._share_rows:
@@ -935,15 +1049,19 @@ class LanPage(BasePage):
                         "取消" if busy else ("移除" if e["mine"] else "下载"))
                     if not busy:
                         w["prog"].setVisible(False)
-        self.share_count.setText("%d 个文件" % len(entries))
+        self.share_count.setText(
+            "%d 个文件" % sum(1 for e in entries if not e.get("problem")))
         if self._running and self._hub is not None and self._hub.running:
             others = sum(len(f) for f in (self._share_remote or {}).values())
+            bad = len(self._share_errors or {})
+            extra = ("\n⚠ 有 %d 位队友的云盘暂时连不上（列表里已标出来，"
+                     "可点「重试」）。" % bad) if bad else ""
             self.share_hint.setText(
                 "云盘已开启：拖文件进来（或点一下这里选文件），队友就能下载；"
                 "已看到队友分享的 %d 个文件。\n"
                 "下载时每次都会让你选保存位置。队友退出房间或取消分享，"
                 "他那些文件会立刻从这里消失。\n"
-                "你退出房间后服务立即关闭，之后谁都下不到。" % others)
+                "你退出房间后服务立即关闭，之后谁都下不到。%s" % (others, extra))
 
     def _render_share(self, entries):
         while self.share_layout.count():
@@ -1077,6 +1195,8 @@ class LanPage(BasePage):
             # 变化并立刻重拉清单——这就是"每次上传文件，所有人都刷新一次"。
             self._bump_share_rev()
             self._poll_shares()
+            # 同时，每个新分享的文件在聊天室里留一条可下载的消息
+            self._announce_share_files(added)
         self._refresh_share_view()
 
     def _on_share_action(self, entry):
@@ -1089,6 +1209,9 @@ class LanPage(BasePage):
                 return
             self._hub.remove(entry["fid"])
             self._append_log("已取消分享：%s" % entry["name"])
+            # 聊天室里那条文件消息同步变成「已撤回」（先撤再广播版本号，
+            # 队友那边两条信号到的顺序无所谓：一个改文字、一个撤列表行）
+            self._withdraw_chat_file(entry["fid"])
             # 取消分享同样要让所有人立刻刷新（队友那边这一行要马上消失）
             self._bump_share_rev()
             self._poll_shares()
@@ -1163,6 +1286,115 @@ class LanPage(BasePage):
         self._share_rev = int(self._share_rev) + 1
         self._publish_share_port()
 
+    # ------------------------------------------------------------------ 聊天
+    def chat_history(self):
+        """聊天历史（屏幕共享页切到前台时补画用）。"""
+        return self._chat.history() if self._chat is not None else []
+
+    def chat_active(self):
+        """聊天是否可用（在房间里且监听成功）。"""
+        return self._chat is not None and self._chat.running
+
+    def send_chat_text(self, text):
+        """屏幕共享页的输入框调用：往房间发一条文本消息。
+
+        返回 (成功, 错误说明)。失败原因直接来自引擎（没进房 / 没虚拟 IP /
+        发送失败），界面原样 toast 出来。
+        """
+        if self._chat is None or not self._chat.running:
+            return False, "还没进入房间（先在「异地联机」里进房）"
+        try:
+            rec = self._chat.send_text(text)
+        except Exception as exc:
+            return False, "发送失败：%s" % exc
+        if rec is None:
+            return False, "消息是空的"
+        if rec.get("error"):
+            return False, str(rec.get("error"))
+        return True, ""
+
+    def _announce_share_files(self, added):
+        """把新分享的文件广播成聊天室里的文件消息（带下载按钮）。
+
+        一条消息一个文件：`_chat_file_ids` 记下 fid → 消息 id，取消分享时
+        靠它广播撤回（见 _withdraw_chat_file）。聊天没起来（监听失败等）
+        就只走云盘原有的版本号广播——聊天是锦上添花，不拦着传文件。
+        """
+        if not added or self._chat is None or not self._chat.running:
+            return
+        port = (self._hub.port if (self._hub is not None
+                                   and self._hub.running) else 0)
+        for e in added:
+            try:
+                rec = self._chat.send_file(e["name"], e["size"], e["id"], port)
+            except Exception:
+                continue
+            if rec:
+                self._chat_file_ids[e["id"]] = rec["id"]
+
+    def _withdraw_chat_file(self, fid):
+        """取消分享 → 广播撤回：队友聊天室里那条文件消息变成「已撤回」。"""
+        mid = self._chat_file_ids.pop(fid, "")
+        if not mid or self._chat is None:
+            return
+        try:
+            self._chat.withdraw(mid)
+        except Exception:
+            pass
+
+    def download_chat_file(self, rec):
+        """下载聊天室里的文件消息（屏幕共享页的下载图标调用）。
+
+        端口优先用**轮询拿到的最新值**：消息里带的是对方分享那一刻的云盘
+        端口，对方换 IP 重绑后会变；`_share_peer_ports` 每 3 秒随清单刷新。
+        下载 key 与云盘列表行同一个格式（ip:fid）——于是同一次下载在云盘
+        卡片里也能看到进度，两边点的是同一个文件，不该出现两个进度。
+        """
+        hub = self._hub
+        if hub is None or not hub.running:
+            self.toast("临时云盘没在运行（先进房间）")
+            return
+        if self._download is not None:
+            self.toast("已有一个下载在进行，先等它结束或点它那行的「取消」")
+            return
+        rec = rec or {}
+        ip = str(rec.get("from_ip") or "")
+        fid = str(rec.get("fid") or "")
+        name = str(rec.get("name") or "文件")
+        port = int((self._share_peer_ports or {}).get(ip)
+                   or rec.get("port") or 0)
+        if not ip or not fid or not port:
+            self.toast("这条文件消息已经下不了了（对方可能退出了房间）")
+            return
+        dest = self._ask_save_path(name)
+        if not dest:
+            self._append_log("已取消下载：%s" % name)
+            self.toast("已取消下载")
+            return
+        key = "%s:%s" % (ip, fid)
+        self._download = {"key": key, "name": name}
+        self._cancel_dl = False
+        self._append_log("开始下载 %s（来自 %s，聊天室）→ %s" % (name, ip, dest))
+        last = [0.0]
+
+        def prog(done, total):
+            now = time.monotonic()
+            if done != total and now - last[0] < 0.25:
+                return          # 节流：每个 64KB 分块都发信号会把事件队列灌满
+            last[0] = now
+            self._event.emit("share_prog", {"key": key, "done": done,
+                                            "total": total})
+
+        def work():
+            ok, res = hub.download(ip, port, fid, progress=prog,
+                                   is_cancelled=lambda: self._cancel_dl,
+                                   timeout=20.0, dest_path=dest)
+            self._event.emit("share_done",
+                             {"key": key, "ok": ok, "result": res,
+                              "name": name})
+
+        threading.Thread(target=work, daemon=True, name="ChatDownload").start()
+
     def _ensure_share_hub(self, ip):
         """按当前虚拟 IP 起（或重绑）云盘服务。
 
@@ -1197,6 +1429,11 @@ class LanPage(BasePage):
         self._share_remote = {}
         self._share_peer_ports = {}
         self._share_peers = {}
+        self._share_errors = {}
+        self._share_seen_errors = {}
+        # 云盘没了：fid → 聊天消息 id 的对照表也没用了（聊天记录本身留着，
+        # 但那些文件消息点了也下不到了——服务已经停了，如实失败即可）
+        self._chat_file_ids = {}
         if hub is not None:
             try:
                 hub.stop()
@@ -1220,6 +1457,32 @@ class LanPage(BasePage):
         except RuntimeError:
             pass
 
+    def _room_alive_ips(self):
+        """此刻「应该算在场」的成员 IP：跟踪器快照 ∪ 信标新鲜表。
+
+        为什么云盘也要自己并一次（跟踪器内部已经并了信标）：跟踪器是另一条
+        线程的快照，慢一拍不要紧，**卡住**也不要紧——但只要这一拍没算他
+        在场，`_share_watch` 就会把他分享的文件行撤掉、`_poll_shares` 也不
+        会去拉他的清单。用户实测的"好友在房间里放东西我看不到"，就是
+        peer 列表单靠跟踪器快照造成的。两条线索取并集，任何一条算数。
+        """
+        ips = set()
+        try:
+            if self._tracker is not None:
+                ips.update(m.get("ip") or ""
+                           for m in self._tracker.snapshot())
+        except Exception:
+            pass
+        try:
+            if self._beacon is not None:
+                ips.update((self._beacon.live_peers() or {}).keys())
+        except Exception:
+            pass
+        ips.discard("")
+        if self._my_ip:
+            ips.discard(self._my_ip)
+        return ips
+
     def _poll_shares(self):
         """每 3 秒拉一次各成员的云盘清单（网络操作，必须丢后台线程）。"""
         if self._refresh_paused:
@@ -1235,12 +1498,21 @@ class LanPage(BasePage):
             live = self._beacon.live_shares() if self._beacon is not None else {}
         except Exception:
             live = {}
+        # 跟踪器快照兜底：信标条目有 15 秒新鲜期，偶尔连丢几包就过期了，
+        # 这时跟踪器里 sticky 的 share/srev 还能把轮询续上。
+        snap = {}
+        try:
+            if self._tracker is not None:
+                snap = {m.get("ip") or "": m
+                        for m in self._tracker.snapshot()}
+        except Exception:
+            snap = {}
+        # 🔴 轮询对象 = 跟踪器快照 ∪ 信标新鲜表（见 _room_alive_ips）：
+        # 以前只遍历跟踪器快照，ARP 没生成条目的队友永远不进 peers 列表，
+        # 他的文件就永远拉不回来——"好友放了文件我看不到"的根因。
         peers, ports, names = [], {}, {}
-        for m in (self._tracker.snapshot() if self._tracker else []):
-            ip = m.get("ip") or ""
-            if not ip or ip == self._my_ip:
-                continue
-            names[ip] = m.get("name") or ip
+        for ip in sorted(self._room_alive_ips()):
+            m = snap.get(ip) or {}
             if ip in live:
                 port = int(live[ip][0] or 0)     # 信标说关了就是关了，别拿旧值
             else:
@@ -1248,6 +1520,7 @@ class LanPage(BasePage):
             if port:
                 ports[ip] = port
                 peers.append({"ip": ip, "port": port})
+                names[ip] = m.get("name") or ip
         self._share_polling = True
 
         def work():
@@ -1267,24 +1540,25 @@ class LanPage(BasePage):
 
           1. 对方信标里的版本号变了 → 他刚上传或取消了一个分享文件，
              马上重拉一次他的清单。（"谁传文件/取消分享，所有人都刷新一次"）
-          2. 对方的云盘端口变成 0（他关了云盘）、或者他人已经不在成员列表
-             里了（退出房间 / 掉线）→ 当场把他分享的文件行撤下来。
+          2. 对方的云盘端口变成 0（他关了云盘）、或者两条到场信号都看不到
+             他了（真退出房间 / 掉线）→ 当场把他分享的文件行撤下来。
              （"分享的人退出房间，文件直接从分享列表里消失"）
         """
         if not (self._running and self._hub is not None and self._hub.running):
             self._share_seen = {}
             return
+        marks = {}
         try:
-            members = self._tracker.snapshot() if self._tracker else []
+            for m in (self._tracker.snapshot() if self._tracker else []):
+                ip = m.get("ip") or ""
+                if ip and ip != self._my_ip:
+                    marks[ip] = int(m.get("share") or 0)
         except Exception:
-            members = []
-        marks, online = {}, set()
-        for m in members:
-            ip = m.get("ip") or ""
-            if not ip or ip == self._my_ip:
-                continue
-            online.add(ip)
-            marks[ip] = int(m.get("share") or 0)
+            marks = {}
+        # 到场判定同样走并集：只认跟踪器快照的话，ARP 慢一拍就会把队友的
+        # 文件行撤掉，下一拍又拉回来——用户看到的就是"文件一闪一闪"，
+        # 严重时（跟踪器那拍始终没他）就一直是空的。
+        online = self._room_alive_ips()
         try:
             live = self._beacon.live_shares() if self._beacon is not None else {}
         except Exception:
@@ -1320,10 +1594,27 @@ class LanPage(BasePage):
         self._share_peers = payload.get("names") or {}
         self._share_peer_ports = payload.get("ports") or {}
         remote = {}
+        errors = {}
         for r in payload.get("res") or []:
-            if r.get("ok") and r.get("files"):
-                remote[r.get("ip") or ""] = r["files"]
+            ip = r.get("ip") or ""
+            if not ip:
+                continue
+            if r.get("ok"):
+                remote[ip] = r.get("files") or []
+            else:
+                err = str(r.get("error") or "未知原因")
+                errors[ip] = err
+                # ⭐ 本轮失败**不清空**上次拿到的清单：网络抖动、对方一时忙
+                # 都会失败一次，清空就会让队友的文件在列表里一闪一闪。
+                # 保留旧数据 + 打上"暂时连不上"的标记，才是用户能理解的行为。
+                if ip in (self._share_remote or {}):
+                    remote[ip] = self._share_remote[ip]
+                if err and self._share_seen_errors.get(ip) != err:
+                    self._append_log(
+                        "拉取 %s 的云盘清单失败：%s" % (self._share_peers.get(ip) or ip, err))
+        self._share_seen_errors = dict(errors)
         self._share_remote = remote
+        self._share_errors = errors
         self._refresh_share_view()
 
     def _on_share_prog(self, payload):
@@ -1365,6 +1656,7 @@ class LanPage(BasePage):
     def _build_log_card(self):
         card = QFrame()
         card.setObjectName("Card")
+        card.setMinimumHeight(140)
         v = QVBoxLayout(card)
         v.setContentsMargins(18, 16, 18, 16)
         v.setSpacing(8)
@@ -1383,44 +1675,13 @@ class LanPage(BasePage):
         self.log_view.setObjectName("LanLog")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)     # 自动丢掉旧行，不会越滚越吃内存
-        self.log_view.setFixedHeight(150)
+        # 四区块布局下日志卡只占右下 1/3：不锁死高度，让日志框随卡片伸缩。
+        # 垂直策略用 Ignored——QPlainTextEdit 空文档的 sizeHint 也有上百像素，
+        # 默认 Preferred 会把整页的 sizeHint 顶高、拖出滚动条。
+        self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.log_view.setMinimumHeight(80)
         v.addWidget(self.log_view)
         return card
-
-    def _build_help_card(self):
-        return info_card(
-            "怎么用",
-            "1. 游戏里点「对局域网开放」（以 Minecraft 为例：端口随机，"
-            "以聊天栏显示的为准）。\n"
-            "2. 这里「随机」生成房间码、设个密码，点「进入房间」"
-            "（首次弹一次 UAC，点「是」）。\n"
-            "3. 房间码 + 密码发给队友，队友填同一组、也点「进入房间」。\n"
-            "4. 各自打开游戏「多人游戏」，列表里就能看到彼此开的房间。\n"
-            "\n"
-            "房间码不是谁「建」出来的，是大家约定好的一组暗号，谁先进入都行。\n"
-            "昵称必填，队友在「在线成员」里看到的就是它。\n"
-            "虚拟 IP 由 EasyTier 自动分配，重启或卡死重进后可能变——变了本页会\n"
-            "提示，拿不准就点「在线成员」右上角的「刷新」，不用重进房间。\n"
-            "「游戏快连」选你这次要玩的游戏，会广播给队友；每行的「复制」拿到的\n"
-            "是**那个人的**「IP:端口」，填进游戏即可。选「其他游戏」时不带端口，\n"
-            "复制的是纯 IP。中继节点一般保持「自动」——\n"
-            "下拉里各节点的毫秒是本机实测、按快慢排序，每 90 秒自动重测；\n"
-            "想手动指定更快/更稳的那个，点「测速」看清延迟再选。\n"
-            "\n"
-            "原理：内嵌 EasyTier（Apache 2.0 开源）建一块虚拟网卡，把填了相同\n"
-            "房间码 + 密码的电脑拉进同一个虚拟局域网——P2P 直连优先，打洞不通时\n"
-            "走社区节点中继。虚拟网卡驱动已内置，无需提前装任何东西；首次运行\n"
-            "Windows 防火墙若弹窗，允许即可，否则隧道建不起来。\n"
-            "房间码 + 密码双重校验，密码不落盘、不明文传输，停止后即从内存清除。\n"
-            "\n"
-            "临时云盘：进房后把文件拖进「临时云盘」的框里（或点一下那个框选文件），\n"
-            "同房间的人就能下载，下载时各自选自己要存的位置。\n"
-            "文件只在你自己的电脑上，不经任何服务器；谁退出房间、谁取消分享，\n"
-            "他那份文件都会立刻从所有人的列表里消失。\n"
-            "\n"
-            "备注：神力科莎用 acServer 开服后走游戏内 LAN 列表，或直接填 IP:9600；\n"
-            "以撒的结合不支持局域网联机（只能同屏或走 Steam 在线），列表里只是提醒。",
-        )
 
     # ------------------------------------------------------------------ 交互
     def _start_button_text(self):
@@ -1753,8 +2014,11 @@ class LanPage(BasePage):
         # 遇到冲突会自动改地址。代价是 IP 不再可预测，所以成员侧的准入校验
         # 不能再 ping 固定的 10.126.126.1，改由 pick_host_ip() 动态发现。
         try:
+            # 网络名与密码都走 etier 的**唯一归一化口径**（见 etier.room_key）：
+            # 云盘的 token、屏幕共享的观看码都按同一口径派生，避免出现
+            # "房间进得去、但云盘/看屏幕互相读不到"。
             ok, msg = tier.start(
-                "yuhub-" + code.lower().replace(" ", ""), password,
+                "yuhub-" + etier.room_key(code), etier.room_secret(password),
                 timeout=20.0, hostname=nick, node=node_addr,
             )
         except Exception as exc:
@@ -1805,8 +2069,10 @@ class LanPage(BasePage):
             self.toast("启动失败：%s" % msg)
 
     def _stop_room_threads(self):
-        """停掉成员跟踪与昵称信标的后台线程（重复调用安全）。"""
-        for attr in ("_tracker", "_beacon"):
+        """停掉成员跟踪、昵称信标、core 成员表与聊天室的后台线程。
+
+        重复调用安全（换 IP 时会先停再起一遍）。"""
+        for attr in ("_tracker", "_beacon", "_core_feed"):
             obj = getattr(self, attr, None)
             if obj is not None:
                 try:
@@ -1814,6 +2080,13 @@ class LanPage(BasePage):
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        chat, self._chat = self._chat, None
+        if chat is not None:
+            try:
+                chat.stop()
+            except Exception:
+                pass
+        self._chat_file_ids = {}
         # 房间没了，屏幕共享那两个登记也一并撤掉（这个函数在换 IP 时也会走，
         # 换完 IP 会在 _start_room_threads 末尾重新登记）。
         screenshare.set_active_room()
@@ -1839,12 +2112,45 @@ class LanPage(BasePage):
             game=game, port=port,
         )
         self._beacon.start()
+        beacon = self._beacon        # 闭包用局部绑定，避免捕获 self 后取到新实例
+        # 🔴 权威成员表：借 easytier-cli 读 core 内部那张表（etier.CorePeerFeed）。
+        # 端口用**本次房间探得的那个**——core 的 portal 起在哪儿，cli 就连哪儿
+        # （见 RPC_PORT 的注释：刻意避开官方默认的 15888，免得和用户自装的
+        # EasyTier 撞车把 core 顶死）。拿不到就退回默认值：自检里的假 tier
+        # 没有这个方法，不该因此起不来房间。
+        try:
+            rpc_port = (int(self._etier.rpc_port())
+                        if self._etier is not None else etier.RPC_PORT)
+        except Exception:
+            rpc_port = etier.RPC_PORT
+        self._core_feed = etier.CorePeerFeed(rpc_port=rpc_port, on_log=log)
+        self._core_feed.start()
+        feed = self._core_feed
+        # 成员发现的三条到场信号，**并集**：
+        #   a. ARP（跟踪器内部自己扫）
+        #   b. 昵称信标新鲜表——应用层广播，入站 UDP 按端口放行
+        #   c. core 权威成员表——协议内数据，握手过的人在表里
+        # 任何一条坏掉都还有另外两条：用户实测的"看不到好友 / 好友云盘的文件
+        # 看不到"根因是只认 a，b 是应用层补丁，c 是根治。名称与链路质量也一并
+        # 从 c 兜底/补充（hostname 就是用户昵称）。
         self._tracker = etier.MemberTracker(
-            ip, name_lookup=self._beacon.get_info, on_log=log,
-        )
+            ip, name_lookup=beacon.get_info, on_log=log,
+            alive_hints=(lambda: (beacon.live_peers() or {}).keys(),
+                         lambda: (feed.by_ip() or {}).keys()),
+            name_hint=feed.hostname_of,
+            quality_hint=feed.quality_map)
         self._tracker.start()
         # 临时云盘与这一对同生共死（进房起、退房停、IP 变了重绑）
         self._ensure_share_hub(ip)
+        # 房间聊天：文本消息 + 云盘文件消息都走虚拟网 UDP 广播（room_chat）。
+        # 昵称用进房时填的那个——联机页强制必填，所以聊天室里不会出现裸 IP；
+        # 消息记录经 chat_message 信号转到主线程，由屏幕共享页渲染。
+        self._chat = room_chat.RoomChat(
+            ip, self._host_nick or self._current_nickname(),
+            on_message=lambda rec: self.chat_message.emit(rec),
+            on_log=lambda m: self._event.emit("_etier_log", m))
+        self._chat.start()
+        self._chat_file_ids = {}
         # 登记给屏幕共享：异地共享要绑虚拟 IP，观看码由「房间码+密码」派生。
         # 放在这里而不是 _on_done，是因为虚拟 IP 变了也会重走这条路，
         # 每次都要把最新的 IP 重新登记进去。
@@ -2016,7 +2322,18 @@ class LanPage(BasePage):
         成员列表来自 MemberTracker 的稳定快照（后台线程负责 ARP 扫描、
         ping 保活与名称解析），UI 线程在这里**不起任何子进程**——
         800ms 一次的 tick 再也不会被 arp/gethostbyaddr 拖出卡顿。
+
+        ⚠️ 整段包 try：这一拍里任何异常都会让成员列表/云盘视图**停在半路**，
+        而打包态（--windowed）没有 stderr，Qt 只在控制台打印 traceback——
+        用户看到的就是"列表不动了"，毫无线索。接住并写进日志面板。
         """
+        try:
+            self._update_ip_inner()
+        except Exception as exc:
+            self._append_log("界面刷新出错（这一轮的成员/云盘视图已跳过，"
+                             "下一拍会重试）：%s" % exc)
+
+    def _update_ip_inner(self):
         ip = etier.virtual_adapter_ip()
         if ip:
             # 先记下旧值：进入房间后 IP 还可能变（DHCP 冲突改址 /
@@ -2055,16 +2372,30 @@ class LanPage(BasePage):
                     "game": m.get("game") or "",
                     "port": int(m.get("port") or 0),
                     "ss": int(m.get("ss") or 0),
+                    # 链路质量（core 成员表并进来的，见 MemberTracker
+                    # ._apply_quality）：没有就是空字典，行照旧渲染。
+                    "core": {"lat_ms": m.get("lat_ms"),
+                             "loss_rate": m.get("loss_rate") or "",
+                             "tunnel": m.get("tunnel") or "",
+                             "nat": m.get("nat") or "",
+                             "relayed": bool(m.get("relayed"))},
                 })
             # 只在"行内容真的变了"时重建控件，否则每 800ms 重建一次会闪。
             # 签名必须带上昵称与游戏快连：队友中途换了游戏，他那行也得跟着
             # 更新——只比 IP 的话，那一行会一直停在旧游戏上。ss 同理：
             # 队友开始/停止共享屏幕，按钮得跟着出现/消失。
-            sig = [(e["ip"], e["name"], e.get("game", ""), int(e.get("port") or 0),
-                    int(e.get("ss") or 0))
+            # v0.13 加上「是否中继」与延迟分档（5ms 一档）：中继态一变就要
+            # 重画贴片，延迟在档位之间跳动时也更新（同一档内不动，免得抖动
+            # 引起每秒重建）。
+            sig = [(e["ip"], e["name"], e.get("game", ""),
+                    int(e.get("port") or 0), int(e.get("ss") or 0),
+                    bool((e.get("core") or {}).get("relayed")),
+                    _lat_bucket((e.get("core") or {}).get("lat_ms")))
                    for e in entries]
             old_sig = [(r.get("ip"), r.get("name"), r.get("game", ""),
-                        int(r.get("port") or 0), int(r.get("ss") or 0))
+                        int(r.get("port") or 0), int(r.get("ss") or 0),
+                        bool((r.get("core") or {}).get("relayed")),
+                        _lat_bucket((r.get("core") or {}).get("lat_ms")))
                        for r in self._members_row]
             if sig != old_sig:
                 self._render_members(entries)
@@ -2099,6 +2430,26 @@ class LanPage(BasePage):
                     )
                     self._append_log("提示：房间内暂时没有其他成员（可能是"
                                      "队友未进入，也可能是房间码/密码不一致）")
+                    # 诊断分叉：信标到底收没收到人？这是"列表只有自己"时
+                    # 最能分开两种原因的一问——收到过人说明发现链路坏了
+                    # （跟踪器），没收到说明广播没到（防火墙 / 中继丢包），
+                    # 两者的处置完全不同。用户反馈过这个症状，日志里必须
+                    # 留得下可判定的线索。
+                    try:
+                        seen = sorted((self._beacon.live_peers() or {}).keys()) \
+                            if self._beacon is not None else []
+                    except Exception:
+                        seen = []
+                    if seen:
+                        self._append_log(
+                            "诊断：昵称信标其实收到了 %s，但成员列表没显示——"
+                            "这是成员跟踪的问题，请把本日志反馈给作者。"
+                            % "、".join(seen))
+                    else:
+                        self._append_log(
+                            "诊断：昵称信标也没有收到任何成员广播。请确认队友"
+                            "填的房间码/密码与你完全一致；若一致仍收不到，"
+                            "可能是中继节点丢广播，换一个「中继节点」试试。")
                 elif not self._alone_hinted:
                     self._set_status_note(normal_note)
             self.members_hint.setVisible(True)
@@ -2130,6 +2481,8 @@ class LanPage(BasePage):
                 self._on_share_done(payload or {})
             elif kind == "node_speed":
                 self._on_node_speed(payload or {})
+            elif kind == "link_diag":
+                self._on_link_diag(payload or {})
         except Exception as exc:                     # 界面出错不该拖垮转发
             self._append_log("界面更新出错：%s" % exc)
 
@@ -2161,6 +2514,13 @@ class LanPage(BasePage):
             self._share_watch()
         except (RuntimeError, AttributeError):
             pass
+        # 链路诊断：房间开着时每 10 秒扫一次 EasyTier 日志，把打洞/中继/连接
+        # 错误的新行写进日志面板。异地分屏帧率低时，用户能直接看到链路状况。
+        if self._running and not self._etier_busy:
+            now = time.monotonic()
+            if now - self._link_check_at >= 10.0:
+                self._link_check_at = now
+                threading.Thread(target=self._do_link_check, daemon=True).start()
         if self._etier is not None and self._running:
             # 检测网络切换（WiFi→热点 / 换 WiFi）：物理网络指纹变了说明
             # 虚拟局域网大概率已失效，自动关闭，避免一直卡在「房间开着」。
@@ -2178,6 +2538,34 @@ class LanPage(BasePage):
             self.log_view.appendPlainText("[%s] %s" % (stamp, text))
         except RuntimeError:
             pass
+
+    # ------------------------------------------------------------ 链路诊断
+    def _do_link_check(self):
+        """后台读一次 EasyTier 日志（文件 IO，不占 GUI 线程）。"""
+        try:
+            info = etier.link_diagnostics()
+        except Exception:
+            return
+        self._event.emit("link_diag", info)
+
+    def _on_link_diag(self, info):
+        """把链路线索写进日志面板（**只写新行**，否则每 10 秒刷一遍同样的内容）。
+
+        为什么需要它：异地分屏帧率低的时候，"是不是走了中继"是第一个要排的
+        问题（公共中继被社区共享、常被限速）。以前日志面板里只有我们自己的
+        提示，看不到 EasyTier 侧的打洞/连接情况。
+        """
+        if not isinstance(info, dict):
+            return
+        labels = (("error", "❌ 连接问题"),
+                  ("relay", "🔁 中继相关"),
+                  ("punch", "🎯 打洞"))
+        for key, label in labels:
+            for line in (info.get(key) or []):
+                if line in self._link_seen:
+                    continue
+                self._link_seen.add(line)
+                self._append_log("%s：%s" % (label, line))
 
     def on_shown(self):
         """页面被切到前台。

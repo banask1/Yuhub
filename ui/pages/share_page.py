@@ -45,33 +45,53 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
+import lan_share
 import screenshare
 from .. import motion, theme
 from ..widgets import danger_button, ghost_button, primary_button
 from .base_page import BasePage
+
+try:                      # H.264 组件可能未内置（见 h264codec 模块注释）
+    import h264codec
+except Exception:         # noqa: BLE001
+    h264codec = None
+
+try:                      # 组件按需下载（与 EasyTier 组件同款机制）
+    import ffmpeg_pack
+except Exception:         # noqa: BLE001
+    ffmpeg_pack = None
 
 #: 抓屏线程两次投递本机预览的最小间隔（秒）。
 #: 预览只是给共享者"确认发出去的是什么"，不需要跟着 12fps 一起刷——
 #: 每帧都往主线程发一张图，等于把工作线程省下来的时间又花回去。
 PREVIEW_INTERVAL = 0.25
 
+#: 显示器几何的缓存时长（秒）。见 `_Sender._resolve`：不缓存的话每帧都要
+#: 枚举一次显示器（30fps = 每秒 30 次），而显示器几何只在改分辨率/热插拔时变。
+SCREEN_RESOLVE_TTL = 1.0
 
-def _encode_jpeg(img, quality):
-    """QImage → JPEG 字节。在工作线程里调用。
+#: 聊天气泡的最大宽度（像素）。聊天卡大约是底部行的一半宽，360 是
+#: "长句能换行、短行不占满"的折中。
+CHAT_BUBBLE_MAX_W = 360
 
-    单独把编码拆出来，是为了"没人观看时跳过编码"这条优化（见 `_Sender.run`）。
+
+def room_chat_text_max():
+    """输入框长度上限：与引擎口径（room_chat.TEXT_MAX）一致。
+
+    本页不直接 import room_chat——聊天消息由联机页转发（见 _lan_page），
+    这里只为拿一个常量做本地导入，拿不到就退回 300（与引擎默认值相同）。
     """
-    buf = QBuffer()
-    buf.open(QIODevice.OpenModeFlag.WriteOnly)
-    img.save(buf, "JPEG", quality)
-    data = bytes(buf.data())
-    buf.close()
-    return data
+    try:
+        import room_chat
+        return int(room_chat.TEXT_MAX)
+    except Exception:
+        return 300
 
 
 class _Bridge(QObject):
@@ -147,6 +167,21 @@ class _Sender:
         self._lock = threading.Lock()
         self._target = ("screen", 0)
         self._quality = screenshare.DEFAULT_QUALITY
+        self._geom_cache = None      # (key, ts, rect)：显示器几何缓存（见 _resolve）
+        # ---- 编码与自适应（2026-10-11）----
+        #: 用不用 H.264（由页面按"组件可用 + 对端都会解"设置）
+        self._use_h264 = False
+        #: 给编码器的帧率提示（**不是**抓屏节奏：帧率不再设上限）
+        self._fps_hint = 30
+        #: 编码后的实际格式名（界面显示用）
+        self.codec_name = "jpeg"
+        #: 自适应码率控制器：按送达速率调 target，编码线程每秒读一次
+        preset = screenshare.QUALITY_PRESETS[
+            min(screenshare.DEFAULT_QUALITY,
+                len(screenshare.QUALITY_PRESETS) - 1)]
+        self.adaptive = screenshare.AdaptiveBitrate(
+            preset[2], log=lambda m: self.bridge.event.emit(
+                "codec_log", {"msg": m}))
         self._cap = threading.Thread(target=self._capture_loop,
                                      name="share-capture", daemon=True)
         self._enc = threading.Thread(target=self._encode_loop,
@@ -157,9 +192,18 @@ class _Sender:
         with self._lock:
             self._target = target
 
-    def set_quality(self, index):
+    def set_use_h264(self, flag):
+        """页面决定这一轮用不用 H.264（对端能力会变，所以要能动态切）。"""
+        with self._lock:
+            self._use_h264 = bool(flag)
+
+    def set_preset(self, index):
+        """换画质挡位：目标码率跟着换，并把自适应控制器重置到新基准。"""
+        index = max(0, min(index, len(screenshare.QUALITY_PRESETS) - 1))
         with self._lock:
             self._quality = index
+        target = screenshare.QUALITY_PRESETS[index][2]
+        self.adaptive.reset(target)
 
     def start(self):
         # 先起编码线程：抓屏线程一开跑就会往邮箱里塞东西，消费者得在位。
@@ -178,45 +222,111 @@ class _Sender:
         """把"共享什么"解析成屏幕坐标上的一个矩形。"""
         kind, key = target
         if kind == "screen":
+            # 显示器几何极少变化（改分辨率 / 热插拔），没必要每帧都枚举一遍：
+            # 30fps 就是每秒 30 次 EnumDisplayMonitors。缓存 1 秒，既省掉这些
+            # 无用调用，改了分辨率也能在 1 秒内跟上。
+            now = time.monotonic()
+            cached = self._geom_cache
+            if cached is not None and cached[0] == key \
+                    and now - cached[1] < SCREEN_RESOLVE_TTL:
+                return cached[2]
             screens = screenshare.list_screens()
             if not screens:
                 return None
             s = screens[min(key, len(screens) - 1)]
-            return (s["x"], s["y"], s["w"], s["h"])
+            geom = (s["x"], s["y"], s["w"], s["h"])
+            self._geom_cache = (key, now, geom)
+            return geom
+        # 窗口目标**不缓存**：窗口随时会被拖动/缩放，缓存一帧的代价就是
+        # 画面上跟着慢半拍（拖窗口时肉眼可见）。
         return screenshare.window_rect(key)
+
+    def h264_ready(self):
+        """本机能不能用 H.264（组件在 + 编解码器可用）。"""
+        if h264codec is None:
+            return False
+        try:
+            return bool(h264codec.available())
+        except Exception:
+            return False
+
+    def _ensure_encoder(self, enc, w, h):
+        """按需创建/重建 H.264 编码器（分辨率变了就得重建）。"""
+        if not self.h264_ready():
+            return None
+        if enc is not None and enc.w == w and enc.h == h:
+            return enc
+        if enc is not None:
+            try:
+                enc.close()
+            except Exception:
+                pass
+        try:
+            enc = h264codec.H264Encoder(
+                w, h, fps=max(1, int(self._fps_hint)),
+                bitrate=int(self.adaptive.target), threads=2,
+                log=lambda m: self.bridge.event.emit(
+                    "codec_log", {"msg": m}))
+            self.codec_name = enc.name
+        except Exception as exc:                        # noqa: BLE001
+            self.bridge.event.emit("codec_log",
+                                   {"msg": "H.264 编码器不可用：%s" % exc})
+            return None
+        return enc
 
     def _capture_loop(self):
         cap = screenshare.GdiCapture()
         nxt = time.monotonic()
         last_preview = 0.0
+        last_beat = 0.0            # 抓屏失败时的保活心跳（见下）
         misses = 0
+        miss_since = 0.0
         try:
             while not self._stop.is_set():
                 with self._lock:
                     target = self._target
                     index = self._quality
                 index = max(0, min(index, len(screenshare.QUALITY_PRESETS) - 1))
-                _name, max_edge, fps, quality = screenshare.QUALITY_PRESETS[index]
-                interval = 1.0 / max(1, fps)
+                _name, max_edge, _target_bps = \
+                    screenshare.QUALITY_PRESETS[index]
+                # 帧率**不设上限**（用户要求）：抓屏与编码能跑多快就多快，
+                # 真正限制帧率的只有链路带宽（H.264 由自适应码率控制）。
+                # 循环节奏交给抓屏+编码自身的耗时。
+                interval = 0.0
+                self._fps_hint = 30        # 只作为编码器的时基提示
 
                 rect = self._resolve(target)
                 if rect is None or rect[2] <= 0 or rect[3] <= 0:
                     misses += 1
+                    if not miss_since:
+                        miss_since = time.monotonic()
                     # 共享的窗口被关掉了：连着几秒都解析不出矩形就认输，
                     # 继续空转只会让用户以为"还在共享"。
-                    if misses >= max(3, int(3.0 / interval)):
-                        self.error = "共享的内容不见了（窗口被关闭了？）"
+                    # （不能再用"帧数"判：帧率不限之后每帧耗时可快可慢，
+                    #   按帧数算会一会儿就误判或等很久，所以改用时间。）
+                    if misses >= 3 and time.monotonic() - miss_since >= 3.0:
+                        if (target[0] == "window"
+                                and screenshare.window_minimized(target[1])):
+                            # 最小化要给**准确的说法**：否则用户看到的是
+                            # "共享的内容不见了（窗口被关闭了？）"，而窗口
+                            # 明明还在任务栏里躺着。
+                            self.error = ("被共享的窗口已最小化，抓不到画面"
+                                          "（请还原窗口，或改共享整个屏幕）")
+                        else:
+                            self.error = "共享的内容不见了（窗口被关闭了？）"
                         break
                 else:
                     misses = 0
+                    miss_since = 0.0
                     out_w, out_h = cap.fit(rect[2], rect[3], max_edge)
                     raw = cap.grab(rect, out_w, out_h)
                     if raw:
                         self.size = (out_w, out_h)
+                        last_beat = 0.0
                         # 有人在看才把帧交给编码线程。没人看的时候抓屏照跑
                         # （本机预览要用它），但没必要白占编码线程的 CPU。
                         if self.server.viewers:
-                            self._mail.put((raw, out_w, out_h, quality))
+                            self._mail.put((raw, out_w, out_h))
                         now = time.monotonic()
                         if now - last_preview >= PREVIEW_INTERVAL:
                             last_preview = now
@@ -228,14 +338,32 @@ class _Sender:
                             # 的话界面会去读已经释放的内存（表现为随机花屏或
                             # 直接崩）。预览只有 4 次/秒，拷一次的代价可忽略。
                             self.bridge.event.emit("preview", img.copy())
+                    elif self.server.viewers:
+                        # 抓屏拿不到画面（锁屏 / 切到安全桌面 / 显示器休眠 /
+                        # 独占全屏）：**什么都不发**的话，对端要等
+                        # RECV_TIMEOUT×3 才判死并报"连接已断开"，用户看到的
+                        # 是"画面卡住，然后莫名其妙断开"。发心跳保活，
+                        # 让对方知道"连接还在，只是暂时没画面"。
+                        now = time.monotonic()
+                        if now - last_beat >= screenshare.HEARTBEAT_INTERVAL:
+                            last_beat = now
+                            try:
+                                self.server.push(None, *self.size)
+                            except Exception:
+                                pass
 
                 nxt += interval
                 delay = nxt - time.monotonic()
-                if delay < -interval:          # 落后超过一整帧就重新对表
+                if interval > 0 and delay < -interval:   # 落后超过一帧就重新对表
                     nxt = time.monotonic()
                     delay = 0.0
                 if delay > 0:
                     self._stop.wait(delay)
+                elif not self.server.viewers:
+                    # 没人观看时**不空转**：预览本来只要 4 次/秒，抓屏（18ms）
+                    # 全速跑纯属白烧 CPU。给 100ms 的节奏（约 10fps），
+                    # 有人连进来立刻恢复全速。
+                    self._stop.wait(0.1)
         except Exception as exc:               # 抓屏线程绝不能静默死掉
             self.error = "抓屏中断（%s）" % exc
         finally:
@@ -244,39 +372,90 @@ class _Sender:
 
     # -------------------------------------------------------------- 编码线程
     def _encode_loop(self):
+        """编码线程：**只有 H.264 一条路**（2026-10-11 起 JPEG 编码已删除）。
+
+        生命周期：
+          * 组件未就绪（首次共享时还在下载）→ 只发心跳保活，装好后下一帧
+            自动开始编码（`_use_h264` 由 pack_done 事件置位）。
+          * 分辨率变了 → 重建编码器（重建自带关键帧，解码端自动恢复）。
+          * 编码失败（驱动重置/显存耗尽…）→ 关掉编码器重试，**连续 3 次**
+            失败才停共享 —— 一次瞬时的驱动抖动不该终结整场共享。
+        """
         rev = 0
         last_sig = None
         last_real = 0.0
         last_beat = 0.0
+        encoder = None
+        encode_fails = 0
         try:
             while not self._stop.is_set():
                 item, rev = self._mail.get(rev, 0.3)
                 if item is None:
                     continue
-                raw, out_w, out_h, quality = item
+                raw, out_w, out_h = item
                 now = time.monotonic()
                 # 采样签名判断画面变了没有。为什么不逐字节比较，见
                 # `screenshare.SAMPLE_STEP` 的注释：真实桌面上总有个 20×20
                 # 的小块在闪，逐字节比**从不命中**，这条优化等于白写。
                 sig = screenshare.frame_signature(raw)
-                if sig == last_sig and now - last_real < screenshare.IDLE_REFRESH:
-                    # 画面没变：跳过 JPEG 编码（这一段是整条链上最贵的一步），
-                    # 只发一个 17 字节心跳。看文档、看桌面时发送端的 CPU 与
-                    # 带宽占用都趋于零，异地走中继时这一条最关键。
-                    # 心跳按固定间隔发就够（它的作用只是保活），跟着 30fps
-                    # 发不但没意义，还会把待发的画面帧从邮箱里挤掉。
+                unchanged = (sig == last_sig
+                             and now - last_real < screenshare.IDLE_REFRESH)
+                if unchanged or not self._use_h264:
+                    # 画面没变 / 组件还没就绪（正在下载）：只发心跳保活。
+                    # H.264 的帧间预测下"没变"本来就该是零成本，跳过编码
+                    # 既省 CPU 也省带宽；心跳按固定间隔发就够，跟着满帧率
+                    # 发只会把待发帧挤出邮箱。
                     if now - last_beat >= screenshare.HEARTBEAT_INTERVAL:
                         last_beat = now
-                        self.server.push(None, out_w, out_h)
+                        self.server.push(None, out_w, out_h, kind="idle")
                     continue
                 last_sig = sig
                 last_real = now
-                img = QImage(raw, out_w, out_h, out_w * 4,
-                             QImage.Format.Format_RGB32)
-                self.server.push(_encode_jpeg(img, quality), out_w, out_h)
+
+                encoder = self._ensure_encoder(encoder, out_w, out_h)
+                if encoder is None:
+                    # 组件异常且重试也没建成：发心跳撑着，等下载/重试完成
+                    if now - last_beat >= screenshare.HEARTBEAT_INTERVAL:
+                        last_beat = now
+                        self.server.push(None, out_w, out_h, kind="idle")
+                    continue
+                self.codec_name = encoder.name
+                # 自适应：目标码率变了就立刻应用（不必重建编码器）
+                want = int(self.adaptive.target)
+                if encoder.bitrate != want:
+                    encoder.set_bitrate(want)
+                try:
+                    for pkt, is_key in encoder.encode(raw, out_w * 4):
+                        self.server.push(pkt, out_w, out_h,
+                                         kind="h264_key" if is_key else "h264")
+                    encode_fails = 0            # 成功一帧就清零
+                except Exception as exc:        # noqa: BLE001
+                    encode_fails += 1
+                    self.bridge.event.emit(
+                        "codec_log",
+                        {"msg": "H.264 编码失败（%d/3）：%s"
+                                % (encode_fails, exc)})
+                    try:
+                        encoder.close()
+                    except Exception:
+                        pass
+                    encoder = None
+                    if encode_fails >= 3:
+                        # 连续三次重建/编码都失败：如实停掉，别让用户对着
+                        # 一个永远黑屏的"共享中"发呆
+                        self.error = ("H.264 编码器连续失败，共享已停止"
+                                      "（最后一次错误：%s）" % exc)
+                        self._stop.set()
+                        break
         except Exception as exc:
             self.error = "画面编码中断（%s）" % exc
             self._stop.set()
+        finally:
+            if encoder is not None:
+                try:
+                    encoder.close()
+                except Exception:
+                    pass
 
 
 
@@ -295,7 +474,9 @@ class _ScreenView(QLabel):
         super().__init__()
         self.setObjectName("ScreenView")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumHeight(280)
+        # 最小高度给小：三区块布局下画面区与底部两张卡要能同时放下，
+        # 小窗口时宁可画面矮一点（纵向布局交给拉伸，不再强制 280）。
+        self.setMinimumHeight(150)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setTextFormat(Qt.TextFormat.PlainText)
         self._pix = None
@@ -512,27 +693,47 @@ class SharePage(BasePage):
         self._server = None
         self._sender = None
         self._client = None
+        self._decoder = None        # h264codec.H264Decoder（接收线程独占）
+        self._codec_note = ""       # 当前编码方式说明（界面显示）
+        self._auto_downgraded = None  # 已自动降到的挡位（防重复降）
+        self._pack_fetching = False  # H.264 组件下载进行中（防重复触发）
         self._full = None            # 全屏观看窗口（懒建，退出只是 hide）
         self._mode = ""
         self._last_pix = None
         self._targets_loaded = False
+        # 房间聊天（引擎在 room_chat.py，UI 在这里；消息由联机页转发过来）
+        self._chat_enabled = False   # 是否在「异地联机」的房间里
+        self._chat_connected = False # 聊天信号是否已接到联机页（只接一次）
+        self._chat_rows = {}          # 消息 id -> {"row","name_lbl","btn"}
         self._send_meter = screenshare.RateMeter()
         self._recv_meter = screenshare.RateMeter()
+        # 送达口径（per-viewer 在 sendall 成功后才计数）：与"发出"对照，
+        # 一眼看出瓶颈是不是链路。见 `_tick` 的注释。
+        self._deliver_meter = screenshare.RateMeter()
 
         self._bridge = _Bridge()
         self._bridge.event.connect(self._on_engine)
         self._bridge.engine.connect(self._on_engine)
 
-        # 本页不用 BasePage 的滚动区：画面区要吃掉全部剩余高度，
-        # 塞进 QScrollArea 会变成"画面里再套一个滚动条"的怪样子。
+        # 本页不用 BasePage 的滚动区（水墨重做后是三区块布局，见下）：
+        # 画面区要吃掉全部剩余高度，塞进 QScrollArea 会变成
+        # "画面里再套一个滚动条"的怪样子。
         self.scroll.setVisible(False)
         root = self.layout()
-        root.addWidget(self._build_host_card())
-        root.addWidget(self._build_watch_card())
+        root.addSpacing(2)
+        # 上：共享画面（吃掉全部剩余高度）
         root.addWidget(self._build_view_card(), 1)
+        root.addSpacing(10)
+        # 下：左 = 聊天（预留） ｜ 右 = 共享设置
+        bottom = QHBoxLayout()
+        bottom.setSpacing(10)
+        bottom.addWidget(self._build_chat_card(), 1)
+        bottom.addWidget(self._build_settings_card())
+        root.addLayout(bottom)
 
         self._restyle()
         self._apply_state()
+        self._apply_chat_state()
         theme.bus.changed.connect(lambda _: self._restyle())
 
         self._timer = QTimer(self)
@@ -541,144 +742,24 @@ class SharePage(BasePage):
         self._timer.start()
 
     # ------------------------------------------------------------------ 构建
-    def _build_host_card(self):
-        card = QFrame()
-        card.setObjectName("Card")
-        v = QVBoxLayout(card)
-        v.setContentsMargins(18, 14, 18, 14)
-        v.setSpacing(10)
-
-        top = QHBoxLayout()
-        top.setSpacing(10)
-        self._lbl_state = _label("● 未共享")
-        top.addWidget(self._lbl_state)
-        self._lbl_stats = _label("", "Faint")
-        top.addWidget(self._lbl_stats)
-        top.addStretch(1)
-        # 只有一个"开始共享"：走局域网还是走异地，由下面的「本机地址」
-        # 里选中哪块网卡决定（选虚拟网卡就是异地，选真实网卡就是局域网）。
-        # 分成两个按钮的时候，用户得自己保证"选的地址"和"点的按钮"是一对，
-        # 选错就出现"绑着局域网 IP 却按了异地共享"这种自相矛盾的状态。
-        self._btn_start = primary_button("开始共享")
-        self._btn_start.clicked.connect(self._start_host)
-        self._btn_stop = danger_button("停止共享")
-        self._btn_stop.clicked.connect(self._stop_host)
-        for b in (self._btn_start, self._btn_stop):
-            top.addWidget(b)
-        v.addLayout(top)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
-
-        self._target_combo = QComboBox()
-        self._target_combo.setMinimumWidth(220)
-        self._btn_targets = ghost_button("刷新")
-        self._btn_targets.clicked.connect(self._reload_targets)
-        tbox = QHBoxLayout()
-        tbox.setSpacing(6)
-        tbox.addWidget(self._target_combo, 1)
-        tbox.addWidget(self._btn_targets)
-        grid.addWidget(_label("共享内容"), 0, 0)
-        grid.addLayout(tbox, 0, 1)
-        grid.addWidget(_label("画质"), 0, 2)
-        self._quality_combo = QComboBox()
-        for i, (name, edge, fps, _q) in enumerate(screenshare.QUALITY_PRESETS):
-            self._quality_combo.addItem("%s（%dpx · %d 帧）" % (name, edge, fps))
-            self._quality_combo.setItemData(
-                i,
-                "上行带宽约 %s（桌面内容的实测值，放视频/游戏会更高）。\n"
-                "异地经中继时建议停在「标准」。" % screenshare.QUALITY_BANDWIDTH[i],
-                Qt.ToolTipRole)
-        self._quality_combo.setCurrentIndex(screenshare.DEFAULT_QUALITY)
-        self._quality_combo.currentIndexChanged.connect(self._on_quality)
-        grid.addWidget(self._quality_combo, 0, 3)
-
-        self._addr_combo = QComboBox()
-        self._addr_combo.setMinimumWidth(240)
-        # 选哪块网卡 = 走哪条链路，所以换地址要立刻把提示文案改过来。
-        self._addr_combo.currentIndexChanged.connect(self._on_addr_changed)
-        grid.addWidget(_label("本机地址"), 1, 0)
-        grid.addWidget(self._addr_combo, 1, 1)
-        grid.addWidget(_label("端口"), 1, 2)
-        self._lbl_port = _label("--")
-        grid.addWidget(self._lbl_port, 1, 3)
-
-        self._token_edit = QLineEdit()
-        self._token_edit.setReadOnly(True)
-        self._token_edit.setPlaceholderText("开始共享后生成")
-        grid.addWidget(_label("观看码"), 2, 0)
-        grid.addWidget(self._token_edit, 2, 1)
-        self._btn_copy = ghost_button("复制观看码")
-        self._btn_copy.clicked.connect(self._copy_token)
-        self._btn_copy.setEnabled(False)
-        grid.addWidget(self._btn_copy, 2, 2)
-        v.addLayout(grid)
-
-        self._host_hint = _label(self._hint_off(), "Faint")
-        self._host_hint.setWordWrap(True)
-        v.addWidget(self._host_hint)
-        return card
-
-    def _build_watch_card(self):
-        card = QFrame()
-        card.setObjectName("Card")
-        v = QVBoxLayout(card)
-        v.setContentsMargins(18, 14, 18, 14)
-        v.setSpacing(8)
-
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        title = QLabel("共享屏幕")
-        title.setObjectName("CardTitle")
-        top.addWidget(title)
-        top.addStretch(1)
-        self._lbl_watch = _label("", "Faint")
-        top.addWidget(self._lbl_watch)
-        v.addLayout(top)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self._host_edit = QLineEdit()
-        self._host_edit.setPlaceholderText("对方的地址，如 192.168.1.5 或 10.126.126.7:45890")
-        self._code_edit = QLineEdit()
-        self._code_edit.setPlaceholderText("观看码")
-        self._code_edit.setMaximumWidth(220)
-        self._btn_watch = primary_button("开始观看")
-        self._btn_watch.clicked.connect(self._start_watch)
-        self._btn_unwatch = ghost_button("停止观看")
-        self._btn_unwatch.clicked.connect(self._stop_watch)
-        self._btn_unwatch.setEnabled(False)
-        row.addWidget(self._host_edit, 1)
-        row.addWidget(self._code_edit)
-        row.addWidget(self._btn_watch)
-        row.addWidget(self._btn_unwatch)
-        v.addLayout(row)
-
-        hint = _label(
-            "在「异地联机」里进了同一个房间的话，直接去成员列表点「看屏幕」——"
-            "地址和观看码会自动填好。", "Faint")
-        hint.setWordWrap(True)
-        v.addWidget(hint)
-        return card
-
     def _build_view_card(self):
+        """上半区块：共享画面 + 状态行。"""
         holder = QFrame()
         holder.setObjectName("Card")
         box = QVBoxLayout(holder)
-        box.setContentsMargins(8, 8, 8, 8)
+        box.setContentsMargins(12, 10, 12, 12)
         box.setSpacing(6)
 
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self._lbl_state = _label("● 未共享")
+        top.addWidget(self._lbl_state)
+        self._lbl_stats = _label("", "Faint")
+        self._lbl_stats.setWordWrap(False)
+        top.addWidget(self._lbl_stats, 1)
         # 全屏入口做两个：一个按钮（看得见、找得到），一个双击画面
         # （看视频的人的本能动作）。按钮在没在观看时是灰的 —— 全屏看的是
         # 对方的画面，共享端自己的预览全屏没有意义。
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        self._lbl_full_hint = _label("双击画面即可全屏观看", "Faint")
-        top.addWidget(self._lbl_full_hint)
-        top.addStretch(1)
         self._btn_full = ghost_button("全屏观看")
         self._btn_full.setToolTip(
             "整块屏只放画面。按 Esc 或双击画面退出；只用来观看对方的屏幕。")
@@ -688,10 +769,194 @@ class SharePage(BasePage):
 
         self._view = _ScreenView(
             "还没开始。\n\n共享时这里显示本机正要发出去的画面；"
-            "观看时显示对方的屏幕。")
+            "观看时显示对方的屏幕。\n共享与观看的入口在右下方的「共享设置」。")
         self._view.double_clicked.connect(self._open_full)
-        box.addWidget(self._view)
+        box.addWidget(self._view, 1)
         return holder
+
+    def _build_chat_card(self):
+        """左下区块：房间聊天（文本消息 + 云盘文件消息）。
+
+        只在「异地联机」的房间里可用：聊天走虚拟网 UDP 广播（room_chat），
+        昵称来自进房时必填的那个——联机页强制有昵称才能进房，所以聊天室里
+        不会出现裸 IP。文件消息由临时云盘产生：谁分享/取消分享，聊天室里
+        就多一条带下载图标的消息 / 把那条标成「已撤回」。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumHeight(240)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("聊天")
+        title.setObjectName("CardTitle")
+        head.addWidget(title)
+        self._chat_badge = QLabel("未进入房间")
+        self._chat_badge.setObjectName("Badge")
+        head.addWidget(self._chat_badge)
+        head.addStretch(1)
+        v.addLayout(head)
+
+        # 消息列表：滚动区 + 竖向布局。行是懒加载的小控件，撤回时**原地**
+        # 改那一行（整表重建会丢滚动位置，还会让正在选的文字断掉）。
+        self._chat_scroll = QScrollArea()
+        self._chat_scroll.setWidgetResizable(True)
+        self._chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._chat_scroll.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        self._chat_list = QVBoxLayout(inner)
+        self._chat_list.setContentsMargins(0, 0, 0, 0)
+        self._chat_list.setSpacing(4)
+        # 空态提示放在最上面，stretch 垫底——消息插到 stretch 之前即可
+        self._chat_empty = QLabel()
+        self._chat_empty.setObjectName("Faint")
+        self._chat_empty.setWordWrap(True)
+        self._chat_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chat_list.addWidget(self._chat_empty)
+        self._chat_list.addStretch(1)
+        self._chat_scroll.setWidget(inner)
+        v.addWidget(self._chat_scroll, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._chat_input = QLineEdit()
+        self._chat_input.setPlaceholderText("进入异地联机的房间后，这里就能聊天…")
+        self._chat_input.setMaxLength(room_chat_text_max())
+        self._chat_input.returnPressed.connect(self._send_chat)
+        self._chat_send = ghost_button("发送")
+        self._chat_send.setCursor(Qt.PointingHandCursor)
+        self._chat_send.clicked.connect(self._send_chat)
+        row.addWidget(self._chat_input, 1)
+        row.addWidget(self._chat_send)
+        v.addLayout(row)
+        return card
+
+    def _build_settings_card(self):
+        """右下区块：开始共享 / 清晰度 / 共享码 / 观看入口。"""
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setFixedWidth(410)
+        card.setMinimumHeight(240)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(7)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("共享设置")
+        title.setObjectName("CardTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        port_lbl = QLabel("端口")
+        port_lbl.setObjectName("Faint")
+        head.addWidget(port_lbl)
+        self._lbl_port = _label("--", "Faint")
+        head.addWidget(self._lbl_port)
+        v.addLayout(head)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        # 只有一个"开始共享"：走局域网还是走异地，由「本机地址」
+        # 里选中哪块网卡决定（选虚拟网卡就是异地，选真实网卡就是局域网）。
+        # 分成两个按钮的时候，用户得自己保证"选的地址"和"点的按钮"是一对，
+        # 选错就出现"绑着局域网 IP 却按了异地共享"这种自相矛盾的状态。
+        self._btn_start = primary_button("开始共享")
+        self._btn_start.clicked.connect(self._start_host)
+        self._btn_stop = danger_button("停止共享")
+        self._btn_stop.clicked.connect(self._stop_host)
+        btns.addWidget(self._btn_start, 1)
+        btns.addWidget(self._btn_stop, 1)
+        v.addLayout(btns)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+
+        self._target_combo = QComboBox()
+        self._target_combo.setMinimumWidth(200)
+        self._btn_targets = ghost_button("刷新")
+        self._btn_targets.clicked.connect(self._reload_targets)
+        tbox = QHBoxLayout()
+        tbox.setSpacing(6)
+        tbox.addWidget(self._target_combo, 1)
+        tbox.addWidget(self._btn_targets)
+        grid.addWidget(_label("共享内容"), 0, 0)
+        grid.addLayout(tbox, 0, 1)
+
+        self._quality_combo = QComboBox()
+        for i, (name, edge, bitrate) in enumerate(
+                screenshare.QUALITY_PRESETS):
+            self._quality_combo.addItem("%s（%dpx）" % (name, edge))
+            self._quality_combo.setItemData(
+                i,
+                "目标码率约 %.1f Mbps（自适应会按实测带宽上下浮动）。\n"
+                "上行带宽参考：%s。\n"
+                "帧率不设上限——能跑多快取决于链路带宽与机器性能。"
+                % (bitrate / 1e6, screenshare.QUALITY_BANDWIDTH[i]),
+                Qt.ToolTipRole)
+        self._quality_combo.setCurrentIndex(screenshare.DEFAULT_QUALITY)
+        self._quality_combo.currentIndexChanged.connect(self._on_quality)
+        grid.addWidget(_label("清晰度"), 1, 0)
+        grid.addWidget(self._quality_combo, 1, 1)
+
+        self._addr_combo = QComboBox()
+        # 选哪块网卡 = 走哪条链路，所以换地址要立刻把提示文案改过来。
+        self._addr_combo.currentIndexChanged.connect(self._on_addr_changed)
+        grid.addWidget(_label("本机地址"), 2, 0)
+        grid.addWidget(self._addr_combo, 2, 1)
+
+        self._token_edit = QLineEdit()
+        self._token_edit.setReadOnly(True)
+        self._token_edit.setPlaceholderText("开始共享后生成")
+        self._btn_copy = ghost_button("复制")
+        self._btn_copy.clicked.connect(self._copy_token)
+        self._btn_copy.setEnabled(False)
+        kbox = QHBoxLayout()
+        kbox.setSpacing(6)
+        kbox.addWidget(self._token_edit, 1)
+        kbox.addWidget(self._btn_copy)
+        grid.addWidget(_label("观看码"), 3, 0)
+        grid.addLayout(kbox, 3, 1)
+        v.addLayout(grid)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setObjectName("Separator")
+        v.addWidget(sep)
+
+        wrow = QHBoxLayout()
+        wrow.setSpacing(6)
+        self._host_edit = QLineEdit()
+        self._host_edit.setPlaceholderText("对方的地址，如 192.168.1.5 或 10.126.126.7:45890")
+        wrow.addWidget(self._host_edit, 1)
+        v.addLayout(wrow)
+        wrow2 = QHBoxLayout()
+        wrow2.setSpacing(6)
+        self._code_edit = QLineEdit()
+        self._code_edit.setPlaceholderText("观看码")
+        self._code_edit.setMaximumWidth(140)
+        self._btn_watch = primary_button("开始观看")
+        self._btn_watch.clicked.connect(self._start_watch)
+        self._btn_unwatch = ghost_button("停止观看")
+        self._btn_unwatch.clicked.connect(self._stop_watch)
+        self._btn_unwatch.setEnabled(False)
+        wrow2.addWidget(self._code_edit)
+        wrow2.addWidget(self._btn_watch)
+        wrow2.addWidget(self._btn_unwatch)
+        v.addLayout(wrow2)
+
+        self._lbl_watch = _label("", "Faint")
+        v.addWidget(self._lbl_watch)
+
+        self._host_hint = _label(self._hint_off(), "Faint")
+        self._host_hint.setWordWrap(True)
+        self._host_hint.setStyleSheet("font-size: 11px;")
+        v.addWidget(self._host_hint, 1)
+        return card
 
     # ------------------------------------------------------------------ 主题
     def _restyle(self):
@@ -700,11 +965,49 @@ class SharePage(BasePage):
             "QLabel#ScreenView { background: %s; border: 1px solid %s;"
             " border-radius: 5px; color: %s; font-size: 12px; }"
             % (p["surface_sunken"], p["border"], p["text_faint"]))
+        self._restyle_chat()
+
+    def _restyle_chat(self):
+        """聊天区的颜色（深浅模式都走这里；气泡是内联样式，不跟全局 QSS）。"""
+        p = theme.current()
+        self._chat_badge.setStyleSheet(
+            "font-size: 11px; font-weight: 700; color: %s;"
+            " background: transparent; border: 1px solid %s;"
+            " border-radius: 4px; padding: 2px 10px;"
+            % (p["green"] if self._chat_enabled else p["text_faint"],
+               p["green"] if self._chat_enabled else p["border_strong"]))
+        # 空态提示与气泡底色跟着主题走
+        self._chat_empty.setStyleSheet("font-size: 11px; color: %s;"
+                                       % p["text_faint"])
+        for refs in list(self._chat_rows.values()):
+            bubble = refs.get("bubble")
+            nick = refs.get("nick_lbl")
+            if bubble is not None:
+                bubble.setStyleSheet(
+                    "QFrame#ChatBubble { background: %s;"
+                    " border: 1px solid %s; border-radius: 8px; }"
+                    % (p["surface_hover"], p["border"]))
+            if nick is not None and not refs.get("me"):
+                nick.setStyleSheet("font-size: 11px; font-weight: 700;"
+                                   " color: %s;" % p["text_dim"])
+            elif nick is not None:
+                nick.setStyleSheet("font-size: 11px; font-weight: 700;"
+                                   " color: %s;" % p["accent"])
+        # 已撤回的行：灰色斜体（_mark_chat_withdrawn 写的内联样式会被
+        # 主题切换覆盖掉，所以撤回态在这里按标记重刷一遍）
+        for refs in list(self._chat_rows.values()):
+            if refs.get("withdrawn"):
+                lbl = refs.get("name_lbl")
+                if lbl is not None:
+                    lbl.setStyleSheet("color: %s; font-style: italic;"
+                                      % p["text_faint"])
 
     def _hint_off(self):
         return ("在「本机地址」里选哪块网卡，就决定了走哪条链路 ——\n"
                 "· 本地网络地址 → 局域网共享，观看码是随机 6 位数字，念给朋友就行。\n"
-                "· 异地联机虚拟网卡 → 异地共享，走 EasyTier 的虚拟局域网，房间成员免输观看码。")
+                "· 异地联机虚拟网卡 → 异地共享，走 EasyTier 的虚拟局域网，房间成员免输观看码。"
+                "\n观看别人的屏幕：填对方地址与观看码后点「开始观看」；"
+                "在「异地联机」的成员列表里点「看屏幕」会自动填好。")
 
     # ------------------------------------------------------------------ 状态
     @property
@@ -745,8 +1048,209 @@ class SharePage(BasePage):
         if not watching:
             self._lbl_watch.setText("")
 
+    # ------------------------------------------------------------------ 聊天
+    def _lan_page(self):
+        """拿到「异地联机」页实例（聊天消息由它转发，下载也走它的云盘）。
+
+        用间接查找而不是互相持有引用：这两页在功能上没有从属关系，
+        为了一次跳转把它们绑死，会让任何一页的构造顺序都变成必须。
+        """
+        win = self.window()
+        pages = getattr(win, "_pages", None) if win is not None else None
+        return pages.get("lan") if pages else None
+
+    def _apply_chat_state(self):
+        """聊天可用态 + 空态文案。
+
+        可用性跟着「异地联机」的房间走（_tick 里检测变化）：不在房间里
+        时输入框是灰的——没有虚拟网卡，消息发出去也没有人收。
+        """
+        on = self._chat_enabled
+        self._chat_input.setEnabled(on)
+        self._chat_send.setEnabled(on)
+        self._chat_badge.setText("房间聊天中" if on else "未进入房间")
+        if not on:
+            # 退房了：这个房间的消息一起退。留着只会让人以为还能接着聊。
+            self._clear_chat_rows()
+        if not self._chat_rows:
+            self._chat_empty.setVisible(True)
+            self._chat_empty.setText(
+                "还没人说话。\n\n进入「异地联机」的房间后就能和成员聊天；"
+                "临时云盘里分享的文件也会出现在这里，点旁边的图标即可下载。"
+                if on else
+                "进入「异地联机」的房间后，这里就能和房间成员聊天。\n"
+                "临时云盘里分享的文件也会出现在这里，可直接下载。")
+        else:
+            self._chat_empty.setVisible(False)
+        self._restyle_chat()
+
+    def _connect_chat(self):
+        """把聊天信号接到联机页（只接一次；on_shown 会重复触发）。
+
+        接上之后先把房里已有的消息补画出来——用户可能是进房之后才切到
+        本页的，前面的对话不该凭空消失。
+        """
+        if self._chat_connected:
+            return
+        lan = self._lan_page()
+        if lan is None or not hasattr(lan, "chat_message"):
+            return
+        try:
+            lan.chat_message.connect(self._on_chat_message)
+        except (TypeError, RuntimeError):
+            return
+        self._chat_connected = True
+        try:
+            for rec in (lan.chat_history() or []):
+                self._on_chat_message(dict(rec, event="new"))
+        except Exception:
+            pass
+
+    def _send_chat(self):
+        """发送按钮 / 回车：把输入框里的文本交给联机页广播出去。"""
+        text = self._chat_input.text().strip()
+        if not text:
+            return
+        lan = self._lan_page()
+        if lan is None or not hasattr(lan, "send_chat_text"):
+            self.toast("聊天不可用（找不到联机页）")
+            return
+        ok, err = lan.send_chat_text(text)
+        if ok:
+            self._chat_input.clear()
+        else:
+            self.toast(err or "发送失败")
+
+    def _download_chat_file(self, rec):
+        """文件消息上的下载图标：走联机页的云盘下载（会先问保存位置）。"""
+        lan = self._lan_page()
+        if lan is None or not hasattr(lan, "download_chat_file"):
+            self.toast("下载不可用（找不到联机页）")
+            return
+        lan.download_chat_file(rec)
+
+    def _on_chat_message(self, rec):
+        """聊天消息到达（主线程）：新消息加一行，撤回改那一行。"""
+        rec = dict(rec or {})
+        mid = str(rec.get("id") or "")
+        if not mid:
+            return
+        if str(rec.get("event") or "new") == "new":
+            if mid in self._chat_rows:
+                return                  # 历史补画时的重复
+            refs = self._add_chat_row(rec)
+            self._chat_rows[mid] = refs
+            self._chat_empty.setVisible(False)
+            self._scroll_chat_bottom()
+        else:
+            refs = self._chat_rows.get(mid)
+            if refs is not None:
+                self._mark_chat_withdrawn(refs)
+
+    def _add_chat_row(self, rec):
+        """往聊天列表里加一行，返回该行的控件引用（撤回时原地改它）。
+
+        自己的消息靠右、别人的靠左；文件消息带一个下载图标按钮。
+        """
+        p = theme.current()
+        me = bool(rec.get("me"))
+        kind = str(rec.get("kind") or "text")
+        who = "我" if me else (str(rec.get("nick") or "").strip()
+                               or str(rec.get("from_ip") or "队友"))
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(2, 2, 2, 2)
+        h.setSpacing(6)
+        if me:
+            h.addStretch(1)                      # 自己的消息靠右
+        bubble = QFrame()
+        bubble.setObjectName("ChatBubble")
+        bubble.setMaximumWidth(CHAT_BUBBLE_MAX_W)
+        bubble.setStyleSheet(
+            "QFrame#ChatBubble { background: %s; border: 1px solid %s;"
+            " border-radius: 8px; }" % (p["surface_hover"], p["border"]))
+        bv = QVBoxLayout(bubble)
+        bv.setContentsMargins(9, 5, 9, 6)
+        bv.setSpacing(3)
+        nick_lbl = QLabel(who)
+        nick_lbl.setStyleSheet(
+            "font-size: 11px; font-weight: 700; color: %s;"
+            % (p["accent"] if me else p["text_dim"]))
+        bv.addWidget(nick_lbl)
+        refs = {"row": row, "bubble": bubble, "nick_lbl": nick_lbl,
+                "me": me, "withdrawn": False}
+        if kind == "file":
+            line = QHBoxLayout()
+            line.setSpacing(8)
+            size = lan_share.human_size(int(rec.get("size") or 0))
+            name_lbl = QLabel("%s（%s）" % (str(rec.get("name") or "文件"),
+                                           size))
+            name_lbl.setWordWrap(True)
+            name_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            name_lbl.setStyleSheet("font-size: 12px; color: %s;" % p["text"])
+            line.addWidget(name_lbl, 1)
+            btn = ghost_button("⬇")
+            btn.setFixedWidth(34)
+            btn.setToolTip("下载：%s" % str(rec.get("name") or "文件"))
+            # lambda 里抓 rec 的副本：行建好后记录不会再变，但闭包抓可变
+            # 字典的话，将来若记录被改写（撤回）按钮行为会跟着漂。
+            btn.clicked.connect(
+                lambda _=False, r=dict(rec): self._download_chat_file(r))
+            line.addWidget(btn)
+            bv.addLayout(line)
+            refs["name_lbl"] = name_lbl
+            refs["btn"] = btn
+        else:
+            body = QLabel(str(rec.get("text") or ""))
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            body.setStyleSheet("font-size: 12px; color: %s;" % p["text"])
+            bv.addWidget(body)
+        h.addWidget(bubble)
+        if not me:
+            h.addStretch(1)
+        # 插到 stretch 之前：消息自上而下堆积
+        self._chat_list.insertWidget(self._chat_list.count() - 1, row)
+        row.show()
+        return refs
+
+    def _mark_chat_withdrawn(self, refs):
+        """把一条文件消息改写成「已撤回」：文字变灰、下载按钮失效。"""
+        refs["withdrawn"] = True
+        p = theme.current()
+        lbl = refs.get("name_lbl")
+        btn = refs.get("btn")
+        if lbl is not None:
+            lbl.setText("已撤回")
+            lbl.setStyleSheet("color: %s; font-style: italic;"
+                              % p["text_faint"])
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setToolTip("对方已撤回这个文件")
+
+    def _clear_chat_rows(self):
+        """清空所有消息行（退房时用；控件先 hide 再 deleteLater，防重影）。"""
+        for refs in list(self._chat_rows.values()):
+            w = refs.get("row")
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        self._chat_rows = {}
+
+    def _scroll_chat_bottom(self):
+        bar = self._chat_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     def _tick(self):
-        """每秒采样一次计数器，算帧率与码率。"""
+        """每秒采样一次计数器，算帧率与码率。
+
+        ⚠️ 这里有两套口径，别混：
+          * `frames_sent` / `bytes_sent` = **投递口径**（交给观看者的那一刻计数）
+          * `viewer_stats()` 的 frames/bytes = **送达口径**（sendall 成功之后计数）
+        慢链路下投递 30 帧/秒、送达可能只有 4 帧/秒 —— 这正是"异地只有 4 帧"
+        的判断依据。以前只显示投递口径，用户看到的是"发出 30 帧/秒"，完全
+        看不出瓶颈在链路。
+        """
         if self._sender is not None and self._server is not None:
             # 统计口径统一在引擎层：`frames_sent` 只数**真正带画面的帧**
             # （心跳不算），`bytes_sent` 含协议头。抓屏线程与编码线程各数
@@ -755,21 +1259,44 @@ class SharePage(BasePage):
                                   self._server.bytes_sent)
             w, h = self._sender.size
             if self._server.viewers:
-                index = min(self._quality_combo.currentIndex(),
-                            len(screenshare.QUALITY_PRESETS) - 1)
-                cap_fps = screenshare.QUALITY_PRESETS[max(0, index)][2]
-                text = ("%d 人正在观看　·　发出 %.0f 帧/秒　·　%.2f MB/s　·　%d×%d"
-                        % (self._server.viewers, self._send_meter.fps,
-                           self._send_meter.kbps / 1024.0, w, h))
-                # 静止画面本来就不重复发，这时帧率掉到挡位以下是对的。
-                # 不解释一句的话，"我选了 30 帧怎么只有 2 帧"会被当成故障。
-                if self._send_meter.fps < cap_fps * 0.5:
+                stats = self._server.viewer_stats()
+                d_frames = sum(v["frames"] for v in stats)
+                d_bytes = sum(v["bytes"] for v in stats)
+                d_drop = sum(v["dropped"] for v in stats)
+                self._deliver_meter.feed(d_frames, d_bytes)
+                # ---- 自适应码率：把**送达口径**的实测值喂给控制器 ----
+                # 用送达而不是投递：投递包含"塞进内核缓冲但还没出去"的部分，
+                # 拿它判链路会把拥塞中的链路误判成富余。
+                action = self._sender.adaptive.feed(d_bytes, d_frames)
+                # "down" 由编码线程按 target 直接生效（H.264 的码率旋钮）；
+                # "preset_down" = 码率压到下限仍不够 → 自动降一档分辨率。
+                if action == "preset_down":
+                    self._auto_lower_preset()
+                per_frame = (self._deliver_meter.kbps * 1024.0
+                             / max(1.0, self._deliver_meter.fps))
+                text = ("%d 人正在观看　·　%s　·　发出 %.0f 帧/秒　·　送达 %.0f 帧/秒"
+                        "　·　%.2f MB/s　·　%d×%d"
+                        % (self._server.viewers, self._sender.codec_name,
+                           self._send_meter.fps, self._deliver_meter.fps,
+                           self._deliver_meter.kbps / 1024.0, w, h))
+                if self._deliver_meter.fps > 0.5:
+                    text += "　·　单帧 %.0f KB" % (per_frame / 1024.0)
+                text += "　·　码率目标 %.2f Mbps" % (
+                    self._sender.adaptive.target / 1e6)
+                # 判定优先级：先看"送达是不是明显低于发出"（=链路受限），
+                # 再看"发出本身就低"（=画面静止没有重发）。
+                # 以前无脑补一句"（画面没变就不重发）"，在链路受限时会把
+                # 4fps 说成正常现象，把真正的瓶颈掩盖掉。
+                sent, got = self._send_meter.fps, self._deliver_meter.fps
+                if got < 3.0 and sent < 2.0:
                     text += "　（画面没变就不重发）"
                 self._lbl_stats.setText(text)
             else:
                 # 没人在看时显示"0 帧/秒"会让人以为坏了。如实说清状态：
                 # 画面已经准备好，只是在等人连进来。
-                self._lbl_stats.setText("等待观看者接入　·　画面已就绪 %d×%d" % (w, h))
+                hint = "（%s）" % self._codec_note if self._codec_note else ""
+                self._lbl_stats.setText(
+                    "等待观看者接入　·　画面已就绪 %d×%d %s" % (w, h, hint))
         if self._client is not None:
             self._recv_meter.feed(self._client.frames, self._client.bytes)
             text = ("收到 %.0f 帧/秒　·　%.2f MB/s"
@@ -779,6 +1306,14 @@ class SharePage(BasePage):
             if self._recv_meter.fps < 5:
                 text += "　（对方画面没变，没有重发）"
             self._lbl_watch.setText(text)
+
+        # 聊天可用态跟着「异地联机」的房间走：进房/退房各刷新一次界面。
+        # （房间状态是联机页通过 screenshare.set_active_room 登记的，
+        #  这里只读快照，不跨页调方法。）
+        in_room = bool(screenshare.active_room().get("ip"))
+        if in_room != self._chat_enabled:
+            self._chat_enabled = in_room
+            self._apply_chat_state()
 
     # ------------------------------------------------------------------ 共享
     def _reload_targets(self):
@@ -862,13 +1397,56 @@ class SharePage(BasePage):
         else:
             self._host_hint.setText(self._hint_off())
 
+    def _fetch_ffmpeg_pack(self):
+        """后台下载/解压 H.264 组件（在网络线程里跑，进度走信号队列）。"""
+        try:
+            def prog(msg):
+                self._bridge.event.emit("pack_progress", {"msg": msg})
+
+            ok, msg = ffmpeg_pack.ensure_installed(
+                on_progress=prog, on_stage=prog)
+            self._bridge.event.emit("pack_done", {"ok": ok, "msg": msg})
+        except Exception as exc:                        # noqa: BLE001
+            self._bridge.event.emit("pack_done",
+                                    {"ok": False, "msg": repr(exc)})
+
+    def _auto_lower_preset(self):
+        """自适应判定"码率压到下限还不够" → 自动降一档分辨率。
+
+        只降一次一档，并记在 `_auto_downgraded` 里：控制器每个窗口都会报
+        `preset_down`，不记就会一路降到底。用户手动换挡会清掉这个记录
+        （见 `_on_quality`），把主动权还给用户。
+        """
+        idx = self._quality_combo.currentIndex()
+        if idx <= 0:
+            return
+        if self._auto_downgraded == idx:
+            return
+        self._auto_downgraded = idx - 1
+        self._quality_combo.setCurrentIndex(idx - 1)   # 触发 _on_quality → 重置控制器
+        self.toast("链路带宽不足，已自动降到 %s 以保住帧率"
+                   % screenshare.QUALITY_PRESETS[idx - 1][0])
+
+    def _on_codec_log(self, payload):
+        """编码器/解码器的日志（在后台线程里发出，已经过信号队列）。"""
+        msg = str((payload or {}).get("msg") or "")
+        if msg:
+            self.toast(msg)
+
     def _current_target(self):
         data = self._target_combo.currentData()
         return data if data is not None else ("screen", 0)
 
     def _on_quality(self, index):
+        """用户手动换挡：目标码率跟着换，并把自适应重置到新基准。
+
+        为什么不用旧接口 `set_quality`：那只是改 JPEG 质量，而现在是
+        码率档 —— 用户选了 1080p，自适应就从 5Mbps 起步往上/往下浮动。
+        """
         if self._sender is not None:
-            self._sender.set_quality(index)
+            self._sender.set_preset(index)
+        # 手动换挡也把"自动降挡"的记忆清掉（否则用户的意图会被旧记录盖住）
+        self._auto_downgraded = None
 
     def _start_host(self):
         """开始共享。走哪条链路**完全由「本机地址」里选中的网卡决定**。"""
@@ -917,8 +1495,29 @@ class SharePage(BasePage):
 
         self._sender = _Sender(server, self._bridge)
         self._sender.set_target(self._current_target())
-        self._sender.set_quality(self._quality_combo.currentIndex())
+        self._sender.set_preset(self._quality_combo.currentIndex())
+        # H.264 是唯一的编码路径（JPEG 编码已于 2026-10-11 删除）：组件可用
+        # 就发 H.264。对端能力在**握手时**就已经筛掉——不声明 CAP_H264 的
+        # 旧客户端直接吃 ERR codec（见 screenshare.ShareServer.offer），
+        # 所以这里不用、也没有"每帧判一次要不要退回 JPEG"的逻辑。
+        self._sender.set_use_h264(self._sender.h264_ready())
+        if self._sender.h264_ready():
+            self._codec_note = "H.264（%s）" % h264codec.describe()
+        elif ffmpeg_pack is not None:
+            self._codec_note = "H.264 组件未就绪（正在后台下载，就绪后自动启用）"
+        else:
+            self._codec_note = "H.264 组件缺失，画面暂时发不出去（连接会保持）"
         self._sender.start()
+        if not self._sender.h264_ready() and ffmpeg_pack is not None \
+                and not self._pack_fetching:
+            # H.264 组件未装：**后台**按需下载（与 EasyTier 组件同款机制）。
+            # 下载完成前连接保持着、心跳照发，但**没有画面**——编码线程在
+            # `not self._use_h264` 分支只发心跳保活；装好后下一帧自动切换，
+            # 不需要重启共享。
+            self._pack_fetching = True
+            threading.Thread(target=self._fetch_ffmpeg_pack,
+                             daemon=True).start()
+            self.toast("H.264 组件未安装，正在后台下载（一次性）…")
 
         if mode == "room":
             self._host_hint.setText(
@@ -1004,9 +1603,15 @@ class SharePage(BasePage):
             except ValueError:
                 self.toast("端口看着不对：%s" % raw)
                 return
-        client = screenshare.FrameClient(host, port, self._code_edit.text().strip(),
-                                         on_frame=self._on_frame,
-                                         on_event=self._engine_event)
+        client = screenshare.FrameClient(
+            host, port, self._code_edit.text().strip(),
+            on_frame=self._on_frame,
+            on_event=self._engine_event,
+            # 声明"我会解 H.264"——发送端据此才敢发 3/4 号包。
+            # 组件不在时**不声明**：发送端会在握手时回绝（ERR codec）。
+            # JPEG 编码已删除，没有"对面继续发 JPEG"这条兼容旧版的路了。
+            caps=((screenshare.CAP_H264,) if h264codec is not None
+                  and h264codec.available() else ()))
         ok, res = client.start()
         if not ok:
             self.toast(res)
@@ -1025,6 +1630,9 @@ class SharePage(BasePage):
         self._close_full()
         client, self._client = self._client, None
         client.stop()
+        # 注意：**不在这里关解码器** —— 它归接收线程，主线程关会踩到
+        # "线程还在 recv、上下文已被释放"（见 `_close_decoder`）。
+        # `client.stop()` 会让接收线程走到 `closed` 事件，那时它自己收尾。
         self._view.clear()
         self._lbl_watch.setText("")
         self._apply_state()
@@ -1073,18 +1681,83 @@ class SharePage(BasePage):
         different thread`，随后整个进程直接消失，连 Python 堆栈都留不下来。
         v0.12beta 实测踩过：别人一点「看屏幕」，共享端立刻闪退。
         """
+        # 解码器归接收线程所有，所以**它的收尾也必须在接收线程里做**
+        # （`closed` 正是接收线程退出前发的最后一个事件）。放在 emit 之前，
+        # 所以这段代码确实跑在接收线程上 —— 见 `_close_decoder` 的注释。
+        if kind == "closed":
+            self._close_decoder()
         self._bridge.engine.emit(kind, payload)
 
     def _on_frame(self, kind, seq, w, h, payload):
-        """在接收线程里被调用 —— 只做转发，绝不碰控件。"""
+        """在接收线程里被调用 —— 绝不碰控件，但**可以**在这里解码。
+
+        为什么要在这里解（而不是主线程）：1920px 一帧 H.264 解码约 3~8ms，
+        30fps 下主线程要被吃掉一两成时间，界面动画（切页、开关、侧栏 hover）
+        会被拖累。`QImage` 是纯数据对象，在非 GUI 线程里解码/构造是安全的
+        —— 只有 `QPixmap` 必须留在主线程（由主线程那侧 `fromImage` 转一次）。
+        """
+        img = None
         if kind == screenshare.TYPE_FRAME and payload:
-            self._bridge.event.emit("frame", payload)
+            img = QImage()
+            try:
+                if not img.loadFromData(payload, "JPEG"):
+                    img = None
+            except Exception:
+                img = None
+        elif kind in (screenshare.TYPE_H264_KEY,
+                      screenshare.TYPE_H264) and payload:
+            img = self._decode_h264(payload)
+        if img is not None:
+            self._bridge.event.emit("frame", img)
+
+    def _decode_h264(self, payload):
+        """解一个 Annex-B 包（解码器实例只在接收线程里用，见模块约定）。"""
+        if h264codec is None:
+            return None
+        dec = self._decoder
+        if dec is None:
+            try:
+                dec = h264codec.H264Decoder(threads=2)
+            except Exception as exc:                    # noqa: BLE001
+                self._bridge.engine.emit(
+                    "codec_log", {"msg": "H.264 解码器不可用：%s" % exc})
+                return None
+            self._decoder = dec
+        try:
+            got = dec.decode(payload)
+        except Exception as exc:                        # noqa: BLE001
+            self._bridge.engine.emit(
+                "codec_log", {"msg": "H.264 解码失败：%s" % exc})
+            return None
+        if not got:
+            return None                                 # 还没凑够一帧
+        w, h, bgra = got
+        img = QImage(bgra, w, h, w * 4, QImage.Format.Format_RGB32)
+        # 必须 copy()：bgra 是这一次解码的临时缓冲，下一帧就换掉了
+        return img.copy()
+
+    def _close_decoder(self):
+        """关闭解码器。**只能在接收线程里调用**（见 `_engine_event`）。
+
+        ⚠️ 为什么不能从主线程关：`FrameClient.stop()` 的 join 只有 1.5 秒，而
+        接收线程可能正卡在 5 秒的 recv 里 —— join 超时后主线程继续跑，
+        这时若把解码器上下文释放掉，接收线程下一帧就会解码到已释放的内存。
+        实测症状：自检全过、**进程退出时访问违例 0xC0000005**。
+        """
+        dec, self._decoder = self._decoder, None
+        if dec is not None:
+            try:
+                dec.close()
+            except Exception:
+                pass
 
     def _on_engine(self, kind, payload):
         """在主线程里处理引擎事件。"""
         if kind == "frame":
-            pix = QPixmap()
-            if pix.loadFromData(payload, "JPEG"):
+            # payload 是接收线程里已经解好的 QImage（见 _on_frame）——
+            # 这里只做 QPixmap 转换（必须主线程），不再解码 JPEG。
+            pix = QPixmap.fromImage(payload)
+            if not pix.isNull():
                 self._last_pix = pix
                 self._view.show_frame(pix)
                 # 全屏窗口开着就同步刷 —— 两个 `_ScreenView` 各自缓存自己
@@ -1093,10 +1766,34 @@ class SharePage(BasePage):
                     self._full.show_frame(pix)
         elif kind == "preview":
             self._view.show_frame(QPixmap.fromImage(payload))
+        elif kind == "codec_log":
+            self._on_codec_log(payload)
+        elif kind == "pack_progress":
+            msg = str((payload or {}).get("msg") or "")
+            if msg:
+                try:
+                    self._host_hint.setText("H.264 组件：%s" % msg)
+                except RuntimeError:
+                    pass
+        elif kind == "pack_done":
+            ok = bool((payload or {}).get("ok"))
+            msg = str((payload or {}).get("msg") or "")
+            self._pack_fetching = False
+            if ok and self._sender is not None:
+                # 组件装好了：立刻让编码线程切到 H.264（不用重启共享）
+                self._sender.set_use_h264(self._sender.h264_ready())
+                self._codec_note = "H.264（%s）" % h264codec.describe()
+            base = ("H.264 组件已就绪，下一帧起启用" if ok
+                    else "H.264 组件下载失败，画面暂时发不出去（连接保持）")
+            self.toast("%s（%s）" % (base, msg) if msg else base)
         elif kind == "viewer_join":
             self.toast("有人开始观看了（%d 人）" % payload.get("total", 1))
         elif kind == "rejected":
-            self.toast("有人用错的观看码来连，已拒绝")
+            if (payload or {}).get("reason") == "codec":
+                # 旧版本客户端来观看：JPEG 编码已删除，它解不了 H.264
+                self.toast("有旧版本客户端尝试观看，已拒绝（请对方更新 Yuhub）")
+            else:
+                self.toast("有人用错的观看码来连，已拒绝")
         elif kind == "sender_stopped":
             err = payload.get("error", "")
             if self._server is not None:
@@ -1114,6 +1811,13 @@ class SharePage(BasePage):
         self._reload_addresses()
         if not self._targets_loaded:
             self._reload_targets()
+        # 聊天：先同步房间状态（徽标/输入框立刻是对的，不等下一秒的 tick），
+        # 再接信号、补画房里已有的消息。
+        in_room = bool(screenshare.active_room().get("ip"))
+        if in_room != self._chat_enabled:
+            self._chat_enabled = in_room
+            self._apply_chat_state()
+        self._connect_chat()
 
     def shutdown(self):
         for stop in (self._stop_host, self._stop_watch):
@@ -1122,4 +1826,14 @@ class SharePage(BasePage):
             except Exception:
                 pass
         self._close_full()
+        # 聊天信号摘掉：退出过程中联机页可能还在广播最后几条消息，
+        # 排着队发进一个正在拆的页面没有意义。
+        lan = self._lan_page()
+        if lan is not None and self._chat_connected:
+            try:
+                lan.chat_message.disconnect(self._on_chat_message)
+            except (TypeError, RuntimeError):
+                pass
+        self._chat_connected = False
+        self._clear_chat_rows()
         self._timer.stop()

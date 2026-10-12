@@ -43,6 +43,25 @@ def _qss_templates():
     return out
 
 
+def _menu_bg_alpha(css):
+    """取 QMenu 规则里 background 的不透明度（0-255）。
+
+    解析不出来返回 None —— 调用方要能区分"解析失败"和"alpha=0"。
+    """
+    import re as _re
+    m = _re.search(r"QMenu\s*\{[^}]*background:\s*([^;]+);", css, _re.S)
+    if not m:
+        return None
+    col = m.group(1).strip()
+    if col.lower().startswith("rgba("):
+        try:
+            return int(float(col.rsplit(",", 1)[1].rstrip(")")))
+        except ValueError:
+            return None
+    # #rrggbb / rgb() 都当作全不透明
+    return 255 if col.startswith("#") or col.lower().startswith("rgb(") else None
+
+
 def run(out_file, timeout_sec=60):
     from PySide6.QtWidgets import QApplication
 
@@ -175,7 +194,13 @@ def run(out_file, timeout_sec=60):
             theme.set_pack(tname)
             theme.set_theme("dark")
             q2 = theme.build_qss()
-            chk("切换后 QSS 反映新 accent", "#ff6600" in q2.lower(), "")
+            # 水墨重做（2026-10-11）后：主题包的 accent 会被 INK_OVERLAY
+            # 统一接管（见 theme.current），用户包改 accent 不再改变观感——
+            # 这是既定设计（观感收编为"纸 + 墨"），不是回归。
+            chk("切换后 QSS 走水墨 accent（用户包 accent 被水墨覆盖层接管）",
+                "#ff6600" not in q2.lower()
+                and str(theme.current().get("accent", "")).lower() in q2.lower(),
+                (theme.current_pack_name(), theme.current().get("accent")))
             chk("current_pack_name 正确", theme.current_pack_name() == tname,
                 theme.current_pack_name())
     finally:
@@ -492,19 +517,19 @@ def run(out_file, timeout_sec=60):
         chk("选中片高度几乎撑满整行（上下各只内缩 1px，不再是一片薄条）",
             pill.height() >= btn.height() - 2,
             (pill.height(), btn.height()))
-        # ---- 选中片改成「浅蓝液态玻璃」（v0.15beta） ----
-        # 用户要求「选中的特效不要蓝色，可以要带有浅蓝色的液态玻璃的效果」。
-        # 所以左缘那条实心 accent 色条**撤掉**了 —— 改为由"上/左内侧光带 +
-        # 左缘青色散"承担方向提示。这里断言玻璃本身：主体是浅蓝、上缘有光带、
-        # 左缘比右缘更偏青（色散），而不是"某条竖线是不是蓝的"。
+        # ---- 选中片改成「水墨墨灰」（2026-10-11 水墨重做） ----
+        # 玻璃时期的"浅蓝液态玻璃"已随水墨改版移除：选中片现在是宣纸/玄墨
+        # 体系里的中性墨灰（三通道接近、不偏蓝），上缘仍有光带、左缘仍
+        # 略偏青作为方向提示。这里断言的就是这套水墨观感。
         def _plum(c):
             return 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
 
         mid = pimg.height() // 2
         body = pimg.pixelColor(pimg.width() // 2, mid)
-        chk("选中片主体是浅蓝（B 通道最高且够亮）",
-            body.blue() > body.red() and body.blue() > body.green()
-            and body.blue() > 170, body.getRgb())
+        chk("选中片主体是水墨墨灰（三通道接近、不偏蓝）",
+            abs(body.blue() - body.red()) <= 16
+            and abs(body.green() - body.red()) <= 16,
+            body.getRgb())
         top_px = pimg.pixelColor(pimg.width() // 2, 3)
         chk("选中片内侧有顶部光带（上缘比中段亮）",
             _plum(top_px) > _plum(body), (_plum(top_px), _plum(body)))
@@ -1092,8 +1117,10 @@ def run(out_file, timeout_sec=60):
                 theme.set_theme(_md)
                 _liq = theme.liquid_palette()
                 _tint = glass.qcolor(_liq["tint"])
-                chk("[%s] 液态玻璃底色是浅蓝（B 通道最高）" % _md,
-                    _tint.blue() > _tint.red() and _tint.blue() > _tint.green(),
+                # 水墨重做后 liquid_tint 是中性墨灰（覆盖层写死），不再是蓝
+                chk("[%s] 水墨玻璃底是中性墨灰（不偏蓝、不偏彩）" % _md,
+                    abs(_tint.blue() - _tint.red()) <= 16
+                    and abs(_tint.green() - _tint.red()) <= 16,
                     _tint.getRgb())
                 chk("[%s] 液态玻璃底色够浅（亮度 > 0.45）" % _md,
                     theme._luminance(_liq["tint"]) > 0.45,
@@ -1110,8 +1137,8 @@ def run(out_file, timeout_sec=60):
                     _contrast(_over.name(), _liq["text"]) >= 4.5,
                     "呈色 %s 对比度 %.2f:1"
                     % (_over.name(), _contrast(_over.name(), _liq["text"])))
-                # 对照组：白字压在浅蓝上确实不够（证明这条不是走过场）
-                chk("[%s] 对照组：白字压在浅蓝玻璃上不到 3:1" % _md,
+                # 对照组：白字压在浅色水墨灰上确实不够（证明这条不是走过场）
+                chk("[%s] 对照组：白字压在浅色水墨玻璃上不到 3:1" % _md,
                     _contrast(_over.name(), "#ffffff") < 3.0,
                     _contrast(_over.name(), "#ffffff"))
         finally:
@@ -1443,6 +1470,52 @@ def run(out_file, timeout_sec=60):
 
     except Exception as exc:      # noqa: BLE001 —— 跑不起来本身就算失败
         chk("窗口圆角回归检查能跑起来", False, repr(exc))
+
+    # ---------------- ⑱ 弹出菜单底色必须近实心（用户反馈回归） ----------------
+    # 现象：sky glass 深色下右键托盘图标，菜单"没有底、字浮在半空"。
+    # 根因：托盘菜单是**独立顶层弹窗**，背后没有主窗口那层模糊背板可透，
+    # 而玻璃系主题的 card_top 只有约 10% 不透明度。修法是用主题里专门为
+    # 菜单准备的近实心色 menu_bg / menu_border（默认色板与 sky glass 的
+    # theme.qss 都用它）。
+    # 这组检查守两件事：① 托盘菜单自己那份样式不再退回 card_top；
+    # ② 内置模板的 QMenu 规则也跟着换成菜单专用键（否则只修了一半）。
+    from ui import tray as _tray
+    _pk_saved, _md_saved = theme.get_pack().name, theme.get_theme()
+    _faint = []
+    _rows = []
+    try:
+        for _pn in theme.pack_names():
+            theme.set_pack(_pn)
+            for _m in ("dark", "light"):
+                theme.set_theme(_m)
+                _a = _menu_bg_alpha(_tray.menu_qss())
+                _rows.append("%s/%s=%s" % (_pn, _m, _a))
+                if _a is None or _a < 200:
+                    _faint.append("%s/%s=%s" % (_pn, _m, _a))
+    finally:
+        theme.set_pack(_pk_saved)
+        theme.set_theme(_md_saved)
+    chk("托盘菜单底色是近实心（alpha≥200，不用半透明的 card_top）",
+        not _faint, _faint or _rows)
+    _builtin_tpl2 = str(getattr(theme._QSS, "template", theme._QSS))
+    chk("内置模板的 QMenu 规则也用菜单专用键 $menu_bg / $menu_border",
+        "$menu_bg" in _builtin_tpl2 and "$menu_border" in _builtin_tpl2)
+    # 对照：水墨主题的 card_top 是实心纸面（alpha=255）—— 证明"不能用
+    # 半透明的 card_top 当菜单底"这条规矩在水墨体系里依然有依据（卡片
+    # 是不透明的，菜单要有自己的 menu_bg 键才能跟卡片区分开）。
+    theme.set_pack("sky glass")
+    theme.set_theme("dark")
+    _ct_alpha = None
+    try:
+        _ct = theme.current().get("card_top", "")
+        _ct_alpha = int(float(_ct.rsplit(",", 1)[1].rstrip(")"))) \
+            if _ct.lower().startswith("rgba(") else 255
+    except (ValueError, IndexError):
+        pass
+    theme.set_pack(_pk_saved)
+    theme.set_theme(_md_saved)
+    chk("对照组：水墨主题的 card_top 确实不透明（卡片是实心纸面，菜单需要专用底色键）",
+        _ct_alpha is not None and _ct_alpha == 255, _ct_alpha)
 
     result["ok"] = all(c["pass"] for c in checks)
     # 先 dumps 再落盘 + default=str：detail 里混进 bytes / 自定义对象时，

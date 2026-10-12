@@ -51,7 +51,7 @@ class SettingsPage(BasePage):
     ):
         super().__init__(
             "设置中心",
-            "应用偏好、主题、开机自启与关于 Yuhub。",
+            "应用偏好、开机自启与关于 Yuhub。",
             icon="⚙️",
             notify=notify,
             parent=parent,
@@ -77,22 +77,25 @@ class SettingsPage(BasePage):
         self._build_appearance(theme_setting)
         self._build_startup_card(close_to_tray)
         self._build_repair_card()
+        self._build_accel_card()
         self._build_etier_card()
         self._build_about()
         self.add_stretch()
 
+    # ------------------------------------------------------ 外观
+    # 水墨重做后不再提供"主题包"切换；明暗模式在下面分段按钮里选
+    # （跟随系统 / 浅色 / 深色），标题栏 🌙/☀️ 按钮也能直接切。
     def _build_appearance(self, theme_setting):
         appearance = QFrame()
         appearance.setObjectName("Card")
         av = QVBoxLayout(appearance)
         av.setContentsMargins(18, 16, 18, 16)
-        av.setSpacing(14)
+        av.setSpacing(10)
 
         t = QLabel("外观")
         t.setObjectName("CardTitle")
         av.addWidget(t)
 
-        # ---- ① 明暗模式 ----
         self.theme_segment = SegmentedControl(
             [("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")],
             current=theme_setting,
@@ -101,75 +104,20 @@ class SettingsPage(BasePage):
         self.theme_segment.setMaximumWidth(380)
         av.addWidget(self.theme_segment, 0, Qt.AlignLeft)
 
-        # ---- ② 主题包 ----
-        pack_lbl = QLabel("主题")
-        pack_lbl.setObjectName("GroupTitle")
-        av.addWidget(pack_lbl)
+        note = QLabel("水墨界面：浅色是宣纸黑墨，深色是玄墨白竹。")
+        note.setObjectName("Faint")
+        av.addWidget(note)
 
-        self.pack_combo = QComboBox()
-        self.pack_combo.setMinimumWidth(260)
-        self.pack_combo.setMaximumWidth(380)
-        self.pack_combo.currentTextChanged.connect(self._on_pack_selected)
-        av.addWidget(self.pack_combo, 0, Qt.AlignLeft)
-
-        self.pack_desc = QLabel("")
-        self.pack_desc.setObjectName("Muted")
-        self.pack_desc.setStyleSheet("font-size: 11px;")
-        self.pack_desc.setWordWrap(True)
-        av.addWidget(self.pack_desc)
-
-        self._reload_pack_combo()
-        theme.bus.packs_changed.connect(self._reload_pack_combo)
         self.add(appearance)
 
-    # ------------------------------------------------------ 主题包
-    def _reload_pack_combo(self, *_args):
-        """把主题列表同步进下拉框（不触发切换信号）。"""
-        names = theme.pack_names()
-        self.pack_combo.blockSignals(True)
-        self.pack_combo.clear()
-        for nm in names:
-            pk = theme.packs().get(nm)
-            self.pack_combo.addItem(pk.label if pk else nm, nm)
-        cur = theme.current_pack_name()
-        idx = self.pack_combo.findData(cur)
-        if idx >= 0:
-            self.pack_combo.setCurrentIndex(idx)
-        self.pack_combo.blockSignals(False)
-        self._update_pack_desc()
+    def set_theme_setting(self, value):
+        """外部（标题栏按钮）切换主题时同步分段按钮选中态。"""
+        if getattr(self, "theme_segment", None) is not None:
+            self.theme_segment.set_current(value)
 
-    def _update_pack_desc(self):
-        nm = self.pack_combo.currentData()
-        pk = theme.packs().get(nm) if nm else None
-        if pk is None:
-            self.pack_desc.setText("")
-            return
-        bits = []
-        if pk.description:
-            bits.append(pk.description)
-        if pk.author:
-            bits.append(f"作者：{pk.author}")
-        if pk.version:
-            bits.append(f"v{pk.version}")
-        self.pack_desc.setText(" · ".join(bits) or "（无描述）")
-        self._populate_note_style()
-
-    def _on_pack_selected(self, _label):
-        nm = self.pack_combo.currentData()
-        if not nm or nm == theme.current_pack_name():
-            self._update_pack_desc()
-            return
-        self._on_pack_change(nm)
-        self._update_pack_desc()
-
-    def set_pack_setting(self, name):
-        """外部切换主题包时同步下拉框选中态。"""
-        idx = self.pack_combo.findData(name)
-        if idx >= 0:
-            self.pack_combo.blockSignals(True)
-            self.pack_combo.setCurrentIndex(idx)
-            self.pack_combo.blockSignals(False)
-        self._update_pack_desc()
+    def set_pack_setting(self, _name):
+        """旧接口：主题包切换 UI 已移除，这里只是兼容空操作。"""
+        return
 
     def _build_startup_card(self, close_to_tray):
         card = QFrame()
@@ -240,8 +188,8 @@ class SettingsPage(BasePage):
             info_card(
                 "关于 Yuhub",
                 f"版本：{VERSION_LABEL}\n"
-                "支持多套主题，主题存放在「文档 / Yuhub」目录下，"
-                "每个主题一个文件夹，可自行修改配色。\n"
+                "界面为水墨风：明暗模式自动跟随系统，浅色宣纸黑墨、"
+                "深色玄墨白竹。\n"
                 "技术栈：Python + PySide6 (Qt)\n"
                 "已上线：本机配置检测（含逐盘容量）、实时占用监控、C盘清理、"
                 "多线程下载、软件卸载与残留清理、跨网联机、系统托盘驻留、"
@@ -378,6 +326,84 @@ class SettingsPage(BasePage):
         self._etier_event.emit(
             "repair_ready", {"info": info.to_dict(), "path": path})
 
+    # ------------------------------------------------------ 网络加速框架
+    def _build_accel_card(self):
+        """网络加速框架的体检 + 一键修复。
+
+        修复做的事（全部走 ui.pages.accel_page.repair_framework，与加速页
+        共用同一份实现）：停掉残留内核 → 清 hosts 加速块 → 用本体里内嵌的
+        那份覆盖写回落点并校验 sha256 → 重建/确认根证书（原本信任过且证书
+        被重建时自动重新信任）。适用场景：框架 exe 被安全软件删掉、更新中
+        断导致文件损坏、加速开启异常退出后 hosts 残留 —— 重装 Yuhub 太重，
+        这里一键恢复即可。
+        """
+        self._accel_repair_busy = False
+
+        card = QFrame()
+        card.setObjectName("Card")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+
+        title = QLabel("网络加速框架")
+        title.setObjectName("CardTitle")
+        v.addWidget(title)
+
+        # 状态：后台检测，不在构造函数里起子进程拖慢页面
+        self.accel_status = QLabel("框架检测中…")
+        self.accel_status.setWordWrap(True)
+        self.accel_status.setStyleSheet("font-size: 12px;")
+        v.addWidget(self.accel_status)
+
+        v.addWidget(small_note(
+            "加速框架随程序内嵌，进「网络加速」页会自动就位。若它被安全软件"
+            "误删、文件损坏，或加速异常退出后残留 hosts 记录，点「修复加速"
+            "框架」会用内嵌文件重新写入并校验，同时清理 hosts 与重建证书，"
+            "无需重装 Yuhub。"))
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self.btn_accel_repair = ghost_button("修复加速框架")
+        self.btn_accel_repair.clicked.connect(self._on_accel_repair_clicked)
+        row.addWidget(self.btn_accel_repair)
+        v.addLayout(row)
+
+        self.add(card)
+
+        threading.Thread(target=self._do_accel_check, daemon=True).start()
+
+    def _do_accel_check(self):
+        """后台体检：框架在不在 + 证书状态（不触碰任何 UI）。"""
+        try:
+            from . import accel_page as ap
+            installed = ap.framework_installed()
+            status = ap.framework_status() if installed else None
+        except Exception as exc:                                   # noqa: BLE001
+            installed, status = False, {"error": repr(exc)}
+        self._etier_event.emit("accel_check",
+                               {"installed": installed, "status": status})
+
+    def _on_accel_repair_clicked(self):
+        if self._accel_repair_busy:
+            return
+        self._accel_repair_busy = True
+        self.btn_accel_repair.setEnabled(False)
+        self.accel_status.setText("正在修复加速框架…")
+        threading.Thread(
+            target=self._do_accel_repair, name="AccelRepair", daemon=True).start()
+
+    def _do_accel_repair(self):
+        def progress(text):
+            self._etier_event.emit("accel_repair_prog", text)
+
+        try:
+            from . import accel_page as ap
+            ok, msg = ap.repair_framework(progress=progress)
+        except Exception as exc:                                   # noqa: BLE001
+            ok, msg = False, repr(exc)
+        self._etier_event.emit("accel_repair_done", {"ok": ok, "msg": msg})
+
     # ------------------------------------------------------ 异地联机组件
     def _build_etier_card(self):
         """EasyTier 组件体检 + 一键修复。
@@ -426,17 +452,30 @@ class SettingsPage(BasePage):
             ok, detail = etier.core_health()
         except Exception as exc:
             ok, detail = False, repr(exc)
-        self._etier_event.emit("check", {"ok": ok, "detail": detail})
+        # 顺带报一下管理 CLI 的状态：它是**可选件**，缺了只是成员表退回
+        # ARP + 信标的旁路推断（联机/云盘/分屏全不受影响），所以这里只做
+        # 说明，不影响上面的 ok——两个判据混在一起会让"组件正常"变红。
+        try:
+            cli_ok, cli_detail = etier.cli_health()
+        except Exception as exc:
+            cli_ok, cli_detail = False, repr(exc)
+        self._etier_event.emit("check", {"ok": ok, "detail": detail,
+                                         "cli_ok": cli_ok,
+                                         "cli_detail": cli_detail})
 
     def _on_etier_event(self, kind, payload):
         """后台线程 → 主线程的事件落地（体检结果 / 修复进度与结果）。"""
         if kind == "check":
             ok = payload.get("ok")
             detail = str(payload.get("detail") or "")
-            if ok:
-                self.etier_status.setText("组件正常（%s）" % detail)
+            cli_ok = bool(payload.get("cli_ok"))
+            cli_detail = str(payload.get("cli_detail") or "")
+            base = ("组件正常（%s）" % detail) if ok else ("组件异常：%s" % detail)
+            if cli_ok:
+                base += "；成员表：已接入 core（权威数据）"
             else:
-                self.etier_status.setText("组件异常：%s" % detail)
+                base += "；成员表：%s" % (cli_detail or "未接入")
+            self.etier_status.setText(base)
         elif kind == "progress":
             self.etier_status.setText(str(payload or ""))
         elif kind == "repair_done":
@@ -476,8 +515,56 @@ class SettingsPage(BasePage):
             else:
                 self._reset_repair_button()
                 self.repair_status.setText("修复失败：下载结果无效")
+        elif kind == "accel_check":
+            self._render_accel_status(payload.get("installed"),
+                                      payload.get("status"))
+        elif kind == "accel_repair_prog":
+            self.accel_status.setText(str(payload or ""))
+        elif kind == "accel_repair_done":
+            ok = bool(payload.get("ok"))
+            msg = str(payload.get("msg") or "")
+            self._accel_repair_busy = False
+            self.btn_accel_repair.setEnabled(True)
+            if ok:
+                self.accel_status.setText(msg)
+                self.toast("加速框架已修复：%s" % msg)
+                # 加速页可能已经建好并停在旧状态上，通知它重读框架/证书
+                self._refresh_accel_page()
+            else:
+                self.accel_status.setText("修复失败：%s" % msg)
+                self.toast("修复失败：%s" % msg)
         else:
             return
+
+    def _render_accel_status(self, installed, status):
+        """把框架体检结果写进状态行。"""
+        if not installed:
+            self.accel_status.setText(
+                "框架尚未就位（进一次「网络加速」页会自动安装，"
+                "或直接点下面的「修复加速框架」）。")
+            return
+        if not isinstance(status, dict) or not status.get("ca"):
+            self.accel_status.setText(
+                "框架已就位，但根证书状态异常 —— 建议点「修复加速框架」重建。")
+            return
+        trusted = status.get("trusted")
+        days = status.get("expires_in_days")
+        bits = ["框架已就位", "根证书"
+                + ("已信任" if trusted else "未信任（加速前需在加速页点「信任证书」）")]
+        if isinstance(days, int):
+            bits.append("证书剩余 %d 天" % days)
+        self.accel_status.setText(" · ".join(bits))
+
+    def _refresh_accel_page(self):
+        """若「网络加速」页已构造过，让它重读状态（不触发懒构造）。"""
+        win = self.window()
+        pages = getattr(win, "_pages", None)
+        page = pages.get("accel") if hasattr(pages, "get") else None
+        if page is not None and hasattr(page, "refresh_state"):
+            try:
+                page.refresh_state()
+            except Exception:                                      # noqa: BLE001
+                pass
 
     def _on_repair_clicked(self):
         self.btn_repair.setEnabled(False)
@@ -522,20 +609,9 @@ class SettingsPage(BasePage):
     def _on_theme_changed_restyle(self, *_args):
         _style_note(self.autostart_hint, self._autostart_is_warn)
         _style_note(self.tray_hint, not self._tray_available)
-        self._populate_note_style()
 
-    def _populate_note_style(self):
-        """主题包描述是内联色值，主题一换要重新染色。"""
-        p = theme.current()
-        try:
-            self.pack_desc.setStyleSheet(
-                f"font-size: 11px; color: {p['text_dim']}; background: transparent;")
-        except AttributeError:
-            pass
-
-    def set_theme_setting(self, value):
-        """外部（标题栏按钮）切换主题时同步选中态。"""
-        self.theme_segment.set_current(value)
+    # set_theme_setting / set_pack_setting 的兼容空操作见 _build_content 上方
+    # （外观切换 UI 已随水墨重做移除）。
 
     # -------------------------------------------------------------- 开机自启
     def _autostart_state(self):

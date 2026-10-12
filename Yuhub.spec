@@ -13,26 +13,23 @@ _datas = [
     # "结束进程"的调用 —— 这是"内存优化绝不关掉用户程序"这条承诺的静态
     # 证据。PyInstaller 默认只把 .pyc 收进 PYZ，源码不可读，扫描会失效。
     ("memopt.py", "."),
-    # hostsaccel.py 同理：自检要 AST 扫描"提权进程只写 hosts 和结果文件、
-    # 绝不碰注册表 / 杀进程 / 联网"，并校验域名清单与清洗逻辑的一致性。
-    ("hostsaccel.py", "."),
-    # hostssniproxy.py：自检要 AST 扫描"纯标准库、不 import ssl（透传不解密）、
-    # 不碰子进程/注册表"。
-    ("hostssniproxy.py", "."),
-    # accel_page.py：自检要 AST 扫描"后台线程回调只 emit"的界面纪律。
-    ("ui/pages/accel_page.py", "ui/pages"),
-    # main.py / single_instance.py / winadmin.py / accel_page.py：
+    # main.py / single_instance.py / winadmin.py：
     # 「常驻管理员启动 + 重启链路已删净」这两条都是**读源码才验得了**的
-    # 结构性约束 —— 自检会 AST / 文本扫描这四个文件，确认：
+    # 结构性约束 —— 自检会 AST / 文本扫描这几个文件，确认：
     #   ① single_instance._probe 真的在泵事件循环（同进程时 waitFor* 不保证
     #      把消息推出去，写完立刻 disconnect 会把字节丢掉）；
     #   ② 代码里不再残留 relaunch / takeover 的任何痕迹（谁加回来就红）。
     # 源码没随包 → 扫描**空转**、断言照样绿 —— 那正是"它绿了≠它测到了"，
-    # 所以这四个文件必须进 datas。
+    # 所以这几个文件必须进 datas。
     ("main.py", "."),
     ("single_instance.py", "."),
     # winadmin.py：提权判定（TokenElevation）—— 不能用 IsUserAnAdmin 判组。
     ("winadmin.py", "."),
+    # v1.0.7 内嵌加速框架（Native AOT 单文件，2.69MB）：进「网络加速」页时
+    # 自动复制到 %LOCALAPPDATA%\Yuhub\accel —— 不再需要手动选文件 / 下载。
+    # 注意必须是 out/ 下这份 2.69MB 的 AOT 产物；bin/Release/.../ 下还有个
+    # 151KB 的 apphost 壳（旁边要同名 .dll 才能跑），千万别收错。
+    ("accel-framework/out/YuhubAccel.exe", "accel"),
 ]
 for _root, _dirs, _files in os.walk("resources"):
     for _name in _files:
@@ -46,7 +43,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=_datas,
-    hiddenimports=['theme_selftest', 'uninstaller_selftest', 'lan_selftest', 'update_selftest', 'gpu_selftest', 'share_selftest', 'node_selftest', 'memopt_selftest', 'toast_selftest', 'screenshare_selftest', 'hostsaccel_selftest'],
+    hiddenimports=['theme_selftest', 'uninstaller_selftest', 'lan_selftest', 'update_selftest', 'gpu_selftest', 'share_selftest', 'node_selftest', 'memopt_selftest', 'toast_selftest', 'screenshare_selftest', 'cleaner_selftest', 'room_chat', 'room_chat_selftest', 'PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -62,7 +59,11 @@ a = Analysis(
     #     `from PySide6.QtTest import QTest` 驱动分享页点击。排掉它不会让任何
     #     自检变红，只会让**冻结态的 lan 自检**炸 ModuleNotFoundError，并且被
     #     main 的兜底吞成 rc=5（GUI 子系统没有 stderr，毫无线索）。
-    #     hostsaccel_selftest 现在有一条断言专门守这个对应关系。
+    #     PySide6 子模块"与 spec 的 excludes 的对应关系。
+    # ⚠️ `PySide6.QtSvg` 是 v1.0.7 新增的显式依赖：网络加速页要渲染品牌 logo
+    #    （resources/logos/*.svg）。它**不在** excludes 里、源码也 import 了它，
+    #    但这里仍然显式列进 hiddenimports —— 理由同上：PySide6 的子模块一旦
+    #    没被收进来，症状是"冻结态才炸、源码态全绿"，最难查。
     excludes=[
         'PySide6.QtQml', 'PySide6.QtQuick', 'PySide6.QtQuickWidgets',
         'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',

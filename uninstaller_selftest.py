@@ -220,10 +220,10 @@ def run(out_file, timeout_sec=90):
 
     # ---------------- 检查 6：删除权限与只读属性（v0.10.4） ----------------
     # 回归"AppData 里的文件删不掉"：三个叠加原因
-    #   a) _needs_admin 只认三个系统前缀，AppData 一律按普通权限删
+    #   a) 受保护位置的判定太窄，AppData 一律按普通权限删
+    #      （现已简化为"程序本身就是管理员"，判定不复存在）
     #   b) _delete_dir 不摘只读属性 —— 只读文件连管理员都删不掉
-    #   c) MoveFileEx 对权限失败也返回成功，把失败误报成"重启后自动删"，
-    #      于是永远不触发 UAC 提权兜底
+    #   c) MoveFileEx 对权限失败也返回成功，把失败误报成"重启后自动删"
     try:
         _check_delete_permissions(result["checks"])
     except Exception as exc:
@@ -404,37 +404,72 @@ def _check_delete_permissions(checks):
         "detail": "retryable=%r" % (getattr(res, "retryable", "缺失"),),
     })
 
-    # ④ 提权通道可用性（源码模式必须能识别出没有 exe 的情况）
-    exe = un.sys_executable()
-    cap, why = un.elevation_capable(exe)
-    is_py = os.path.basename(exe).lower() == "python.exe"
+    # ④ 提权链路必须已经彻底移除（用户要求：程序本身就是管理员启动，
+    #    残留清理不再弹二次授权）。这里守着"别哪天又加回来"。
     checks.append({
-        "name": "提权通道判定自洽",
-        "pass": (not cap) if is_py else cap,
-        "detail": "exe=%s capable=%s reason=%r" % (exe, cap, why),
+        "name": "★ 提权入口已移除（run_elevated_clean / elevated_uninstall_main）",
+        "pass": not hasattr(un, "run_elevated_clean")
+        and not hasattr(un, "elevated_uninstall_main")
+        and not hasattr(un, "elevation_capable"),
+        "detail": "全部不存在",
     })
 
-    # ⑤ AppData 里"删不掉"的路径必须被判定为需要提权。
-    #    本机自检多半是管理员，探不出真实权限，所以只验证硬规则：
-    #    UWP 包目录与系统前缀必须命中。
-    from ui.pages.uninstall_page import LeftoverConfirmDialog as D
-    cases = [
-        (r"C:\Users\someone\AppData\Local\Packages\Foo_1", True, "UWP 包目录"),
-        (r"C:\Program Files\Foo", True, "Program Files"),
-        (r"C:\ProgramData\Foo", True, "ProgramData"),
-        (r"C:\Users\someone\AppData\Local\Foo", False, "普通 AppData 目录"),
-    ]
-    bad = []
-    for p, want, label in cases:
-        # 普通 AppData 目录在管理员环境下探测会通过 → 判定 False，属预期
-        got = D._needs_admin(un.Leftover(kind="dir", path=p))
-        if got != want:
-            bad.append("%s(期望%s得到%s)" % (label, want, got))
+    # ⑤ 新增的残留扫描面必须可调用（快捷方式 / 自启动值 / 服务 / 计划任务）
+    for fn in ("_scan_shortcut_leftovers", "_scan_startup_leftovers",
+               "_scan_service_leftovers", "_scan_task_leftovers"):
+        checks.append({
+            "name": "★ 新增扫描器存在：%s" % fn,
+            "pass": callable(getattr(un, fn, None)),
+            "detail": "",
+        })
+    # 残留模型必须支持「删值」（Run 那类键只能删值不能删键）
+    lv = un.Leftover(kind="reg_value", value="Foo")
     checks.append({
-        "name": "受保护路径判定正确",
-        "pass": not bad,
-        "detail": "全部命中" if not bad else "偏差：%s" % "; ".join(bad),
+        "name": "★ 支持注册表**值**级残留（reg_value + value 字段）",
+        "pass": lv.value == "Foo" and un.is_reg_kind(lv)
+        and lv.size_text == "注册表值",
+        "detail": "%s / %s" % (lv.size_text, un.is_reg_kind(lv)),
     })
+    # 扫描必须回报「是否被时间预算截断」（不再静默截断）
+    st = {}
+    class _FakeApp:
+        name = "YuhubSelfTest"
+        publisher = ""
+        install_location = ""
+        display_icon = ""
+        uninstall_string = ""
+        kind = "win32"
+        subkey = ""
+        hive = ""
+    import tempfile as _tf
+    probe_dir = _tf.mkdtemp(prefix="yuhub_ul_")
+    try:
+        class _FakeApp2:
+            name = "YuhubSelfTestUnique20261011"
+            publisher = ""
+            install_location = probe_dir
+            display_icon = ""
+            uninstall_string = ""
+            kind = "win32"
+            subkey = ""
+            hive = ""
+        items = un.scan_leftovers(_FakeApp2(), budget=20.0, stats=st)
+        checks.append({
+            "name": "★ scan_leftovers 回报 truncated/elapsed",
+            "pass": "truncated" in st and "elapsed" in st and items,
+            "detail": st,
+        })
+        checks.append({
+            "name": "★ 扫描是只读的（沙箱目录仍在）",
+            "pass": os.path.isdir(probe_dir),
+            "detail": probe_dir,
+        })
+    except Exception as exc:                                    # noqa: BLE001
+        checks.append({"name": "残留扫描冒烟", "pass": False,
+                       "detail": repr(exc)})
+    finally:
+        import shutil as _sh
+        _sh.rmtree(probe_dir, ignore_errors=True)
 
     # ⑥ 「被占用」绝不能误判成「权限不足」（v1.0.2 修的第二个根因）。
     #    Python 把 WinError 32（共享冲突）也映射成 PermissionError 且

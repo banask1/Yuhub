@@ -8,8 +8,8 @@
    系统进程和当前最前面的程序（详见 memopt 模块头）。
 2. **定时间隔有下限（15 分钟）** —— 更频繁地回收只会让常用程序反复
    重新调页，收益远小于代价。
-3. **两类自动触发（定时 / 过载）一律不提权** —— 后台静默弹 UAC 既烦人
-   又容易被误拒；系统级清理只挂在"管理员深度优化"这个手动开关上。
+3. **优化一律走管理员级清理** —— 程序本身由 exe 清单保证以管理员启动，
+   所以每次优化（手动 / 定时 / 过载）都包含系统级清理，且不会弹授权窗口。
 4. **自动触发有冷却** —— 过载触发后 10 分钟内不再重复，否则机器长期
    跑在阈值之上时会变成"每几秒回收一次"，那是纯伤害。
 """
@@ -369,8 +369,8 @@ class MemoryPage(BasePage):
         self._threshold = self._read_int("mem_thr_percent", DEFAULT_THRESHOLD)
         self._thr_next_ok = 0.0
         self._thr_grace_until = 0.0
-        # 管理员深度优化（只作用于手动优化）
-        self._admin_deep = _read_bool(self._settings, "mem_admin_deep", False)
+        # 管理员深度优化开关已按用户要求**移除**：程序本身以管理员启动，
+        # 所有优化（手动 / 定时 / 过载）一律走管理员级清理，不需要用户去开。
         saved_min = self._read_int("mem_auto_minutes", 30)
 
         self._build_content(saved_min)
@@ -473,17 +473,8 @@ class MemoryPage(BasePage):
         row.addWidget(self.btn_optimize)
         row.addStretch(1)
 
-        # 管理员深度优化 = 一个开关（不再是一个独立按钮）
-        self.sw_admin = ToggleSwitch(self._admin_deep)
-        self.sw_admin.toggled.connect(self._on_admin_toggled)
-        lbl_admin = self._dim("管理员深度优化")
-        lbl_admin.setToolTip(
-            "开启后，手动点「立即优化」会请求一次管理员授权，额外清空系统"
-            "备用列表并收缩文件缓存。定时 / 过载触发不会提权。")
-        row.addWidget(lbl_admin)
-        row.addWidget(self.sw_admin)
-        lay2.addLayout(row)
-
+        # 权限说明（原来这里是「管理员深度优化」开关；已改为常驻提示，
+        # 因为程序本身就是管理员启动，深度清理不再是一个需要用户决定的事）
         self._admin_hint = self._faint("")
         lay2.addWidget(self._admin_hint)
 
@@ -494,7 +485,8 @@ class MemoryPage(BasePage):
         lay2.addWidget(self._faint(
             "· 不会结束任何程序：只把闲置的内存页交还系统，程序照常运行。\n"
             "· 当前最前面的窗口（你正在用的软件）会被跳过，避免操作时卡顿。\n"
-            "· 定时与过载触发一律使用普通权限，不会在后台弹授权窗口。"))
+            "· 每次优化都包含系统级清理（清空备用列表 + 收缩文件缓存），"
+            "程序以管理员身份运行，不会再弹授权窗口。"))
         self.add(card2)
 
         # ---------------- 定时自动优化 ----------------
@@ -575,78 +567,42 @@ class MemoryPage(BasePage):
         self._mem_detail.setText(
             "可用 %s · 占用率 %.1f%%" % (memopt.human_bytes(st["avail"]),
                                       st["percent"]))
-        self._sync_admin_switch()
+        self._sync_admin_hint()
 
-    # ------------------------------------------------------------ 管理员开关
-    def _sync_admin_switch(self):
-        """按当前权限 / 运行形态决定开关是否可用，并更新说明文字。"""
-        admin = memopt.is_admin()
-        packed = bool(memopt.exe_path())
-        if admin:
-            self.sw_admin.blockSignals(True)
-            self.sw_admin.setChecked(False)
-            self.sw_admin.blockSignals(False)
-            self.sw_admin.setEnabled(False)
+    # ------------------------------------------------------------ 权限说明
+    def _sync_admin_hint(self):
+        """说明这次优化会做到什么程度（程序以管理员启动 → 一律含系统级清理）。"""
+        if memopt.is_admin():
             self._admin_hint.setText(
-                "当前已是管理员权限：每次优化都会自动包含系统级缓存清理，"
-                "这个开关无需开启。")
-        elif not packed:
-            self.sw_admin.setEnabled(False)
-            self._admin_hint.setText(
-                "源码运行时无法请求管理员授权；打包成 exe 后这个开关才可用。")
+                "当前以管理员权限运行：每次优化都会清空系统备用列表并收缩"
+                "文件缓存，可用内存通常还能再涨一截。")
         else:
-            self.sw_admin.setEnabled(True)
-            if self._admin_deep:
-                self._admin_hint.setText(
-                    "已开启：点「立即优化」会请求一次授权，额外清空系统备用"
-                    "列表并收缩文件缓存。定时 / 过载触发仍然只走普通权限。")
-            else:
-                self._admin_hint.setText(
-                    "关闭中：只做免管理员的逐进程回收。开启后手动优化会额外"
-                    "清理系统级缓存（需授权）。")
-
-    def _on_admin_toggled(self, checked):
-        self._admin_deep = bool(checked)
-        self._settings.setValue(
-            "mem_admin_deep", "true" if checked else "false")
-        self._sync_admin_switch()
+            # 打包版由 exe 清单保证管理员启动，正常到不了这里；
+            # 源码态调试时如实说明能力边界。
+            self._admin_hint.setText(
+                "当前未以管理员权限运行：只做逐进程内存回收（打包后的 "
+                "Yuhub.exe 以管理员启动，始终包含系统级清理）。")
 
     # ------------------------------------------------------------ 优化流程
-    def _want_elevated(self):
-        """这次手动优化是否需要提权：开关开着、且还不是管理员、且能提权。"""
-        return (self._admin_deep and memopt.exe_path()
-                and not memopt.is_admin())
-
     def _on_optimize_clicked(self):
-        self._run_optimize(self._want_elevated(), trigger=TRIGGER_MANUAL)
+        self._run_optimize(trigger=TRIGGER_MANUAL)
 
-    def _run_optimize(self, elevated=False, trigger=TRIGGER_MANUAL):
+    def _run_optimize(self, trigger=TRIGGER_MANUAL):
         if self._busy:
             self.toast("正在优化中，请稍候…")
-            return
-        if elevated and not memopt.exe_path():
-            self.toast("源码运行时不支持提权优化，请用打包后的 exe")
             return
         self._busy = True
         self._trigger = trigger
         self.btn_optimize.setEnabled(False)
         self.btn_optimize.setText("正在优化…")
-        self.sw_admin.setEnabled(False)
-        self._status.setText(
-            "正在请求管理员授权…" if elevated else "正在枚举进程…")
-        threading.Thread(target=self._work, args=(elevated,),
-                         name="MemOpt", daemon=True).start()
+        self._status.setText("正在枚举进程…")
+        threading.Thread(target=self._work, name="MemOpt", daemon=True).start()
 
-    def _work(self, elevated):
+    def _work(self):
         try:
-            if elevated:
-                res = memopt.run_elevated_optimize(skip_foreground=True)
-                if res is None:
-                    res = {"ok": False, "error": "已取消管理员授权",
-                           "cancelled": True}
-            else:
-                res = memopt.optimize(
-                    progress=lambda text: self._prog.emit(str(text)))
+            # optimize() 自己按当前权限决定做不做系统级清理（见 memopt.optimize
+            # 的 `elevated = is_admin()`）——程序以管理员启动，所以每次都做。
+            res = memopt.optimize(progress=lambda text: self._prog.emit(str(text)))
         except Exception as exc:                          # noqa: BLE001
             res = {"ok": False, "error": "优化异常：%s" % (exc,)}
         self._done.emit(res)
@@ -658,23 +614,20 @@ class MemoryPage(BasePage):
         self._busy = False
         self.btn_optimize.setEnabled(True)
         self.btn_optimize.setText("立即优化")
-        self._sync_admin_switch()
+        self._sync_admin_hint()
         self.refresh_memory()
         self._last_result = res
 
         if not res or not res.get("ok"):
-            if (res or {}).get("cancelled"):
-                self._status.setText("已取消管理员授权，未做任何改动。")
-            else:
-                self._status.setText(
-                    "优化未完成：%s" % (res or {}).get("error", "未知原因"))
+            self._status.setText(
+                "优化未完成：%s" % (res or {}).get("error", "未知原因"))
             return
 
         prefix = "" if self._trigger == TRIGGER_MANUAL else "（%s触发）" % self._trigger
         self._status.setText(
             "%s%s · 用时 %.2fs%s"
             % (prefix, memopt.describe(res), res.get("seconds", 0.0),
-               "" if res.get("elevated") else "（系统级缓存需管理员权限）"))
+               "" if res.get("elevated") else "（本次未含系统级清理）"))
         self._push_history(res, self._trigger)
         self._render_history()
 
@@ -736,7 +689,7 @@ class MemoryPage(BasePage):
                 bits.append("%d 个程序" % it.get("emptied", 0))
                 bits.append("%.1fs" % it.get("seconds", 0.0))
                 if it.get("elevated"):
-                    bits.append("深度")
+                    bits.append("含系统级清理")
             text = "%s　%s" % (_fmt_clock(it.get("ts", 0)), " · ".join(bits))
             lbl = QLabel(text)
             lbl.setWordWrap(True)
@@ -780,7 +733,7 @@ class MemoryPage(BasePage):
         self._next_at = time.monotonic() + self.picker.minutes() * 60
         if self._busy:
             return
-        self._run_optimize(False, trigger=TRIGGER_TIMER)
+        self._run_optimize(trigger=TRIGGER_TIMER)
 
     # ------------------------------------------------------------ 过载
     def _on_thr_toggled(self, checked):
@@ -848,7 +801,7 @@ class MemoryPage(BasePage):
             return
         self._thr_grace_until = 0.0
         self._thr_next_ok = now + THRESHOLD_COOLDOWN
-        self._run_optimize(False, trigger=TRIGGER_OVERLOAD)
+        self._run_optimize(trigger=TRIGGER_OVERLOAD)
 
     # ------------------------------------------------------------ 心跳
     def _on_tick(self):

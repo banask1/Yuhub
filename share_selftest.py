@@ -93,6 +93,19 @@ def run(out_file, timeout_sec=60):
             ls.make_token("A", "B") == ls.make_token("A", "B"))
         chk("token 对密码敏感",
             ls.make_token("A", "B") != ls.make_token("A", "C"))
+        # 🔴 房间码/密码的**归一化**：加入房间时 EasyTier 收到的是
+        # `code.lower().replace(" ", "")`，所以大小写与空格不参与房间判定。
+        # token 若吃原始输入，两边打的字格式不同就会算出不同 token →
+        # 对方拉不到清单、界面一片空白（用户反馈的"看不到朋友分享的文件"）。
+        chk("★ token 忽略房间码的大小写与空格（与房间判定同口径）",
+            ls.make_token("ABC 123", "pw") == ls.make_token("abc123", "pw")
+            == ls.make_token("  AbC123  ", "pw"),
+            ls.make_token("ABC 123", "pw"))
+        chk("★ token 忽略密码首尾空白（看不见的空格不该决定成败）",
+            ls.make_token("code", " pw ") == ls.make_token("code", "pw"))
+        chk("归一化不改变敏感度：不同房间码/密码仍算出不同 token",
+            ls.make_token("code1", "pw") != ls.make_token("code2", "pw")
+            and ls.make_token("code", "pw1") != ls.make_token("code", "pw2"))
         chk("download_dir 可用", bool(ls.download_dir()))
         p1 = ls.unique_path(dst, "x.bin")
         open(p1, "wb").close()

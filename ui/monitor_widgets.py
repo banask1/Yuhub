@@ -11,7 +11,6 @@ from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QBrush
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -152,7 +151,12 @@ class Sparkline(QWidget):
 # 单个监控指标块
 # ---------------------------------------------------------------------------
 class MetricTile(QFrame):
-    """指标块：图标 + 名称 + 大号百分比 + 副信息 + 趋势条。点击可打开详情。"""
+    """指标块（横向长条）：图标 + 名称/副信息 + 大号百分比 + 趋势条。
+
+    2026-10-12 改为**横条**（用户要求）：三个指标块在面板里从上到下排，
+    一行放下"图标 + 名称 + 副信息 + 数值 + 趋势条"，半宽面板里不用滚动
+    就能完整展示。点击仍弹出详情。
+    """
 
     clicked = Signal(str)
 
@@ -162,16 +166,15 @@ class MetricTile(QFrame):
         self._key = key
         self._tint_key = tint_key
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumHeight(132)
+        self.setMinimumHeight(58)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setToolTip("点击查看详细参数")
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(6)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(12, 8, 12, 8)
+        h.setSpacing(10)
 
-        # 第一行：色块图标 + 名称 + 右侧箭头
-        top = QHBoxLayout()
-        top.setSpacing(8)
+        # 色块图标
         self._tile = QFrame()
         self._tile.setFixedSize(26, 26)
         tl = QVBoxLayout(self._tile)
@@ -180,33 +183,38 @@ class MetricTile(QFrame):
         ic.setAlignment(Qt.AlignCenter)
         ic.setStyleSheet("font-size: 13px; background: transparent; color: #ffffff;")
         tl.addWidget(ic)
-        top.addWidget(self._tile, 0, Qt.AlignVCenter)
+        h.addWidget(self._tile, 0, Qt.AlignVCenter)
 
+        # 名称 + 副信息（左列，吃掉剩余宽度；AlignVCenter 让文字列
+        # 在长条被 stretch 拉高时仍然垂直居中，而不是顶在卡片上沿）
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(1)
         self._label = QLabel(label)
         self._label.setStyleSheet("font-size: 12px; font-weight: 700;")
-        top.addWidget(self._label)
-        top.addStretch(1)
-
-        arrow = QLabel("›")
-        arrow.setObjectName("Faint")
-        arrow.setStyleSheet("font-size: 15px; background: transparent;")
-        top.addWidget(arrow, 0, Qt.AlignVCenter)
-        root.addLayout(top)
-
-        # 大号数值
-        self._value = QLabel("--")
-        self._value.setStyleSheet("font-size: 26px; font-weight: 800;")
-        root.addWidget(self._value)
-
-        # 副信息
+        col.addWidget(self._label)
         self._detail = QLabel("")
         self._detail.setObjectName("Faint")
         self._detail.setStyleSheet("font-size: 11px;")
-        root.addWidget(self._detail)
+        # 不换行：半宽面板里中列只有几十像素，换行会把 "14.4 / 31.6 GB"
+        # 折成一列竖排字；放不下就裁掉（tooltip 里有全文）。
+        self._detail.setWordWrap(False)
+        self._detail.setToolTip("")
+        col.addWidget(self._detail)
+        h.addLayout(col, 1)
+        h.setAlignment(col, Qt.AlignVCenter)
 
-        # 趋势条
+        # 大号数值（右对齐，定宽防跳动）
+        self._value = QLabel("--")
+        self._value.setStyleSheet("font-size: 22px; font-weight: 800;")
+        self._value.setMinimumWidth(58)
+        self._value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        h.addWidget(self._value, 0, Qt.AlignVCenter)
+
+        # 趋势条（定宽，垂直居中）
         self.spark = Sparkline(60, tint_key)
-        root.addWidget(self.spark)
+        self.spark.setFixedWidth(84)
+        h.addWidget(self.spark, 0, Qt.AlignVCenter)
 
         theme.bus.changed.connect(lambda _: self._restyle())
         self._restyle()
@@ -231,7 +239,9 @@ class MetricTile(QFrame):
         else:
             self._value.setText(f"{percent:.0f}{suffix}")
             self.spark.push(percent)
+        # 副信息不换行（横条里中列窄），放不下裁掉，全文进 tooltip
         self._detail.setText(detail or "")
+        self._detail.setToolTip(detail or "")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -459,8 +469,10 @@ class LiveMonitorPanel(QFrame):
 
         root.addLayout(head)
 
-        grid = QGridLayout()
-        grid.setSpacing(10)
+        # 三个指标块**从上到下**排（2026-10-12 用户要求）：横条形态配
+        # 纵向堆叠，半宽面板里不用拖动/滚动就能完整展示三个模块。
+        col = QVBoxLayout()
+        col.setSpacing(8)
         self.tiles = {
             "cpu": MetricTile("cpu", "CPU", "🧠", "tile_1"),
             "mem": MetricTile("mem", "内存", "🧩", "tile_4"),
@@ -468,10 +480,10 @@ class LiveMonitorPanel(QFrame):
         }
         for tile in self.tiles.values():
             tile.clicked.connect(self.open_detail)
-        grid.addWidget(self.tiles["cpu"], 0, 0)
-        grid.addWidget(self.tiles["mem"], 0, 1)
-        grid.addWidget(self.tiles["gpu"], 0, 2)
-        root.addLayout(grid)
+        col.addWidget(self.tiles["cpu"])
+        col.addWidget(self.tiles["mem"])
+        col.addWidget(self.tiles["gpu"])
+        root.addLayout(col)
 
         self._sub = QLabel("")
         self._sub.setObjectName("Faint")

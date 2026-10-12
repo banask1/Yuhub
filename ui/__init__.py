@@ -190,8 +190,70 @@
 #       而 `lan_selftest` 里 `from PySide6.QtTest import QTest` 要驱动分享页点击
 #       → 冻结态炸 ModuleNotFoundError，**十套自检全绿、只有 lan 红**，且 GUI
 #       子系统没有 stderr、异常被兜底吞成 rc=5。现在 ① main 的兜底会把
-#       traceback 落到 `<结果>.err`；② hostsaccel_selftest 增加一条断言，
+#       traceback 落到 `<结果>.err`；② 自检套件增加一条断言，
 #       逐一比对"源码里真正引用的 PySide6 子模块"与 spec 的 excludes。
-VERSION = "1.0.6"
-VERSION_LABEL = f"v{VERSION}"
+# [1.0.7] 网络加速功能整体移除
+#   用户决定把「Steam / GitHub 加速」这一整块功能从 Yuhub 里删掉，不留备份
+#   （另有云端备份）。原因是它需要 TLS 中间人 + 自签名根证书才能做到
+#   "改写 HTTPS 内容"，属于高安全代价的设计；改用**独立的、自选的加速框架**
+#   去做（本体不再承担）。
+#   · 删除文件：`accelproxy.py` / `netaccel.py` / `netaccel_selftest.py` /
+#     `ui/pages/accel_page.py`。
+#   · 拆除接线：`main.py` 的 `--netaccel-elevated` 与 `--netaccel-selftest`
+#     两个早返回模式、以及给 `--*-selftest` 统一开的
+#     `enable_selftest_isolation()` 钩子（该钩子本来就是为"theme 自检实例化
+#     MainWindow → accel_page.shutdown() 会真写 hosts"而设，随功能一起下线）；
+#     `ui/main_window.py` 的侧栏项 / 配色映射 / 页面工厂条目（**9 页变 8 页**）；
+#     `Yuhub.spec` 的 datas 与 hiddenimports；三个自检编排脚本的套件表
+#     （**10 套**）；`_probe_mutation.py` 的 19 个加速用例。
+#   · ⚠️ 附带影响：`hostsaccel_selftest.py` 曾是「单实例敲门」在全项目**唯一**
+#     的覆盖点，上一轮把它搬进了 netaccel_selftest；本次随模块删除，
+#     **该覆盖目前缺位**，对应的两个变异用例（probenopump / probeackdrop）
+#     也已移除。将来若要补回，可挂到 theme 自检里。
+#   · 后续：加速能力改由**可下载的独立框架**（.NET/YARP + Native AOT）承担。
+#     已实测该框架可行：单文件 **16.24 MB**、无需 .NET 运行时、YARP 在 AOT 下
+#     零裁剪告警、按 SNI 动态签发证书与 response transform 均工作正常。
+#   · 同版新增：
+#     - `ui/pages/accel_page.py` 重新加回「网络加速」页（**只有 UI 骨架**，
+#       侧栏回到 9 项）。布局对标 Steam++：工具条 + 平台列表（方框多选 +
+#       品牌 logo + 展开箭头）。勾选会记住；未装框架时「一键加速」置灰，
+#       **刻意不做"点了没反应"的假开关**。
+#     - `resources/logos/` 放各平台**真品牌 logo**（Simple Icons，CC0；
+#       商标归各自所有者，仅作指明性使用）。"国外验证码平台"与"图床"是**类别**
+#       不是品牌，用自绘矢量图标，避免张冠李戴。
+#       ⚠️ 为此新增对 `PySide6.QtSvg` 的依赖，已显式写进 spec 的 hiddenimports。
+#     - `accel-framework/` 加速框架子工程（.NET 8 + Native AOT）起步：
+#       证书体系已完成并通过实测（CA 生成 / 载入 / 按域名签发叶证书 /
+#       信任查询 / 安装 / 卸载），AOT 产物 2.56 MB。
+# 1.1：房间聊天 + 成员发现"三信号并集"（根治"看不到好友"）
+#   ① **房间聊天**（新模块 room_chat.py，纯标准库）：异地联机的房间里
+#     发消息、分享/撤回文件。文本与云盘文件消息都走虚拟网 UDP 广播
+#     （端口 41235，与昵称信标同机制；看门狗提权时把两个端口一起放行）。
+#     文件消息由「临时云盘」产生：谁分享文件，聊天室里就多一条带下载
+#     图标的消息；取消分享则广播撤回 → 队友那条变成「已撤回」且按钮失效。
+#     昵称随报文走（进房必填昵称，聊天室里不会出现裸 IP）。
+#     UI 在屏幕共享页左下角（原「即将上线」占位卡）。
+#   ② **成员发现改成三条信号的并集**：ARP 表 ∪ 昵称信标新鲜表 ∪
+#     **core 权威成员表**。前两条是旁路推断（ARP 条目要本机先有出站流量才
+#     生成、会老化；信标是应用层广播、会丢），第三条是协议内数据。用户实测
+#     "在线成员看不到好友 / 好友在临时云盘放的文件看不到"两条症状根因相同
+#     ——云盘轮询的 peer 列表也来自成员跟踪器，跟踪器看不见人就什么都拉不到。
+#     现在任何一条算数、任何一条坏掉都还有另外两条。
+#   ③ 借 **easytier-cli** 读 core 的管理 RPC（新 etier.CorePeerFeed）：
+#     后台线程每 2.5 秒 `easytier-cli -p 127.0.0.1:<port> -o json peer list`，
+#     拿到权威成员表——含虚拟 IP、主机名（就是我们传的 --hostname = 用户
+#     昵称）、延迟、丢包、隧道协议、NAT 类型，以及**是否直连**。成员行因此
+#     新增「中继」贴片与链路 tooltip：异地分屏帧率低十有八九是走了公共中继，
+#     现在用户能直接看见。cli 是**可选件**（缺了不拦房间启动，只退回旁路），
+#     与 core 同发布包（约 9.5MB），「一键修复」会一并安装。
+#     端口刻意用 15889 而不是官方默认的 15888：core 的 portal 是无条件启动
+#     的，绑定失败会让 core 直接退出，而 15888 可能被用户自装的 EasyTier 占着。
+#   ④ 修掉一批"看着正常但不对"的地方：etier.py 里带 --no-listener 的死代码
+#     （它是"异地分屏只有 4 帧"的历史根因，留着就是留雷）；屏幕共享模块与
+#     页面里"JPEG 兜底"的过期注释与文案（JPEG 编码早已删除，握手即回绝
+#     不懂 H.264 的旧客户端）；信标 UDP 监听失败改为记日志（原来静默吞掉，
+#     收不到广播的表现是昵称/云盘端口/聊天全停更却毫无线索）；`_update_ip`
+#     整段包异常（打包态没有 stderr，一次异常就让成员列表静默停摆）。
+VERSION = "1.1"
+VERSION_LABEL = f"v{VERSION} 正式版"
 APP_NAME = "Yuhub"

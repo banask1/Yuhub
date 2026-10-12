@@ -24,6 +24,7 @@
 
 from string import Template
 import os
+import sys
 
 from PySide6.QtCore import QObject, Signal
 
@@ -35,6 +36,67 @@ from . import theme_packs as packs_mod
 # ---------------------------------------------------------------------------
 DARK = dict(packs_mod.DEFAULT_DARK)
 LIGHT = dict(packs_mod.DEFAULT_LIGHT)
+
+
+# ---------------------------------------------------------------------------
+# 水墨覆盖层（2026-10-11 UI 重做）
+# ---------------------------------------------------------------------------
+# 这版把观感改成水墨：宣纸白/玄墨黑 + 墨色前景 + 印章式的点睛红。
+# 之所以做成**覆盖层**而不是直接改内置主题包：老用户文档目录里已经有一份
+# 落盘的 theme.json，扫描时会盖过代码里的默认值——覆盖层压在
+# current() 的出口上，无论用户装过什么主题包，观感都统一成水墨。
+INK_LIGHT = {
+    "window_top": "#f7f6f2", "window_bottom": "#f3f1ec",
+    "window_border": "#d9d5ca",
+    "bg": "#f7f6f2", "titlebar_bg": "#f7f6f2", "sidebar_bg": "#f1efe8",
+    "card_top": "#fcfbf9", "card_bottom": "#f9f8f4",
+    "surface_hover": "#eae7de", "surface_sunken": "#efece4",
+    "border": "#e0dccf", "border_strong": "#cbc6b8",
+    "text": "#1d1d1b", "text_dim": "#57554d", "text_faint": "#8b887c",
+    "accent": "#2e2e2b", "accent_hover": "#1c1c1a", "accent_soft": "#e9e6dc",
+    "accent_text": "#ffffff",
+    "titlebar_separator": "#e6e2d6", "sidebar_separator": "#e0dccf",
+    "input_bg": "#fdfdfb", "toggle_off": "#d3cec1",
+    "scrollbar_handle": "#c7c2b4", "toast_bg": "#fdfdfb",
+    "menu_bg": "#fdfdfb", "menu_border": "#e0dccf",
+    "banner_start": "#444440", "banner_end": "#6e6b60",
+    # 液态玻璃选中色组：旧主题包的 json 里可能写死了蓝色 liquid_*，
+    # 覆盖层必须连这组一起压掉，否则选中片仍是包里的旧蓝色。
+    "liquid_tint": "#9c9b93", "liquid_edge": "#c2c1b9",
+    "liquid_text": "#101010", "liquid_top": "#c9c8c0",
+    "liquid_bottom": "#6b6a62",
+    # 侧栏色块标识：墨分五色（浅色模式用浓淡不同的墨）
+    "tile_1": "#2c2c2a", "tile_2": "#55534a", "tile_3": "#6e6a5e",
+    "tile_4": "#3d3c38", "tile_5": "#8a867a", "tile_6": "#4a4842",
+    "tile_7": "#9b978b", "tile_8": "#5f5c53",
+}
+
+INK_DARK = {
+    "window_top": "#101012", "window_bottom": "#0c0c0e",
+    "window_border": "#2b2b30",
+    "bg": "#101012", "titlebar_bg": "#101012", "sidebar_bg": "#131315",
+    "card_top": "#17171a", "card_bottom": "#141416",
+    "surface_hover": "#1f1f23", "surface_sunken": "#0a0a0c",
+    "border": "#27272b", "border_strong": "#3b3b41",
+    "text": "#ecebe5", "text_dim": "#a9a7a0", "text_faint": "#7c7a73",
+    "accent": "#d6d4cd", "accent_hover": "#eceae3", "accent_soft": "#26262a",
+    "accent_text": "#141414",
+    "titlebar_separator": "#242428", "sidebar_separator": "#27272b",
+    "input_bg": "#0d0d0f", "toggle_off": "#2b2b30",
+    "scrollbar_handle": "#3a3a40", "toast_bg": "#1b1b1f",
+    "menu_bg": "#1b1b1f", "menu_border": "#2b2b30",
+    "banner_start": "#3c3c40", "banner_end": "#62605a",
+    # 深色模式的"白墨"玻璃选中色（压掉旧包的蓝色 liquid_*）
+    "liquid_tint": "#b9b8b0", "liquid_edge": "#e2e1da",
+    "liquid_text": "#141414", "liquid_top": "#d6d5cd",
+    "liquid_bottom": "#8a8980",
+    # 深色模式的"白墨"：银灰分五色
+    "tile_1": "#e6e4dd", "tile_2": "#b5b2a8", "tile_3": "#98948a",
+    "tile_4": "#cfccc3", "tile_5": "#858177", "tile_6": "#bdbab1",
+    "tile_7": "#6d6a62", "tile_8": "#a5a29a",
+}
+
+INK_OVERLAY = {"light": INK_LIGHT, "dark": INK_DARK}
 
 
 class _ThemeBus(QObject):
@@ -63,15 +125,18 @@ WINDOW_RADIUS = DARK["window_radius"]
 # 主题包管理
 # ---------------------------------------------------------------------------
 def reload_packs():
-    """重新扫描文档目录里的主题包。返回 {name: ThemePack}。"""
+    """重新扫描文档目录里的主题包。返回 {name: ThemePack}。
+
+    水墨重做（2026-10-11）后主题包切换 UI 已移除，观感统一收编为水墨：
+    **强制使用内置默认包**。用户目录里的旧包（如 sky glass）不再生效——
+    它们自带的 theme.qss / 玻璃贴片机制 / 写死的 liquid_* 蓝色都会和
+    水墨覆盖层打架（选中片发蓝、滚动条出怪纹就是这么来的）。
+    scan_packs 保留是为了不破坏 ThemePack 的落盘/兼容逻辑。
+    """
     global _packs, _current_pack_name
     _packs = packs_mod.scan_packs(packs_mod.DEFAULT_DARK,
                                   packs_mod.DEFAULT_LIGHT)
-    # 当前主题被删掉时，落回默认主题
-    if _current_pack_name not in _packs:
-        fallback = (packs_mod.FIRST_THEME if packs_mod.FIRST_THEME in _packs
-                    else next(iter(_packs)))
-        _current_pack_name = fallback
+    _current_pack_name = packs_mod.FIRST_THEME
     bus.packs_changed.emit()
     return _packs
 
@@ -134,9 +199,16 @@ def get_theme():
 
 
 def current():
-    """当前生效的完整色板（主题包 + 模式合成后的结果）。"""
+    """当前生效的完整色板（主题包 + 模式 + 水墨覆盖层合成后的结果）。
+
+    水墨覆盖层（INK_OVERLAY）压在最后：无论用户选了哪套主题包，最终
+    观感都是"纸 + 墨"。主题包切换 UI 已移除，这里保留机制只为兼容
+    旧调用点与既有用户配置。
+    """
     pk = get_pack()
-    return pk.palette.get(_current_mode) or pk.palette["dark"]
+    pal = dict(pk.palette.get(_current_mode) or pk.palette["dark"])
+    pal.update(INK_OVERLAY.get(_current_mode, {}))
+    return pal
 
 
 def current_pack_name():
@@ -655,10 +727,13 @@ QSpinBox::up-button, QSpinBox::down-button {
    QMenu 是原生弹窗窗口，"透明背景"会让它自身的底不被绘制 → 漏出窗口默认的黑底；
    而文字颜色又跟着主题走，于是浅色主题变成"近黑文字压黑底"（完全看不见），
    深色主题反而勉勉强强能读。所以必须给 QMenu 显式补一套实心样式。
-   注意条目要写在 QMenu::item 上，只给 QMenu 设 background 的话菜单项仍是系统的白底。 */
+   注意条目要写在 QMenu::item 上，只给 QMenu 设 background 的话菜单项仍是系统的白底。
+   底色用菜单专用键 `menu_bg`（主题作者的近实心菜单色）而**不是** card_top：
+   玻璃系主题的 card_top 是半透明的，压在主窗口背板上正常，但弹窗背后没有
+   可透的东西，会变成"没底的浮字"（sky glass 深色下实测就是这样）。 */
 QMenu {
-    background: $card_top;
-    border: 1px solid $border_strong;
+    background: $menu_bg;
+    border: 1px solid $menu_border;
     border-radius: 6px;
     padding: 5px;
     color: $text;
@@ -852,13 +927,13 @@ QPlainTextEdit#LanLog {
 /* ---------- 滚动区域 ---------- */
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: $scrollbar_handle; border-radius: 2px; min-height: 30px; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 3px 2px; }
+QScrollBar::handle:vertical { background: $scrollbar_handle; border-radius: 4px; min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: $accent; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
-QScrollBar::handle:horizontal { background: $scrollbar_handle; border-radius: 2px; min-width: 30px; }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px 3px; }
+QScrollBar::handle:horizontal { background: $scrollbar_handle; border-radius: 4px; min-width: 30px; }
 QScrollBar::handle:horizontal:hover { background: $accent; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
@@ -1051,10 +1126,53 @@ def build_qss():
 
     if pk.qss:
         try:
-            return Template(pk.qss).substitute(**pal)
+            base = Template(pk.qss).substitute(**pal)
         except (ValueError, KeyError):
-            pass
+            base = Template(pk.qss).safe_substitute(**pal)
+    else:
+        try:
+            base = _QSS.substitute(**pal)
+        except (ValueError, KeyError):
+            # 缺哪个键打出来：模板引用了色板里没有的 $key 时，
+            # safe_substitute 会把 $key 原样留在样式里（Qt 忽略之），
+            # 但这条日志能让"新加的规则整段没生效"当场现形。
+            import re as _re
+            missing = sorted({
+                m.group(1) for m in _re.finditer(r"\$([a-z_]+)", _QSS.template)
+                if m.group(1) not in pal and m.group(1) not in
+                ("arrow", "arrow_hover", "arrow_faint")
+            })
+            print("[theme] QSS 模板缺键，退回 safe_substitute：", missing,
+                  file=sys.stderr)
+            base = _QSS.safe_substitute(**pal)
+    # 滚动条胶囊规则**永远**追加在最后（equal-specificity 后写的赢）——
+    # 之前把它写在 substitute 的成功路径里，模板一抛 KeyError 走兜底
+    # 就整段丢了，滚动条退化成原生样式（棋盘格+箭头）。
+    return base + "\n" + _scrollbar_qss(pal)
+
+
+# ---------------------------------------------------------------------------
+# 滚动条：移动的胶囊长条（水墨版统一观感）
+# ---------------------------------------------------------------------------
+# 追加在 QSS 级联**最后**：主题包自带的 theme.qss（如液态玻璃）里也写了
+# 滚动条样式， equal-specificity 下后写的赢——把形状与颜色都收编成
+# "窄轨道 + 全圆角胶囊滑块"，颜色用墨系 scrollbar_handle / accent。
+_SCROLLBAR_QSS = Template("""
+QScrollBar:vertical { background: transparent; width: 8px; margin: 3px 2px; }
+QScrollBar::handle:vertical { background: $scrollbar_handle; border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: $accent; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px 3px; }
+QScrollBar::handle:horizontal { background: $scrollbar_handle; border-radius: 4px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: $accent; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+""")
+
+
+def _scrollbar_qss(pal):
     try:
-        return _QSS.substitute(**pal)
+        return _SCROLLBAR_QSS.substitute(**pal)
     except (ValueError, KeyError):
-        return _QSS.safe_substitute(**pal)
+        return _SCROLLBAR_QSS.safe_substitute(**pal)

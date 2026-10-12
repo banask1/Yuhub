@@ -49,7 +49,7 @@ FORBIDDEN_NAMES = {
 }
 
 _SETTING_KEYS = ("mem_auto_enabled", "mem_auto_minutes",
-                 "mem_thr_enabled", "mem_thr_percent", "mem_admin_deep",
+                 "mem_thr_enabled", "mem_thr_percent",
                  "mem_history")
 
 
@@ -325,9 +325,8 @@ def _run_all(mark):
     mark("特权启用接口可用（不抛异常）",
          memopt.enable_privilege("SeProfileSingleProcessPrivilege")
          in (True, False))
-    mark("exe_path 在打包态返回真实路径",
-         (not getattr(sys, "frozen", False)) or os.path.isfile(memopt.exe_path()),
-         memopt.exe_path())
+    # 注：原先这里还有一条「exe_path 在打包态返回真实路径」——exe_path 随
+    # 提权链路一起删掉了（程序本身以管理员启动，不需要再找自己的 exe 去 runas）。
 
     # ================= E. 挡位 / 阈值契约 =================
     from ui.pages.memory_page import (
@@ -410,12 +409,9 @@ def _run_all(mark):
 
     # ================= F. 页面行为（打桩验证） =================
     calls = []
-    elev_calls = []
     STATUS = {"percent": 30.0}
     orig_optimize = memopt.optimize
     orig_status = memopt.memory_status
-    orig_elev = memopt.run_elevated_optimize
-    orig_exe = memopt.exe_path
     orig_admin = memopt.is_admin
 
     def fake_optimize(progress=None, skip_foreground=True, deadline_s=None):
@@ -423,7 +419,7 @@ def _run_all(mark):
         if progress:
             progress("打桩阶段")
         return {
-            "ok": True, "ts": time.time(), "elevated": False,
+            "ok": True, "ts": time.time(), "elevated": True,
             "before": {"percent": STATUS["percent"], "total": 100, "avail": 40,
                        "used": 60},
             "after": {"percent": 25.0, "total": 100, "avail": 75, "used": 25},
@@ -431,32 +427,33 @@ def _run_all(mark):
             "freed_avail": 1000, "used_before": 60, "used_after": 25,
             "targets": 5, "emptied": 5, "failed": 0, "skipped": 2,
             "measured": 5, "timed_out": False, "foreground_skipped": True,
-            "system_ops": {"standby": "skip", "filecache": "skip"},
+            "system_ops": {"standby": "ok", "filecache": "ok"},
             "seconds": 0.12,
         }
 
-    def fake_elev(timeout=120.0, skip_foreground=True):
-        elev_calls.append({"skip_foreground": bool(skip_foreground)})
-        return fake_optimize()
-
     try:
         memopt.optimize = fake_optimize
-        memopt.run_elevated_optimize = fake_elev
         memopt.memory_status = lambda: {
             "total": 100, "avail": int(100 - STATUS["percent"]),
             "used": int(STATUS["percent"]), "percent": STATUS["percent"],
             "load": int(STATUS["percent"])}
-        # 假装「打包态 + 非管理员」：这样管理员开关可用、提权路径真的可达，
-        # 才能验证「自动触发不走提权」这条承诺，而不是因为它不可用才没走。
-        memopt.exe_path = lambda: r"C:\Fake\Yuhub.exe"
-        memopt.is_admin = lambda: False
+        # 程序以管理员启动 —— 这就是打包态的真实前提
+        memopt.is_admin = lambda: True
 
         page = MemoryPage(notify=lambda _t: None)
 
         mark("页面上有定时 / 过载两个独立开关",
              page.sw_auto is not None and page.sw_thr is not None, "")
-        mark("管理员深度优化是开关而不是独立按钮",
-             page.sw_admin is not None and not hasattr(page, "btn_elevate"), "")
+        # 🔴 用户要求移除「管理员深度优化」开关：程序本身以管理员启动，
+        # 清理力度不再是一个需要用户决定的选项。
+        mark("★ 管理员深度优化开关已移除（没有 sw_admin / 提权入口）",
+             not hasattr(page, "sw_admin")
+             and not hasattr(page, "_want_elevated")
+             and not hasattr(page, "_on_admin_toggled"), "")
+        mark("★ 页面明确写出「每次都含系统级清理」",
+             "系统" in page._admin_hint.text()
+             and "管理员" in page._admin_hint.text(),
+             page._admin_hint.text())
         mark("两个自动开关默认都是关的",
              page._auto_on is False and page._thr_on is False,
              "auto=%s thr=%s" % (page._auto_on, page._thr_on))
@@ -555,28 +552,18 @@ def _run_all(mark):
         mark("冷却结束后可再次触发", len(calls) == n6 + 1,
              "调用 %d 次" % (len(calls) - n6))
 
-        # ⑥ 关键承诺：定时 / 过载一律不提权
-        mark("定时 + 过载触发全程没有走提权路径",
-             len(elev_calls) == 0, "提权调用 %d 次" % len(elev_calls))
-
-        page.sw_admin.setChecked(True)
-        mark("打开管理员开关后内部状态同步", page._admin_deep is True, "")
-        mark("开关打开时 _want_elevated 为真", page._want_elevated() is True, "")
-        page._on_optimize_clicked()
-        _pump(app, 1.5)
-        mark("手动优化在开关打开时确实走提权", len(elev_calls) == 1,
-             "提权调用 %d 次" % len(elev_calls))
-        mark("提权调用同样跳过前台窗口",
-             elev_calls and elev_calls[-1]["skip_foreground"] is True,
-             elev_calls[-1:] or "")
-        STATUS["percent"] = 95.0
-        page._thr_next_ok = page._thr_grace_until = 0.0
-        n7 = len(calls)
-        page._check_threshold()
-        _pump(app, 1.2)
-        mark("管理员开关开着时，过载触发仍然不提权",
-             len(elev_calls) == 1 and len(calls) == n7 + 1,
-             "提权 %d 次 / 普通 %d 次" % (len(elev_calls), len(calls) - n7))
+        # ⑥ 关键承诺：三种触发都走同一条管理员级清理链路，没有任何提权分支
+        #    （手动 1 次 + 定时 1 次 + 过载 2 次 = 4 次，见上面各步）
+        mark("★ 手动/定时/过载都直接走 optimize（无提权路径）",
+             len(calls) >= 4,
+             "optimize 调用 %d 次" % len(calls))
+        mark("★ 结果里带系统级清理标记（standby/filecache 都做了）",
+             page._last_result
+             and (page._last_result.get("system_ops") or {}).get("standby") == "ok",
+             (page._last_result or {}).get("system_ops"))
+        mark("★ 状态文案注明本次含系统级清理",
+             "未含系统级清理" not in page._status.text(),
+             page._status.text()[:90])
 
         # ⑦ 持久化
         page.picker.set_minutes(240)
@@ -589,9 +576,6 @@ def _run_all(mark):
         mark("阈值会被持久化",
              str(cfg.value("mem_thr_percent", "")) == "85",
              cfg.value("mem_thr_percent", ""))
-        mark("管理员开关会被持久化",
-             str(cfg.value("mem_admin_deep", "")) == "true",
-             cfg.value("mem_admin_deep", ""))
         mark("两个自动开关各自持久化",
              str(cfg.value("mem_auto_enabled", "")) == "false"
              and str(cfg.value("mem_thr_enabled", "")) == "true",
@@ -613,6 +597,7 @@ def _run_all(mark):
              rendered[:2])
         page.on_shown()
         mark("on_shown 不抛异常", True, "")
+        STATUS["percent"] = 95.0        # 内存条吃数的打桩值（上面删了 95% 那段）
         page.refresh_memory()
         mark("内存条能接受占用率",
              abs(page.bar._percent - 95.0) < 0.01, page.bar._percent)
@@ -621,18 +606,15 @@ def _run_all(mark):
     finally:
         memopt.optimize = orig_optimize
         memopt.memory_status = orig_status
-        memopt.run_elevated_optimize = orig_elev
-        memopt.exe_path = orig_exe
         memopt.is_admin = orig_admin
 
-    # ================= G. 提权入口的健壮性 =================
-    mark("提权入口拒绝空参数", memopt.elevated_optimize_main("") in (2, 5),
-         memopt.elevated_optimize_main(""))
-    import base64 as _b64
-    bad = _b64.b64encode(b'{"result_file": ""}').decode("ascii")
-    mark("提权入口拒绝没有结果文件路径的载荷",
-         memopt.elevated_optimize_main(bad) == 3,
-         memopt.elevated_optimize_main(bad))
+    # ================= G. 提权入口必须已经彻底移除 =================
+    # 用户要求：程序本身就是管理员启动，内存优化不再需要任何提权链路。
+    # 这里守着"别哪天又被人加回来"（它是死代码，但会把 UAC 弹窗重新带回来）。
+    mark("★ memopt 里已无提权入口（run_elevated_optimize / elevated_optimize_main）",
+         not hasattr(memopt, "run_elevated_optimize")
+         and not hasattr(memopt, "elevated_optimize_main")
+         and not hasattr(memopt, "exe_path"), "")
 
     # ================= H. 跨机型硬前提 =================
     # ① 枚举不到进程时必须明确报错。否则在 32/64 位结构体不匹配或受限

@@ -897,8 +897,8 @@ class HardwarePanel(QFrame):
     # ------------------------------------------------------------------ 构建
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 12, 18, 12)
+        root.setSpacing(10)
 
         # 头部：标题 + 设备分类标签 + 刷新按钮
         head = QHBoxLayout()
@@ -924,23 +924,25 @@ class HardwarePanel(QFrame):
         head.addWidget(self.btn_refresh)
         root.addLayout(head)
 
-        # 机型整行
-        self._model_row = self._make_model_row()
-        root.addLayout(self._model_row)
-
-        # 4 个规格块：2×2 网格，保证长型号名有足够宽度
-        self._spec_grid = QGridLayout()
-        self._spec_grid.setSpacing(10)
+        # 规格块先建好（下面的型号行要把硬盘格挪过去并排）
         self._cells = {
             "cpu": SpecCell("CPU", "🧠", "tile_1"),
             "gpu": SpecCell("显卡", "🎮", "tile_2"),
             "ram": SpecCell("内存", "🧩", "tile_4"),
             "disk": SpecCell("硬盘", "💾", "tile_3"),
         }
-        self._spec_grid.addWidget(self._cells["cpu"], 0, 0)
-        self._spec_grid.addWidget(self._cells["gpu"], 0, 1)
-        self._spec_grid.addWidget(self._cells["ram"], 1, 0)
-        self._spec_grid.addWidget(self._cells["disk"], 1, 1)
+
+        # 机型整行：设备型号 + 硬盘（名字都短，并排正好）
+        self._model_row = self._make_model_row()
+        root.addLayout(self._model_row)
+
+        # CPU 长名字**横跨两列**独占一行（半宽格子缩到 8px 也放不下）；
+        # 显卡 + 内存并排
+        self._spec_grid = QGridLayout()
+        self._spec_grid.setSpacing(10)
+        self._spec_grid.addWidget(self._cells["cpu"], 0, 0, 1, 2)
+        self._spec_grid.addWidget(self._cells["gpu"], 1, 0)
+        self._spec_grid.addWidget(self._cells["ram"], 1, 1)
         root.addLayout(self._spec_grid)
 
         # 存储空间：逐盘列出容量与占用（标注盘号，如 C: / D: / E:）
@@ -984,6 +986,10 @@ class HardwarePanel(QFrame):
         row.setSpacing(10)
         self._model_cell = SpecCell("设备型号", "🔖", "tile_5", large=True)
         row.addWidget(self._model_cell, 1)
+        # 硬盘格挪到型号旁边（名字都短，并排不挤）：给横跨两列的 CPU 格
+        # 腾出整行宽度，长型号名就不用缩字体了
+        self._cells["disk"].setParent(self)
+        row.addWidget(self._cells["disk"], 1)
         return row
 
     # ------------------------------------------------------------------ 样式
@@ -1189,15 +1195,15 @@ class SpecCell(QFrame):
         super().__init__(parent)
         self.setObjectName("SpecCell")
         self._tint_key = tint_key
-        self.setMinimumHeight(84 if not large else 62)
+        self.setMinimumHeight(72 if not large else 56)
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(10)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(8)
 
         # 色块图标
         self._tile = QFrame()
-        self._tile.setFixedSize(34 if not large else 30, 34 if not large else 30)
+        self._tile.setFixedSize(30 if not large else 28, 30 if not large else 28)
         tl = QVBoxLayout(self._tile)
         tl.setContentsMargins(0, 0, 0, 0)
         ic = QLabel(icon)
@@ -1212,10 +1218,17 @@ class SpecCell(QFrame):
         self._label.setObjectName("Faint")
         self._label.setStyleSheet("font-size: 11px;")
         self._value = QLabel("读取中")
-        self._value.setStyleSheet(
-            f"font-size: {'13px' if not large else '14px'}; font-weight: 700;"
-        )
+        # 主值字号不再写进样式表（样式表会压过 setFont），而是用 QFont
+        # 像素字号 + _fit_value_font 自动缩放：文字过长时逐级缩小保证
+        # 一行放下（用户要求），minWidth 钉死避免长型号名撑宽整块面板。
+        vfont = self._value.font()
+        vfont.setPixelSize(14 if large else 13)
+        vfont.setBold(True)
+        self._value.setFont(vfont)
+        self._value_base_px = 14 if large else 13
+        self._value_min_px = 8          # 缩字下限：再小就真的读不清了
         self._value.setWordWrap(False)
+        self._value.setMinimumWidth(40)
         self._detail = QLabel("")
         self._detail.setObjectName("Faint")
         self._detail.setStyleSheet("font-size: 11px;")
@@ -1243,6 +1256,30 @@ class SpecCell(QFrame):
         self._value.setText(value or "--")
         self._detail.setText(detail or "")
         self._detail.setVisible(bool(detail))
+        self._fit_value_font()
+
+    def _fit_value_font(self):
+        """主值一行放下：文字比当前格子宽就逐级缩小像素字号（最低 9px）。
+
+        用户要求"文字过长就缩小字体，保证在一行能显示所有字"。
+        在 set_value 和 resizeEvent 里都会触发——首次填充时布局还没定，
+        真正的宽度要等 resizeEvent 才准。
+        """
+        text = self._value.text()
+        if not text:
+            return
+        from PySide6.QtGui import QFontMetrics
+        avail = max(30.0, self._value.width() - 2)
+        font = self._value.font()
+        for px in range(self._value_base_px, self._value_min_px - 1, -1):
+            font.setPixelSize(px)
+            if QFontMetrics(font).horizontalAdvance(text) <= avail:
+                break
+        self._value.setFont(font)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_value_font()
 
 
 def _shorten(text, limit):
@@ -1305,7 +1342,7 @@ class DriveRow(QFrame):
         self.setObjectName("DriveRow")
         self._percent = 0.0          # 先声明，避免样式回调早于 set_drive 触发
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(10, 7, 12, 7)
+        lay.setContentsMargins(10, 4, 12, 4)
         lay.setSpacing(10)
 
         # 盘符徽标

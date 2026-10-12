@@ -338,6 +338,30 @@ class AppRow(QFrame):
 # ---------------------------------------------------------------------------
 # 残留项行
 # ---------------------------------------------------------------------------
+def _reg_value_exists(item):
+    """复核一条 reg_value 残留：那个**值**是否还在（键在不算）。
+
+    与"键还在不在"分开判断，因为 Run 这类键本来就该一直存在 —— 只有
+    程序自己那一行被删掉才算清干净。
+    """
+    import winreg
+    for flags in (winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+                  winreg.KEY_READ | winreg.KEY_WOW64_32KEY,
+                  winreg.KEY_READ):
+        try:
+            with winreg.OpenKey(item.hive_handle, item.subkey, 0, flags) as k:
+                try:
+                    winreg.QueryValueEx(k, item.value)
+                    return True
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return False
+        except OSError:
+            continue
+    return False
+
+
 class LeftoverRow(QFrame):
     """一条残留：勾选框 + 类型徽标 + 路径 + 体积。"""
 
@@ -358,7 +382,8 @@ class LeftoverRow(QFrame):
         self.check.stateChanged.connect(self._on_toggle)
         lay.addWidget(self.check, 0, Qt.AlignVCenter)
 
-        kind = "注册表" if item.kind == "reg" else ("文件夹" if item.kind == "dir" else "文件")
+        kind = ("注册表" if un.is_reg_kind(item)
+                else ("文件夹" if item.kind == "dir" else "文件"))
         badge = QLabel(kind)
         badge.setObjectName("Badge")
         badge.setStyleSheet("font-size: 10px; padding: 1px 7px;")
@@ -538,8 +563,8 @@ class LeftoverConfirmDialog(_BaseDialog):
     def __init__(self, items, parent=None):
         super().__init__("确认清理残留", parent)
         sel = [it for it in items if it.checked]
-        total = sum(it.size for it in sel if it.kind != "reg")
-        regs = sum(1 for it in sel if it.kind == "reg")
+        total = sum(it.size for it in sel if not un.is_reg_kind(it))
+        regs = sum(1 for it in sel if un.is_reg_kind(it))
 
         warn = QLabel(
             f"即将清理 <b>{len(sel)}</b> 项残留"
@@ -552,19 +577,9 @@ class LeftoverConfirmDialog(_BaseDialog):
         warn.setObjectName("CardDesc")
         self.root.addWidget(warn)
 
-        admin_needed = [] if un.is_admin() else [it for it in sel
-                                                 if self._needs_admin(it)]
-        if admin_needed:
-            hint = QLabel(
-                f"ℹ️ 有 <b>{len(admin_needed)}</b> 项位于受保护位置"
-                "（如 Program Files、ProgramData、HKLM 注册表），"
-                "清理时会弹一次 <b>UAC 授权框</b>，点「是」即可继续。"
-            )
-            hint.setTextFormat(Qt.RichText)
-            hint.setWordWrap(True)
-            hint.setObjectName("Warn")
-            hint.setStyleSheet("font-size: 11px;")
-            self.root.addWidget(hint)
+        # 以前这里会提示"有 N 项位于受保护位置，会弹 UAC 授权框"。
+        # 程序本身以管理员启动（exe 清单 requireAdministrator），所有残留
+        # 都在同一个已提权进程里直接删，不再有二次提权 —— 提示也随之删除。
 
         box = QVBoxLayout()
         box.setSpacing(4)
@@ -599,48 +614,8 @@ class LeftoverConfirmDialog(_BaseDialog):
 
         self.resize(560, 440)
 
-    @staticmethod
-    def _needs_admin(item):
-        """这一项是否**可能**需要管理员权限。
-
-        旧实现只认 Program Files / ProgramData / Windows 三个前缀，
-        结果 AppData 下的残留一律按普通权限删——而 AppData 里恰恰混着
-        大量"安装程序创建、ACL 只给了 SYSTEM/管理员"的目录（最典型的是
-        AppData\\Local\\Packages 下的 UWP 包目录），普通权限必失败。
-
-        这里改成三层判断：
-          1. 注册表：HKLM / HKCR 必须提权（HKCU 属于当前用户，不需要）。
-          2. 系统级路径前缀：受保护位置。
-          3. 其它位置（含 AppData）：**实测能不能删**——用
-             `os.access(W_OK)` 加父目录写权限探测；探不出来时返回 False，
-             由下游"删失败 → 自动提权重试"兜底，不会漏。
-        """
-        if item.kind == "reg":
-            return item.hive in ("HKLM", "HKLM32", "HKCR")
-
-        p = item.path or ""
-        low = p.lower()
-        for pre in ("c:\\program files", "c:\\programdata",
-                    "c:\\windows", "c:\\users\\all users",
-                    "c:\\users\\default"):
-            if low.startswith(pre):
-                return True
-
-        # AppData 里的 UWP 包目录有特殊 ACL，普通权限一定删不掉
-        if "\\appdata\\local\\packages\\" in low:
-            return True
-
-        # 其它情况：实际探测一下能否删除。删不掉就直接走提权，别等失败。
-        target = p if os.path.isdir(p) else os.path.dirname(p)
-        if target and os.path.isdir(target):
-            try:
-                probe = os.path.join(target, ".yuhub_perm_probe")
-                with open(probe, "wb"):
-                    pass
-                os.remove(probe)
-            except OSError:
-                return True                 # 连临时文件都写不进 → 需要提权
-        return False
+    # 注：`_needs_admin` 已随提权链路一起删除（程序本身以管理员启动，
+    # 残留一律直接删；删不掉时由引擎的 takeown/icacls 兜底并如实报错）。
 
     def _on_ok(self):
         self.accept()
@@ -659,7 +634,6 @@ class UninstallPage(BasePage):
     _work_done = Signal(object)
     _work_status = Signal(str)
     _clean_done = Signal(object)
-    _elevated_done = Signal(object)
 
     def __init__(self, notify=None, parent=None):
         super().__init__(
@@ -680,14 +654,12 @@ class UninstallPage(BasePage):
         self._leftovers = []
         self._leftover_rows = []
         self._confirm_dlg = None
-        self._elevate_items = []
 
         self._apps_ready.connect(self._on_apps_ready)
         self._apps_failed.connect(self._on_apps_failed)
         self._work_done.connect(self._on_work_done)
         self._work_status.connect(self._on_work_status)
         self._clean_done.connect(self._on_clean_done)
-        self._elevated_done.connect(self._on_elevated_done)
 
         self._build_content()
 
@@ -1083,8 +1055,16 @@ class UninstallPage(BasePage):
             return
 
         items = result.get("leftovers") or []
+        stats = result.get("scan_stats") or {}
         if result.get("message"):
             self._status.setText(result["message"])
+
+        # 扫描被时间预算截断时**如实告知**（以前是静默的，用户会以为
+        # "就这些残留了"，其实是还没扫完 —— "清不干净"的观感来源之一）。
+        if stats.get("truncated"):
+            self._status.setText(
+                "残留扫描已达 %.0f 秒上限，可能还有未扫到的项；"
+                "可再点一次「重新扫描残留」继续。" % stats.get("budget", 0))
         self._show_leftovers(items)
 
         # 卸载（或强制扫描）结束后自动重扫应用列表：
@@ -1205,7 +1185,7 @@ class UninstallPage(BasePage):
 
     def _update_leftover_ui(self):
         sel = [it for it in self._leftovers if it.checked]
-        total = sum(it.size for it in sel if it.kind != "reg")
+        total = sum(it.size for it in sel if not un.is_reg_kind(it))
         self.btn_clean_lo.setEnabled(bool(sel) and not self._busy)
         self.btn_clean_lo.setText(
             f"清理选中残留（{len(sel)} 项 · {un.human_bytes(total)}）"
@@ -1224,6 +1204,13 @@ class UninstallPage(BasePage):
         dlg.center_on_parent()
 
     def _run_clean_leftovers(self, items):
+        """清理选中的残留。
+
+        程序本身以管理员身份启动（exe 清单 requireAdministrator），所以这里
+        **不再拆分「普通权限项 / 需提权项」**、也不再有 UAC 兜底批次：所有
+        条目都在同一个已提权进程里直接删；个别删不掉的由引擎 takeown /
+        icacls 兜底，仍失败就逐条如实汇报。
+        """
         if self._busy:
             return
         self._busy = True
@@ -1232,68 +1219,20 @@ class UninstallPage(BasePage):
         self._bar.show()
         self._status.setText("正在清理残留…")
 
-        admin = un.is_admin()
-        direct, elevated = [], []
-        for it in items:
-            if admin or not LeftoverConfirmDialog._needs_admin(it):
-                direct.append(it)
-            else:
-                elevated.append(it)
-        self._elevate_items = elevated
-
         def work():
-            res_freed = 0
-            res_removed = 0
-            res_failed = 0
-            msgs = []
-            retry_elevated = list(elevated)
-
-            if direct:
-                r = un.clean_leftovers(direct)
-                res_freed += r.freed
-                res_removed += r.removed
-                res_failed += r.failed
-                msgs.extend(r.messages)
-                # 关键兜底：普通权限删失败的项，只要还没提权过就并入提权批次。
-                # `_needs_admin` 的探测可能漏判（比如 ACL 只对"删除"动作收紧，
-                # 写探测能过），靠这里"失败即升权重试"保证最终能删掉。
-                if r.retryable and not admin:
-                    by_path = {it.path: it for it in direct}
-                    for p in r.retryable:
-                        it = by_path.get(p)
-                        if it is not None and not any(
-                                e.path == it.path for e in retry_elevated):
-                            retry_elevated.append(it)
-
-            if retry_elevated:
-                if direct and retry_elevated is not elevated:
-                    self._work_status.emit("部分残留需要管理员权限，正在请求授权…")
-                data = un.run_elevated_clean(retry_elevated)
-                if data:
-                    res_freed += int(data.get("freed") or 0)
-                    res_removed += int(data.get("removed") or 0)
-                    res_failed = max(0, res_failed - len(retry_elevated))
-                    res_failed += int(data.get("failed") or 0)
-                    msgs.extend(data.get("messages") or [])
-                else:
-                    res_failed += len(retry_elevated)
-                    msgs.append("需要管理员权限的项未清理（授权被取消）")
+            r = un.clean_leftovers(items)
             self._clean_done.emit({
-                "freed": res_freed, "removed": res_removed,
-                "failed": res_failed, "messages": msgs,
+                "freed": r.freed, "removed": r.removed,
+                "failed": r.failed, "messages": list(r.messages),
                 "items": items,
             })
 
         threading.Thread(target=work, daemon=True,
                          name="YuhubLeftoverClean").start()
 
-    def _on_elevated_done(self, data):
-        pass    # 提权结果已在工作线程内合并
-
     def _on_clean_done(self, res):
         self._busy = False
         self._bar.hide()
-        self._elevate_items = []
         freed = res.get("freed", 0)
         removed = res.get("removed", 0)
         failed = res.get("failed", 0)
@@ -1306,7 +1245,11 @@ class UninstallPage(BasePage):
         # 复核：把仍然存在的项标出来，其余移除
         still = []
         for it in res.get("items", []):
-            if it.kind == "reg":
+            if it.kind == "reg_value":
+                # 值级残留：按"这个值还在不在"复核
+                if _reg_value_exists(it):
+                    still.append(it)
+            elif it.kind == "reg":
                 import winreg
                 try:
                     k = winreg.OpenKey(it.hive_handle, it.subkey)

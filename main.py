@@ -272,21 +272,6 @@ def install_translations(app):
 
 
 def main():
-    # ---- 自检隔离：**所有** `--*-selftest` 模式都先把"会被写的路径"
-    #      （hosts / 备份目录 / 意图文件 / 映射缓存 / 结果文件）钉进临时
-    #      目录，并彻底禁止提权。必须在这里统一做，理由见
-    #      hostsaccel.enable_selftest_isolation() 的注释：
-    #      theme 自检会实例化 MainWindow，它的 teardown() → accel_page.shutdown()
-    #      会真提权、真写 hosts（v1.0.5 实测把用户 hosts 的 steam 区块清掉了）。
-    #      「各套件自己记得打桩」不可靠，钩子必须挂在入口上。
-    if any(a.startswith("--") and a.endswith("-selftest")
-           for a in sys.argv[1:]):
-        try:
-            import hostsaccel
-            hostsaccel.enable_selftest_isolation()
-        except Exception:
-            pass
-
     # ---- watchdog 模式（在所有 Qt / 单例初始化之前早返回） ----
     # etier.py 会用 ShellExecuteW("runas") 启动"Yuhub.exe --watchdog <base64-json>"，
     # 让本程序自己充当 watchdog helper：GUI 子系统 + CREATE_NO_WINDOW 启 easytier-core，
@@ -298,52 +283,6 @@ def main():
     # ---- kill-core 模式：提权强制结束残留的 easytier-core（同样早返回） ----
     if "--kill-core" in sys.argv:
         sys.exit(_run_kill_core())
-
-    # ---- clean-elevated 模式：提权静默清理需要管理员权限的项（同样早返回） ----
-    # cleaner.py 的 run_elevated_clean() 会用 ShellExecuteW("runas") 启动
-    # `Yuhub.exe --clean-elevated <base64-json>`，在管理员权限下清完把结果
-    # 写成 JSON 回传。全程无窗口（GUI 子系统 exe + 不建任何 UI）。
-    if "--clean-elevated" in sys.argv:
-        idx = sys.argv.index("--clean-elevated")
-        rest = sys.argv[idx + 1:]
-        if not rest:
-            sys.exit(2)
-        try:
-            import cleaner
-            sys.exit(cleaner.elevated_clean_main(rest[0]))
-        except Exception:
-            sys.exit(5)
-
-    # ---- mem-optimize-elevated 模式：提权做一次完整内存优化（同样早返回） ----
-    # memopt.run_elevated_optimize() 会启动
-    # `Yuhub.exe --mem-optimize-elevated <base64-json>`，在管理员权限下清空
-    # 系统备用列表 / 收缩文件缓存，把结果 JSON 原子写回文件。
-    # 必须早返回：提权进程不该抢单例锁，也不该建任何 Qt 界面。
-    if "--mem-optimize-elevated" in sys.argv:
-        idx = sys.argv.index("--mem-optimize-elevated")
-        rest = sys.argv[idx + 1:]
-        if not rest:
-            sys.exit(2)
-        try:
-            import memopt
-            sys.exit(memopt.elevated_optimize_main(rest[0]))
-        except Exception:
-            sys.exit(5)
-
-    # ---- uninstall-elevated 模式：提权删除受保护位置的软件残留（同样早返回） ----
-    # uninstaller.py 的 run_elevated_clean() 会启动
-    # `Yuhub.exe --uninstall-elevated <base64-json>`，在管理员权限下删掉
-    # Program Files / ProgramData / HKLM 里的残留项，结果写 JSON 回传。
-    if "--uninstall-elevated" in sys.argv:
-        idx = sys.argv.index("--uninstall-elevated")
-        rest = sys.argv[idx + 1:]
-        if not rest:
-            sys.exit(2)
-        try:
-            import uninstaller
-            sys.exit(uninstaller.elevated_uninstall_main(rest[0]))
-        except Exception:
-            sys.exit(5)
 
     # ---- uninstall-selftest 模式：无窗口自检"进页自动扫描 + 卸载后自动重扫" ----
     # 用法： Yuhub.exe --uninstall-selftest <结果json路径>
@@ -358,6 +297,22 @@ def main():
         try:
             import uninstaller_selftest
             sys.exit(uninstaller_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- cleaner-selftest 模式：无窗口自检「C盘清理」规则引擎 ----
+    # 用法： Yuhub.exe --cleaner-selftest <结果json路径>
+    # 自检**只做只读动作**：规则表完整性、路径表达式求值、目标展开、
+    # 沙箱目录里的匹配/删除模拟、三条真实规则的安全扫描。
+    # 绝不清理真实系统文件——删除逻辑只在自建的临时沙箱里验证。
+    if "--cleaner-selftest" in sys.argv:
+        idx = sys.argv.index("--cleaner-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import cleaner_selftest
+            sys.exit(cleaner_selftest.run(rest[0]))
         except Exception:
             sys.exit(5)
 
@@ -475,6 +430,32 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- chat-selftest 模式：无窗口自检「房间聊天」----
+    # 用法： Yuhub.exe --chat-selftest <结果json路径>
+    # 聊意的三条承诺（昵称随报文走、文件消息与云盘联动、撤回报文不被去重）
+    # 都不会抛异常，坏掉时界面看着完全正常。自检分三段：引擎层两个实例
+    # 回环互发、界面层两页接信号渲染、端到端从聊天室真下载一个文件。
+    # 不需要虚拟网卡、不要管理员权限。
+    if "--chat-selftest" in sys.argv:
+        idx = sys.argv.index("--chat-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import room_chat_selftest
+            sys.exit(room_chat_selftest.run(rest[0]))
+        except SystemExit:
+            raise
+        except Exception:
+            try:
+                import traceback as _tb
+                with open(str(rest[0]) + ".err", "w",
+                          encoding="utf-8") as _fh:
+                    _fh.write(_tb.format_exc())
+            except Exception:
+                pass
+            sys.exit(5)
+
     # ---- node-selftest 模式：无窗口自检「中继节点测速」----
     # 用法： Yuhub.exe --node-selftest <结果json路径>
     # 这个功能的两条承诺（延迟是本机实测的、数字是新鲜的）都不会抛异常，
@@ -540,35 +521,6 @@ def main():
         try:
             import screenshare_selftest
             sys.exit(screenshare_selftest.run(rest[0]))
-        except Exception:
-            sys.exit(5)
-
-    # ---- hosts-elevated 模式：提权写 / 清 hosts（同样早返回） ----
-    # hostsaccel.run_elevated() 会用 ShellExecuteW("runas") 启动
-    # `Yuhub.exe --hosts-elevated <base64-json>`，在管理员权限下改完 hosts
-    # 把结果 JSON 原子写回。全程无窗口、不联网 —— 解析与测速都在普通进程。
-    if "--hosts-elevated" in sys.argv:
-        idx = sys.argv.index("--hosts-elevated")
-        rest = sys.argv[idx + 1:]
-        if not rest:
-            sys.exit(2)
-        try:
-            import hostsaccel
-            sys.exit(hostsaccel.elevated_hosts_main(rest[0]))
-        except Exception:
-            sys.exit(5)
-
-    # ---- hosts-selftest 模式：无窗口自检「hosts 网络加速」----
-    # 用法： Yuhub.exe --hosts-selftest <结果json路径>
-    # 全部写盘断言都打在临时文件上，**绝不碰真实 hosts**、不联网、不弹 UAC。
-    if "--hosts-selftest" in sys.argv:
-        idx = sys.argv.index("--hosts-selftest")
-        rest = sys.argv[idx + 1:]
-        if not rest:
-            sys.exit(2)
-        try:
-            import hostsaccel_selftest
-            sys.exit(hostsaccel_selftest.run(rest[0]))
         except Exception:
             sys.exit(5)
 

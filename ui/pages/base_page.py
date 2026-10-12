@@ -1,6 +1,6 @@
 """页面基类：统一的页头（色块图标 + 标题 + 副标题 + 徽标）与可滚动内容区。"""
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent, QObject
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -11,6 +11,41 @@ from PySide6.QtWidgets import (
 )
 
 from .. import theme
+
+
+class _ViewportHeightSync(QObject):
+    """把滚动区内容控件的高度锁到 max(视口高, 内容布局最小高)。
+
+    修 Qt（PySide6 6.x 实测）的一个怪脾气：`widgetResizable=True` 时，
+    如果内容布局的 sizeHint 高于视口，滚动区会把内容控件撑到 sizeHint
+    高度——而且这个数是在竖向滚动条弹出**之前**那一拍算的；之后滚动条
+    出现、视口变窄，只有宽度被同步，高度卡在旧值上。结果是页面平白多出
+    一截滚动，"上 1/3 / 下 2/3"这类分比例布局全乱。
+
+    这里在视口每次 resize 时按 max(视口, 最小高) 锁一次高度。用
+    `setFixedHeight` 而不是普通 `resize()`：后者会被滚动区下一刻弹回
+    旧值，锁死（min=max）则任何时刻的重算都被夹到我们想要的高度。
+    视口高度小于内容最小高时（小窗口），want 取最小高 → 正常出滚动条，
+    滚动量就是真实的内容溢出，不会多出一截。
+    """
+
+    def __init__(self, scroll, parent=None):
+        super().__init__(parent)
+        self._scroll = scroll
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize:
+            self.sync()
+        return False
+
+    def sync(self):
+        widget = self._scroll.widget()
+        viewport = self._scroll.viewport()
+        if widget is None or viewport is None:
+            return
+        want = max(viewport.height(), widget.minimumSizeHint().height())
+        if widget.height() != want:
+            widget.setFixedHeight(want)
 
 
 class BasePage(QWidget):
@@ -85,6 +120,9 @@ class BasePage(QWidget):
         scroll.setWidget(self._content_widget)
         root.addWidget(scroll, 1)
 
+        # 内容控件高度同步（见 _ViewportHeightSync 的 docstring）
+        scroll.viewport().installEventFilter(_ViewportHeightSync(scroll, scroll))
+
         # 暴露给子页面，用于响应式布局
         self.scroll = scroll
         self.content_widget = self._content_widget
@@ -104,12 +142,13 @@ class BasePage(QWidget):
                 f"QFrame {{ background: {color}; border: none; border-radius: 5px; }}"
             )
 
-    def add(self, widget):
-        """向内容区添加一个控件。"""
-        self._content.addWidget(widget)
+    def add(self, widget, stretch=0):
+        """向内容区添加一个控件（stretch 控制占剩余空间的比例）。"""
+        self._content.addWidget(widget, stretch)
 
-    def add_layout(self, layout):
-        self._content.addLayout(layout)
+    def add_layout(self, layout, stretch=0):
+        """向内容区添加一个布局（stretch 控制占剩余空间的比例）。"""
+        self._content.addLayout(layout, stretch)
 
     def add_stretch(self):
         self._content.addStretch(1)

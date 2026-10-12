@@ -1,4 +1,10 @@
-"""首页：极简色块横幅 + 本机配置面板 + 实时监控面板。
+"""首页：水墨鱼池横幅（yuhub 大字 + 版本号）+ 本机配置 + 实时监控。
+
+2026-10-12 改版（用户要求三区块）：
+  * 上半部分：与开机动画同款的水墨鱼池，几条写实墨鱼巡游，
+    动画中央写 "yuhub" 大字与版本号小字；
+  * 左下部分：本机配置（硬件信息面板）；
+  * 右下部分：实时监控（CPU / 内存 / 显卡）。
 
 注意：本页**不含功能快捷跳转卡片**（按用户要求移除），
 功能入口统一走左侧导航栏。
@@ -6,10 +12,17 @@
 
 import json
 
-from PySide6.QtCore import Qt, Signal, QEvent, QSettings, QTimer
-from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QFrame
+from PySide6.QtCore import Qt, QEvent, QSettings, QTimer, Signal
+from PySide6.QtWidgets import (
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
 
-from .. import theme, VERSION_LABEL
+from .. import ink, theme, VERSION_LABEL
 from ..widgets import HardwarePanel
 from ..monitor_widgets import LiveMonitorPanel
 from .base_page import BasePage
@@ -19,6 +32,7 @@ import live_monitor
 
 class HomePage(BasePage):
     TINT_KEY = "tile_1"
+    # 主窗口会 connect 这个信号（页面内暂无跳转卡片，保留接口兼容）
     navigate = Signal(str)
 
     def __init__(self, notify=None, parent=None):
@@ -35,65 +49,72 @@ class HomePage(BasePage):
 
     # ------------------------------------------------------------ 内容构建
     def _build_content(self):
-        # 顶部横幅：实心主色块 + 左侧深色竖条
-        banner = QFrame()
-        banner.setObjectName("Banner")
-        banner.setFixedHeight(104)
-        self._banner = banner
-        bh = QHBoxLayout(banner)
-        bh.setContentsMargins(0, 0, 24, 0)
-        bh.setSpacing(0)
+        # ---- 上半：水墨鱼池 + 中央大字 ----
+        pond_card = QFrame()
+        pond_card.setObjectName("Card")
+        # 鱼池保底高度：下半（本机配置+实时监控）在硬盘数据加载完后最小
+        # 高度有 ~560px，不设保底的话 stretch 会把鱼池挤成一条缝。
+        # 保底之上仍参与 stretch（大屏上鱼池能占到半页）。
+        pond_card.setMinimumHeight(230)
+        pv = QVBoxLayout(pond_card)
+        pv.setContentsMargins(10, 10, 10, 10)
+        pv.setSpacing(0)
 
-        self._banner_bar = QFrame()
-        self._banner_bar.setFixedWidth(6)
-        bh.addWidget(self._banner_bar)
+        # 鱼池与中央文字叠在同一格：QGridLayout 同格控件按添加顺序绘制，
+        # 后加的文字容器盖在鱼池之上（容器本身透明）。
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        self._pond = ink.InkPond(fish_count=5)
+        grid.addWidget(self._pond, 0, 0)
 
-        left = QVBoxLayout()
-        left.setContentsMargins(22, 0, 0, 0)
-        left.setSpacing(4)
-        t = QLabel("Yuhub")
-        t.setStyleSheet(
-            "font-size: 26px; font-weight: 800; background: transparent; color: #ffffff;"
-        )
-        s = QLabel(f"全能游戏与系统工具箱 · {VERSION_LABEL} 原型")
-        s.setStyleSheet(
-            "font-size: 13px; background: transparent; color: rgba(255,255,255,0.88);"
-        )
-        left.addWidget(t)
-        left.addWidget(s)
-        bh.addLayout(left, 1)
+        mid = QWidget()
+        mid.setAttribute(Qt.WA_TranslucentBackground, True)
+        ml = QVBoxLayout(mid)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(6)
+        ml.setAlignment(Qt.AlignCenter)
+        self._pond_title = QLabel("yuhub")
+        self._pond_ver = QLabel(VERSION_LABEL)
+        ml.addWidget(self._pond_title)
+        ml.addWidget(self._pond_ver)
+        grid.addWidget(mid, 0, 0, Qt.AlignCenter)
 
-        rocket = QLabel("🛰️")
-        rocket.setStyleSheet("font-size: 40px; background: transparent;")
-        bh.addWidget(rocket, 0, Qt.AlignVCenter)
-        self.add(banner)
+        pv.addLayout(grid)
+        self.add(pond_card, 1)
+
+        # ---- 下半：左本机配置 / 右实时监控 ----
+        bottom = QHBoxLayout()
+        bottom.setSpacing(12)
 
         # 本机配置面板（on_profile 用于把采集结果写入缓存，供下次秒开）
         self.hw_panel = HardwarePanel(
             scanner_factory=hardware.HardwareScanner,
             on_profile=self._save_cached_profile,
         )
-        self.add(self.hw_panel)
+        bottom.addWidget(self.hw_panel, 1)
 
         # 实时监控面板
         self.monitor_panel = LiveMonitorPanel(
             monitor_factory=lambda: live_monitor.LiveMonitor(interval=1.0)
         )
-        self.add(self.monitor_panel)
+        bottom.addWidget(self.monitor_panel, 1)
 
-        self.add_stretch()
+        self.add_layout(bottom, 1)
 
-        self._apply_banner()
+        theme.bus.changed.connect(self._apply_pond_text)
+        self._apply_pond_text()
 
-    def _apply_banner(self):
+    def _apply_pond_text(self):
+        """鱼池中央的文字配色随主题走（浅色黑墨、深色白墨）。"""
         p = theme.current()
-        self._banner.setStyleSheet(
-            "QFrame#Banner { background: %s; border: 1px solid %s; border-radius: 5px; }"
-            % (p["banner_start"], p["banner_start"])
+        self._pond_title.setStyleSheet(
+            "font-size: 54px; font-weight: 800; background: transparent;"
+            " color: %s; letter-spacing: 2px;" % p["text"]
         )
-        self._banner_bar.setStyleSheet(
-            "background: %s; border-top-left-radius: 5px; border-bottom-left-radius: 5px;"
-            % p["banner_end"]
+        self._pond_ver.setStyleSheet(
+            "font-size: 13px; background: transparent; color: %s;"
+            " letter-spacing: 1px;" % p["text_dim"]
         )
 
     # -------------------------------------------------------- 硬件信息加载

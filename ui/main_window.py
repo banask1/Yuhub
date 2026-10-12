@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import glass
+from . import ink
 from . import motion
 from . import theme
 from . import VERSION, VERSION_LABEL
@@ -45,6 +46,7 @@ RESIZE_MARGIN = 5
 WINDOW_MARGIN = 6           # 圆角窗口四周的透明留白（极简风格：留白收窄）
 SIDEBAR_WIDTH = 216
 SIDEBAR_COLLAPSED = 76
+INK_STRIP_WIDTH = 118       # 水墨版：页面右侧墨竹条的宽度
 PILL_RADIUS = 8.0           # 侧栏选中指示条的圆角（玻璃片形状，见 GlassPill）
 PILL_INSET_X = 2            # 选中片距按钮左右各内缩多少（右多留 2px 给描边）
 PILL_INSET_Y = 1            # 选中片距按钮上下各内缩多少（越小越"厚"）
@@ -91,7 +93,7 @@ NAV_ITEMS = [
     ("download", "⬇️", "多线程下载"),
     ("share", "📡", "屏幕共享"),
     ("lan", "🌐", "异地联机"),
-    ("accel", "🚀", "Steam加速"),
+    ("accel", "⚡", "网络加速"),
     ("settings", "⚙️", "设置中心"),
 ]
 
@@ -131,18 +133,14 @@ def read_bool(settings, key, default):
 
 
 def init_theme_from_settings(settings):
-    """按 QSettings 里保存的偏好恢复主题包与深浅模式。
+    """按 QSettings 里保存的偏好恢复深浅模式。
 
-    单独抽出来是因为启动画面（ui/splash.py）必须在**主窗口构建之前**
-    就拿到正确的深浅色——用户双击 exe 后启动画面第一个出现，
-    而构建全部页面要几百毫秒，不能让浅色用户先看一屏深色。
-    MainWindow.__init__ 也会再调一次（幂等：重复 set_pack/set_theme 无副作用）。
+    水墨重做后明暗模式仍可手动切换（标题栏 🌙/☀️ + 设置中心分段按钮），
+    保存值是 'system'/'light'/'dark'，缺省跟随系统。函数保留独立入口：
+    启动画面（ui/splash.py）必须在主窗口构建之前拿到正确的深浅色。
     """
     theme.reload_packs()
-    saved_pack = settings.value("theme_pack", "")
-    if saved_pack and saved_pack in theme.packs():
-        theme.set_pack(saved_pack)
-    theme.set_theme(theme.resolve_theme(settings.value("theme", "dark")))
+    theme.set_theme(theme.resolve_theme(settings.value("theme", "system")))
 
 
 def _mix_hex(a, b, t):
@@ -452,9 +450,22 @@ class TitleBar(GlassTitleBar):
         self.btn_menu.setToolTip("折叠/展开侧边栏")
         layout.addWidget(self.btn_menu)
 
-        icon = QLabel("🔷")
-        icon.setStyleSheet("font-size: 15px; background: transparent;")
-        layout.addWidget(icon)
+        # 标题栏小图标：用应用本体的水墨鱼图标（替换原来的 🔷 占位 emoji）。
+        # 打包后的 exe 里 resources/app_source_alpha.png 被裁掉（省 5MB），
+        # 所以优先从 app.ico 取（dev/打包都存在）。
+        icon_lbl = QLabel()
+        _icon_pm = QIcon(resource_path(
+            os.path.join("resources", "app.ico"))).pixmap(20, 20)
+        if _icon_pm.isNull():
+            _icon_pm = QPixmap(resource_path(
+                os.path.join("resources", "app_source_alpha.png")))
+        if not _icon_pm.isNull():
+            icon_lbl.setPixmap(_icon_pm.scaled(
+                20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            icon_lbl.setText("🔷")
+        icon_lbl.setStyleSheet("background: transparent;")
+        layout.addWidget(icon_lbl)
 
         title = QLabel("Yuhub")
         title.setObjectName("AppTitle")
@@ -829,7 +840,7 @@ class MainWindow(QWidget):
         self.setMinimumSize(760, 520)
 
         self._settings = QSettings("Yuhub", "Yuhub")
-        self.theme_setting = self._settings.value("theme", "dark")
+        self.theme_setting = self._settings.value("theme", "system")
 
         # 主题包：先从文档目录扫一遍（首次运行会创建 YuUI），
         # 然后恢复上次选中的那套。主题目录被删/改名时自动落回默认。
@@ -866,19 +877,44 @@ class MainWindow(QWidget):
 
         # 自动更新：启动后延迟一点在后台静默检查（不阻塞启动、失败不打扰）。
         # 用户可在设置里关掉（"自动检查更新"开关）。
+        # 运行期每 30 分钟自动复查一次（用户 2026-10-11 要求）：定时器常驻，
+        # 每次触发时**重读设置开关**——用户中途关掉后当次起就不再检查，
+        # 不需要在设置页反向同步定时器状态。
         self._update_busy = False
         self._updater_thread = None
         self._update_pending = None
         self._dl_cancel = None
+        self._update_last_prompted = None   # 已自动提示过的版本 tag（防 30 分钟一次的重复打扰）
+        self._update_check_source = "startup"  # 本次检查来源：startup / periodic / manual
         if read_bool(self._settings, "auto_check_update", True):
             QTimer.singleShot(2500, self._check_update_silent)
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(30 * 60 * 1000)   # 30 分钟
+        self._update_timer.timeout.connect(self._on_periodic_update_tick)
+        self._update_timer.start()
 
     # ------------------------------------------------------------ 自动更新
-    def _check_update_silent(self):
-        """启动时的静默检查：只有发现新版本才弹窗，任何失败都不打扰用户。"""
+    def _on_periodic_update_tick(self):
+        """每 30 分钟一次的运行期自动复查。
+
+        与启动检查共用同一条静默链路；静默托盘（开机自启还没打开窗口）或
+        已有待处理的新版本时不查——前者等窗口打开后下次再查，后者查了也
+        只会弹同一个框。
+        """
+        if not read_bool(self._settings, "auto_check_update", True):
+            return
+        if self._update_pending is not None:
+            return
+        if self.started_hidden and not self.isVisible():
+            return
+        self._check_update_silent(source="periodic")
+
+    def _check_update_silent(self, source="startup"):
+        """静默检查：只有发现新版本才弹窗，任何失败都不打扰用户。"""
         if self._update_busy:
             return
         self._update_busy = True
+        self._update_check_source = source
         th = UpdateChecker(VERSION)
         th.found.connect(self._on_update_found)
         th.finished_.connect(self._on_update_check_done)
@@ -890,6 +926,17 @@ class MainWindow(QWidget):
 
     def _on_update_found(self, info):
         """子线程发现新版 → 主线程弹窗。"""
+        # 自动检查（启动 / 每 30 分钟）对**同一版本只提示一次**：
+        # 用户点过「稍后」后，30 分钟后的自动复查不再重复弹框打扰；
+        # 手动「检查更新」永远照常弹。manual 来源不走去重。
+        tag = getattr(info, "tag", "") or ""
+        if self._update_check_source in ("startup", "periodic") and tag \
+                and tag == self._update_last_prompted:
+            self._update_check_source = None
+            return
+        if self._update_check_source in ("startup", "periodic"):
+            self._update_last_prompted = tag
+        self._update_check_source = None
         # 开机自启（静默进托盘）时不弹窗打扰；等用户真的打开窗口再说
         if self.started_hidden and not self.isVisible():
             self._update_pending = info
@@ -1042,6 +1089,7 @@ class MainWindow(QWidget):
                 show_toast(self, "正在检查更新…")
             return False
         self._update_busy = True
+        self._update_check_source = "manual"   # 手动检查永远照常弹框（不去重）
         th = UpdateChecker(VERSION)
         if interactive:
             th.found.connect(self._on_update_found)
@@ -1094,6 +1142,12 @@ class MainWindow(QWidget):
         self.stack = QStackedWidget()
         body.addWidget(self.stack, 1)
 
+        # 水墨版（2026-10-11）：页面右侧的墨竹条，随风摆动。
+        # 竹条透明、不吃鼠标事件，底色与背板同为纸色，中间内容区保持纯色。
+        self.bamboo = ink.BambooStrip(orientation="right")
+        self.bamboo.setFixedWidth(INK_STRIP_WIDTH)
+        body.addWidget(self.bamboo)
+
         self._build_pages()
         self.switch_page("home")
 
@@ -1122,6 +1176,12 @@ class MainWindow(QWidget):
             self._sidebar_layout.addWidget(btn)
 
         self._sidebar_layout.addStretch(1)
+
+        # 水墨版：侧栏底部的墨竹小丛（"工具栏"里的竹子）
+        self._sidebar_bamboo = ink.BambooStrip(orientation="mini")
+        self._sidebar_bamboo.setFixedHeight(116)
+        self._sidebar_layout.addWidget(self._sidebar_bamboo)
+        self._sidebar_layout.addSpacing(6)
 
         self._sidebar_version = QLabel(f"Yuhub {VERSION_LABEL}")
         self._sidebar_version.setObjectName("SidebarSection")
@@ -1494,12 +1554,14 @@ class MainWindow(QWidget):
             self.sidebar.setFixedWidth(SIDEBAR_COLLAPSED)
             self._sidebar_section.hide()
             self._sidebar_version.hide()
+            self._sidebar_bamboo.hide()
             for btn in self._nav_buttons.values():
                 btn.set_expanded(False)
         else:
             self.sidebar.setFixedWidth(SIDEBAR_WIDTH)
             self._sidebar_section.show()
             self._sidebar_version.show()
+            self._sidebar_bamboo.show()
             for btn in self._nav_buttons.values():
                 btn.set_expanded(True)
         # 宽度刚改，布局要等这一轮事件处理完才重算；延后一拍让指示条
@@ -1514,6 +1576,11 @@ class MainWindow(QWidget):
             pill.refresh_geometry(animate=False)
 
     # -------------------------------------------------------------- 主题
+    def toggle_theme(self):
+        """标题栏 🌙/☀️：在浅色/深色之间直接切换（并保存偏好）。"""
+        current = theme.get_theme()
+        self.set_theme_setting("light" if current == "dark" else "dark")
+
     def set_theme_setting(self, setting):
         """切换深/浅模式（'system' / 'light' / 'dark'）。"""
         self.theme_setting = setting
@@ -1523,26 +1590,19 @@ class MainWindow(QWidget):
             self._pages["settings"].set_theme_setting(setting)
 
     def set_theme_pack(self, name):
-        """切换主题包（文档目录里的某个主题文件夹）。"""
+        """切换主题包（保留旧 API：设置页的主题包切换 UI 已移除）。"""
         if not name:
             return
         theme.set_pack(name)
         self._settings.setValue("theme_pack", theme.current_pack_name())
         self._apply_theme()
-        if "settings" in self._pages:
-            self._pages["settings"].set_pack_setting(
-                theme.current_pack_name())
-
-    def toggle_theme(self):
-        current = theme.get_theme()
-        self.set_theme_setting("light" if current == "dark" else "dark")
 
     def _apply_theme(self):
         resolved = theme.resolve_theme(self.theme_setting)
         theme.set_theme(resolved)
         self.setStyleSheet(theme.build_qss())
         self.titlebar.update_theme_button(resolved)
-        # 毛玻璃背板跟着换色（浅/深主题的网格与柔光强度不同）
+        # 毛玻璃背板跟着换色（浅/深主题的墨晕强度不同）
         if hasattr(self, "backdrop"):
             self.backdrop.set_radius(
                 theme.current().get("window_radius", 8)

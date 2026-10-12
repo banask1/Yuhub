@@ -12,7 +12,9 @@
 设计原则与 cleaner.py 保持一致：
   * 扫描全只读，清理必须经用户二次确认；
   * 删除走白名单校验（`_is_safe_to_delete`），拒绝越界路径；
-  * 需要管理员权限的操作走 `Yuhub.exe --uninstall-elevated` 提权子进程。
+  * **程序本身以管理员身份启动**（exe 清单 requireAdministrator），所以
+    清理残留、删受保护目录都在同一个已提权进程里直接做，不弹二次 UAC，
+    也没有任何提权子进程（`--uninstall-elevated` 已随死代码一并删除）。
 """
 
 import ctypes
@@ -35,7 +37,7 @@ _CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_CONSOLE = 0x00000010
 
 # 本模块只跑在 Windows 上（winreg / ctypes.windll 全程依赖）。留一个显式
-# 常量而不是到处写死 True，是为了和 hostsaccel / cleaner 的写法保持一致，
+# 常量而不是到处写死 True，是为了和 cleaner 的写法保持一致，
 # 将来若要在别的平台上跑自检也能一眼看出哪里是平台相关的分支。
 IS_WIN = True
 
@@ -72,6 +74,12 @@ _APPDATA_TEMPLATES = [
     r"%LOCALAPPDATA%\Low",     # LocalLow（严格说应是 %USERPROFILE%\AppData\LocalLow）
     r"%PROGRAMDATA%",
     r"%USERPROFILE%\AppData\LocalLow",
+    # ↓ 2026-10-11 补：这几处以前完全没扫，是"清不干净"的主要来源
+    r"%LOCALAPPDATA%\Programs",    # 每用户安装（VS Code / Discord / 微信新版…）
+    r"%USERPROFILE%",             # 家目录下的同名目录与 .点目录（.vscode/.conda）
+    r"%USERPROFILE%\.config",     # 跨平台工具的配置目录
+    r"%PUBLIC%\Documents",        # 游戏存档（很多游戏存在"公共文档"里）
+    r"%APPDATA%\Microsoft\Windows\Start Menu\Programs",   # 开始菜单文件夹
 ]
 
 # 通用词：这些词太常见，不能拿来当搜索关键词，否则会误伤一堆无关目录。
@@ -112,11 +120,18 @@ _GENERIC_WORDS = {
 }
 
 
-# 明确不能删的目录名（在 AppData/ProgramData 里也不许碰）
+# 明确不能删的目录名（在 AppData/ProgramData/家目录里也不许碰）。
+# 2026-10-11：扫描根扩到了 %USERPROFILE% 与 %LOCALAPPDATA%\Programs，
+# 这里必须把家目录下的系统目录一并挡住，否则关键词撞车会误删用户数据。
 _PROTECTED_DIR_NAMES = {
     "microsoft", "windows", "windowsapps", "packages", "temp", "tmp",
-    "packages", "crashdumps", "d3dscache", "nvidia", "amd", "intel",
-    "google", "mozilla", "packages", "connecteddevicesplatform",
+    "crashdumps", "d3dscache", "nvidia", "amd", "intel",
+    "google", "mozilla", "connecteddevicesplatform",
+    # 家目录下的系统 / 用户数据目录
+    "appdata", "desktop", "documents", "downloads", "music", "pictures",
+    "videos", "favorites", "links", "contacts", "searches", "saved games",
+    "onedrive", "3d objects", "start menu", "programs", "programdata",
+    "public", "default", "all users", ".ssh", ".git", "node_modules",
 }
 
 
@@ -173,22 +188,23 @@ class AppInfo:
 
 @dataclass
 class Leftover:
-    """一条残留项（文件或注册表）。"""
+    """一条残留项（文件 / 目录 / 注册表键 / 注册表**值**）。"""
 
-    kind: str = "file"            # file / dir / reg
+    kind: str = "file"            # file / dir / reg / reg_value
     path: str = ""
     size: int = 0
     hive: str = ""
     subkey: str = ""
     hive_handle: int = 0
+    value: str = ""               # kind=reg_value 时：要删的那个值名
     safe: bool = True             # False = 需谨慎（可能被其他程序共享）
     note: str = ""
     checked: bool = True
 
     @property
     def size_text(self):
-        if self.kind == "reg":
-            return "注册表项"
+        if self.kind in ("reg", "reg_value"):
+            return "注册表项" if self.kind == "reg" else "注册表值"
         if self.size <= 0:
             return "--"
         return human_bytes(self.size)
@@ -206,6 +222,16 @@ def human_bytes(n):
                 return f"{int(n)} B"
             return f"{n:.1f} {unit}"
         n /= 1024
+
+
+def is_reg_kind(item):
+    """这条残留是不是"注册表类"（键或值）。
+
+    单独抽出来的原因：UI 里到处在用 `kind == "reg"` 判断"有没有体积 /
+    要不要按注册表显示"，而 2026-10-11 新增了 `reg_value`（删的是值不是键）
+    —— 漏改一处就会出现"注册表值这条显示成 0 B 文件"或用错删除文案。
+    """
+    return getattr(item, "kind", "") in ("reg", "reg_value")
 
 
 def is_admin():
@@ -1312,18 +1338,10 @@ def run_uninstall(app, silent=True, on_status=None, timeout=None):
     elif os.path.sep in exe and os.path.isabs(exe):
         workdir = os.path.dirname(exe)
 
-    # 需要 UAC 的卸载器：用 ShellExecuteW("runas") 才能正常提权。
-    # 先探测 exe 本身是否要求管理员（manifest 里 requireAdministrator）。
-    needs_elevation = _exe_requires_elevation(exe)
-
+    # 卸载器本身若在 manifest 里要求管理员，我们**已经是管理员**，直接
+    # Popen 就能正常跑（以前这里还有个 `ShellExecuteW("runas")` 分支，
+    # 那是给非提权进程用的；Yuhub.exe 以管理员启动后它永远不会走到）。
     try:
-        if needs_elevation and not is_admin():
-            ok = _shell_execute_runas(argv, workdir)
-            if not ok:
-                return False, "提权被取消（UAC）", -1
-            _wait_for_process_tree(exe, timeout=timeout)
-            return True, "卸载程序已结束", 0
-
         proc = subprocess.Popen(
             argv, cwd=workdir,
             creationflags=_CREATE_NO_WINDOW,
@@ -1337,134 +1355,6 @@ def run_uninstall(app, silent=True, on_status=None, timeout=None):
         return False, f"启动失败：{e}", -1
 
 
-def _exe_requires_elevation(exe_path):
-    """粗略判断 exe 的 manifest 是否要求管理员权限。
-
-    做法：读取 PE 的 manifest 资源里的 requestedExecutionLevel。
-    读不到就返回 False（交给系统按需弹 UAC）。
-    """
-    p = _expand(exe_path)
-    if not p or not os.path.isfile(p):
-        # 可能是 PATH 里的裸命令名（如 msiexec）
-        return False
-    try:
-        with open(p, "rb") as f:
-            head = f.read(2 * 1024 * 1024)     # manifest 一般在前 2MB
-    except OSError:
-        return False
-    return b"requireAdministrator" in head
-
-
-def _shell_execute_runas(argv, workdir):
-    """用 ShellExecuteW 以管理员身份启动（会弹 UAC）。
-
-    返回 False 表示用户取消了 UAC（ShellExecute 返回 <= 32）。
-    """
-    SEE_MASK_NOCLOSEPROCESS = 0x00000040
-    SW_SHOWNORMAL = 1
-
-    class SHELLEXECUTEINFO(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", wt.DWORD),
-            ("fMask", ctypes.c_ulong),
-            ("hwnd", wt.HWND),
-            ("lpVerb", wt.LPCWSTR),
-            ("lpFile", wt.LPCWSTR),
-            ("lpParameters", wt.LPCWSTR),
-            ("lpDirectory", wt.LPCWSTR),
-            ("nShow", ctypes.c_int),
-            ("hInstApp", wt.HINSTANCE),
-            ("lpIDList", ctypes.c_void_p),
-            ("lpClass", wt.LPCWSTR),
-            ("hkeyClass", wt.HKEY),
-            ("dwHotKey", wt.DWORD),
-            ("hIcon", wt.HANDLE),
-            ("hProcess", wt.HANDLE),
-        ]
-
-    params = " ".join(_quote(a) for a in argv[1:]) if len(argv) > 1 else None
-    info = SHELLEXECUTEINFO()
-    info.cbSize = ctypes.sizeof(info)
-    info.fMask = SEE_MASK_NOCLOSEPROCESS
-    info.lpVerb = "runas"
-    info.lpFile = argv[0]
-    info.lpParameters = params
-    info.lpDirectory = workdir
-    info.nShow = SW_SHOWNORMAL
-
-    try:
-        r = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-        return bool(r)
-    except Exception:
-        return False
-
-
-def _quote(s):
-    if not s:
-        return '""'
-    if " " in s or "\t" in s:
-        return '"' + s + '"'
-    return s
-
-
-def _wait_proc_tree(root_pid, timeout=None):
-    """等一个进程及其全部后代结束。
-
-    用 taskkill 无法等待，所以用 WMI 轮询父子关系。为避免引入额外依赖，
-    这里退回"轮询根进程 + 短暂宽限"的务实做法：先等根进程，
-    再多等 2 秒让子进程收尾。
-    """
-    SYNCHRONIZE = 0x00100000
-    WAIT_TIMEOUT = 0x102
-    k32 = ctypes.windll.kernel32
-    k32.OpenProcess.restype = ctypes.c_void_p
-    k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
-    k32.WaitForSingleObject.restype = ctypes.c_ulong
-    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-    k32.CloseHandle.argtypes = [ctypes.c_void_p]
-
-    h = k32.OpenProcess(SYNCHRONIZE, 0, int(root_pid))
-    if not h:
-        time.sleep(1.0)
-        return
-    try:
-        # 让用户有机会走完卸载向导：默认给 10 分钟上限
-        ms = int((timeout or 600) * 1000)
-        k32.WaitForSingleObject(h, ms)
-    finally:
-        k32.CloseHandle(h)
-    # 宽限期：等卸载器拉起的子进程收尾
-    time.sleep(2.0)
-
-
-def _wait_for_process_tree(exe_name, timeout=None):
-    """提权路径下拿不到进程句柄，改为按 exe 名轮询。
-
-    最多等 timeout 秒；进程消失后额外宽限 2 秒。
-    """
-    base = os.path.basename(_expand(exe_name)).lower()
-    if not base:
-        return
-    deadline = time.time() + (timeout or 600)
-    _CREATE_NO_WINDOW = 0x08000000
-    while time.time() < deadline:
-        try:
-            p = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {base}", "/NH"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            if base not in (p.stdout or "").lower():
-                break
-        except Exception:
-            break
-        time.sleep(1.0)
-    time.sleep(2.0)
-
-
-# ---------------------------------------------------------------------------
-# 阶段 3/4：残留扫描
-# ---------------------------------------------------------------------------
 def _is_safe_to_delete(path):
     """白名单校验：只允许删除用户数据区与程序安装区里的内容。
 
@@ -1514,22 +1404,258 @@ def _candidate_appdata_dirs():
     return out
 
 
-def scan_leftovers(app, on_status=None, budget=22.0):
+# ---------------------------------------------------------------------------
+# 阶段 5b：快捷方式 / 自启动 / 服务 / 计划任务（2026-10-11 新增）
+#
+# 用户反馈"残留清理不干净、有清不到的地方"，实测漏的正是这几类：
+#   · 开始菜单 / 桌面里指向该程序的 .lnk —— 用户**看得见**的残留
+#   · Run / RunOnce 里的自启动**值**（以前扫注册表只删键、不碰值）
+#   · App Paths 登记项、Windows 服务、计划任务 —— 卸载器留下的"后台痕迹"
+# 这几类的匹配判据与目录/注册表扫描完全一致（`_appdir_matches`），
+# 只在**名字命中程序指纹**、或**路径落在安装目录里**时才收，避免误伤。
+# ---------------------------------------------------------------------------
+def _shortcut_roots():
+    """快捷方式最常出现的位置（用户与公共的开始菜单 / 桌面）。"""
+    prof = os.environ.get("USERPROFILE", "")
+    pd = os.environ.get("ProgramData", r"C:\ProgramData")
+    pub = os.environ.get("PUBLIC", r"C:\Users\Public")
+    out = []
+    for c in (
+        os.path.join(prof, "AppData", "Roaming", "Microsoft", "Windows",
+                     "Start Menu", "Programs") if prof else "",
+        os.path.join(pd, "Microsoft", "Windows", "Start Menu", "Programs"),
+        os.path.join(prof, "Desktop") if prof else "",
+        os.path.join(pub, "Desktop") if pub else "",
+    ):
+        if c and os.path.isdir(c) and c not in out:
+            out.append(c)
+    return out
+
+
+def _scan_shortcut_leftovers(keys, deadline, add, state):
+    """开始菜单 / 桌面里指向该程序的快捷方式（.lnk）。"""
+    if not keys:
+        return
+    for root in _shortcut_roots():
+        for dirpath, dirnames, filenames in os.walk(root):
+            if time.time() > deadline:
+                state["cut"] = True
+                return
+            # 只下探两层：开始菜单里的分组目录不会更深
+            if dirpath[len(root):].count(os.sep) >= 2:
+                dirnames[:] = []
+            for fn in filenames:
+                if not fn.lower().endswith(".lnk"):
+                    continue
+                stem = os.path.splitext(fn)[0].lower()
+                if _appdir_matches(stem, keys):
+                    add(os.path.join(dirpath, fn), "file", True, "快捷方式")
+
+
+def _install_loc_hit(text, install_loc):
+    """一段文本（命令行 / 路径）是否落在该程序的安装目录里。"""
+    if not text or not install_loc:
+        return False
+    low = str(text).lower().replace("/", "\\")
+    loc = str(install_loc).lower().replace("/", "\\").rstrip("\\")
+    # 安装目录太短（如 C:\Program Files）不做路径匹配，否则命中一片
+    if len(loc) < 12:
+        return False
+    return loc in low
+
+
+def _scan_startup_leftovers(keys, install_loc, deadline, add_reg, state):
+    """自启动登记：Run / RunOnce 的**值** + App Paths 的**子键**。
+
+    ⚠️ Run 里要删的是"值"（值名 = 程序名），**不是** Run 键本身——
+    后者是系统与所有软件共用的，删了会连累别人。所以这里用 reg_value。
+    """
+    run_keys = [
+        ("HKCU", winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        ("HKCU", winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+        ("HKLM", winreg.HKEY_LOCAL_MACHINE,
+         r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        ("HKLM", winreg.HKEY_LOCAL_MACHINE,
+         r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+        ("HKLM32", winreg.HKEY_LOCAL_MACHINE,
+         r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"),
+    ]
+    for tag, hive, path in run_keys:
+        if time.time() > deadline:
+            state["cut"] = True
+            return
+        try:
+            k = winreg.OpenKey(hive, path)
+        except OSError:
+            continue
+        try:
+            i = 0
+            while True:
+                try:
+                    vname, vdata, _t = winreg.EnumValue(k, i)
+                except OSError:
+                    break
+                i += 1
+                hit = False
+                if keys and _appdir_matches(str(vname).lower(), keys):
+                    hit = True
+                elif _install_loc_hit(vdata, install_loc):
+                    hit = True
+                if hit:
+                    add_reg(tag, hive, path, "自启动登记项", value=str(vname))
+        finally:
+            try:
+                winreg.CloseKey(k)
+            except OSError:
+                pass
+
+    # App Paths：卸载器经常漏删（留着一个指向已删 exe 的登记项）
+    for tag, hive, path in (
+        ("HKCU", winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+        ("HKLM", winreg.HKEY_LOCAL_MACHINE,
+         r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+        ("HKLM32", winreg.HKEY_LOCAL_MACHINE,
+         r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+    ):
+        if time.time() > deadline:
+            state["cut"] = True
+            return
+        try:
+            k = winreg.OpenKey(hive, path)
+        except OSError:
+            continue
+        try:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                i += 1
+                stem = re.sub(r"\.(exe|com|bat|cmd)$", "", sub.lower())
+                hit = bool(keys) and _appdir_matches(stem, keys)
+                if not hit:
+                    try:
+                        with winreg.OpenKey(hive, path + "\\" + sub) as sk:
+                            default = str(winreg.QueryValueEx(sk, "")[0])
+                        hit = _install_loc_hit(default, install_loc)
+                    except OSError:
+                        pass
+                if hit:
+                    add_reg(tag, hive, path + "\\" + sub, "App Paths 登记项")
+        finally:
+            try:
+                winreg.CloseKey(k)
+            except OSError:
+                pass
+
+
+def _scan_service_leftovers(keys, install_loc, deadline, add_reg, state):
+    """Windows 服务登记项：ImagePath 落在安装目录里（或服务名命中指纹）。"""
+    path = r"SYSTEM\CurrentControlSet\Services"
+    hive = winreg.HKEY_LOCAL_MACHINE
+    try:
+        root = winreg.OpenKey(hive, path)
+    except OSError:
+        return
+    try:
+        i = 0
+        while True:
+            if time.time() > deadline:
+                state["cut"] = True
+                return
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            hit = False
+            try:
+                with winreg.OpenKey(hive, path + "\\" + sub) as sk:
+                    try:
+                        img = str(winreg.QueryValueEx(sk, "ImagePath")[0])
+                    except OSError:
+                        img = ""
+                if _install_loc_hit(img, install_loc):
+                    hit = True
+                elif keys and _appdir_matches(sub.lower(), keys):
+                    hit = True
+            except OSError:
+                continue
+            if hit:
+                add_reg("HKLM", hive, path + "\\" + sub, "服务登记项")
+    finally:
+        try:
+            winreg.CloseKey(root)
+        except OSError:
+            pass
+
+
+def _scan_task_leftovers(keys, install_loc, deadline, add_path, add_reg, state):
+    """计划任务：任务 XML 里引用了该程序的安装目录 / 主程序名。"""
+    tasks_root = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32", "Tasks")
+    if not os.path.isdir(tasks_root):
+        return
+    for dirpath, dirnames, filenames in os.walk(tasks_root):
+        if time.time() > deadline:
+            state["cut"] = True
+            return
+        if dirpath[len(tasks_root):].count(os.sep) >= 2:
+            dirnames[:] = []
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(fp) > 512 * 1024:
+                    continue
+                with open(fp, "r", encoding="utf-16-le", errors="ignore") as f:
+                    xml = f.read()
+            except OSError:
+                continue
+            hit = _install_loc_hit(xml, install_loc)
+            if not hit and keys:
+                # 任务文件名本身就是程序名（如 "EpicGamesLauncher"）
+                hit = _appdir_matches(fn.lower(), keys)
+            if not hit:
+                continue
+            add_path(fp, "file", True, "计划任务")
+            rel = os.path.relpath(fp, tasks_root)
+            add_reg("HKLM", winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                    r"\Schedule\TaskCache\Tree\\" + rel, "计划任务登记项")
+    # 注意：扫描阶段**不做任何删除**。空掉的任务目录留给清理阶段处理
+    #（以前在这里 os.rmdir 是错的：扫描必须只读，否则用户取消清理也回不去）。
+
+
+def scan_leftovers(app, on_status=None, budget=45.0, stats=None):
     """扫描一个程序的残留（文件 + 注册表）。
 
-    策略与 Geek 一致，三个方向：
+    策略与 Geek 一致，四个方向：
       A. 已知路径 —— InstallLocation 直接圈定
       B. 关联路径 —— 从 DisplayIcon 反推程序目录
-      C. 搜索发现 —— 在 AppData / ProgramData 下按关键词找同名目录
+      C. 搜索发现 —— 在 AppData / ProgramData / 家目录 下按关键词找同名目录
+      D. 系统痕迹（2026-10-11 新增）—— 快捷方式 / 自启动值 / App Paths /
+         服务 / 计划任务；这几类是"卸载完看着干净、其实还在"的主要来源
+
+    stats：可选 dict，回填 {"truncated": bool, "elapsed": float}。
+    为什么要它：以前扫描有时间预算、超时**静默截断**，用户看到的是"没有
+    更多残留了"，而真相是"还没来得及扫完"——这正是"清不干净"的观感来源之一。
     """
     deadline = time.time() + budget
+    t_start = time.time()
+    state = {"cut": False}
     found = []
     seen = set()
+    seen_reg = set()
     install_loc = _expand(app.install_location)
     kws = _keywords(app)
 
     def add_path(path, kind=None, safe=True, note=""):
         if time.time() > deadline:
+            state["cut"] = True
             return
         p = _expand(path)
         if not p or not os.path.exists(p):
@@ -1546,6 +1672,23 @@ def scan_leftovers(app, on_status=None, budget=22.0):
             if kind == "dir" else _safe_filesize(p)
         found.append(Leftover(kind=kind, path=p, size=size,
                               safe=safe, note=note))
+
+    def add_reg(hive_tag, hive, subkey, note="", value=None):
+        """登记一条注册表残留（value 非 None → 删的是**值**，不是键）。"""
+        if time.time() > deadline:
+            state["cut"] = True
+            return
+        key = (hive_tag, subkey.lower(), (value or "").lower())
+        if key in seen_reg:
+            return
+        seen_reg.add(key)
+        display = "%s\\%s" % (hive_tag, subkey)
+        if value:
+            display += "  →  值「%s」" % value
+        found.append(Leftover(
+            kind="reg_value" if value else "reg", path=display,
+            hive=hive_tag, subkey=subkey, hive_handle=hive,
+            value=value or "", safe=True, note=note))
 
     # ---- A. 安装目录 ----
     if install_loc and os.path.isdir(install_loc):
@@ -1593,6 +1736,21 @@ def scan_leftovers(app, on_status=None, budget=22.0):
                     add_path(e.path, "dir", safe=True,
                              note="用户数据目录（名称匹配）")
 
+    # ---- D. 系统痕迹：快捷方式 / 自启动 / App Paths / 服务 / 计划任务 ----
+    # 这几类以前完全没扫，用户"卸载完还在开始菜单里看到图标""开机还是
+    # 自启"的反馈就来自这里。判据与 C 同源（名字命中指纹，或路径落在
+    # 安装目录里），只多不少地保守。
+    if akeys:
+        if on_status:
+            on_status("扫描快捷方式与自启动项…")
+        _scan_shortcut_leftovers(akeys, deadline, add_path, state)
+        _scan_startup_leftovers(akeys, install_loc, deadline, add_reg, state)
+        _scan_service_leftovers(akeys, install_loc, deadline, add_reg, state)
+        if on_status:
+            on_status("扫描计划任务…")
+        _scan_task_leftovers(akeys, install_loc, deadline, add_path, add_reg,
+                             state)
+
     # ---- 注册表扫描 ----
     if on_status:
         on_status("扫描注册表残留…")
@@ -1609,6 +1767,12 @@ def scan_leftovers(app, on_status=None, budget=22.0):
 
     # 排序：文件在前（按体积降序），注册表在后
     found.sort(key=lambda x: (x.kind == "reg", -x.size, x.path.lower()))
+    if stats is not None:
+        # 超时截断要**如实上报**：否则用户看到的是"就这些残留"，
+        # 而不是"还没扫完"。UI 会据此提示"可再扫一次"。
+        stats["truncated"] = bool(state["cut"] or time.time() > deadline)
+        stats["elapsed"] = round(time.time() - t_start, 2)
+        stats["budget"] = budget
     return found
 
 
@@ -1991,6 +2155,28 @@ def _delete_reg_key(hive_handle, subkey):
         return False, str(e)
 
 
+def _delete_reg_value(hive_handle, subkey, value):
+    """删除注册表键下的**单个值**（保留键本身）。
+
+    用于 Run / RunOnce 这类系统共用键：要删的只是某程序自己那一行，
+    整键删掉会把别人的自启动一起干掉。先按 64 位视图试，再退 32 位视图
+    （WOW6432Node 下的自启动项要靠后者）。
+    """
+    last = ""
+    for flags in (winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+                  winreg.KEY_SET_VALUE | winreg.KEY_WOW64_32KEY,
+                  winreg.KEY_SET_VALUE):
+        try:
+            with winreg.OpenKey(hive_handle, subkey, 0, flags) as k:
+                winreg.DeleteValue(k, value)
+            return True, ""
+        except FileNotFoundError:
+            return True, ""              # 值已经不在了 = 已被清掉
+        except OSError as e:
+            last = str(e)
+    return False, last
+
+
 def _recursive_del_key(hive, subkey):
     """DFS 递归删除注册表键（winreg 没有递归删除）。"""
     try:
@@ -2039,6 +2225,17 @@ def clean_leftovers(items, on_progress=None):
     for idx, it in enumerate(targets):
         if on_progress:
             on_progress(idx, total, it)
+        if it.kind == "reg_value":
+            # ⚠️ 删的是**值**不是键：Run 这类键是系统共用的，删键会连累别人
+            ok, msg = _delete_reg_value(it.hive_handle, it.subkey, it.value)
+            if ok:
+                res.removed += 1
+                res.messages.append(f"已删除注册表值 {it.path}")
+            else:
+                res.failed += 1
+                res.messages.append(f"注册表值删除失败 {it.path}：{msg}")
+            continue
+
         if it.kind == "reg":
             ok, msg = _delete_reg_key(it.hive_handle, it.subkey)
             if ok:
@@ -2153,166 +2350,6 @@ def _delete_file(path):
 # ---------------------------------------------------------------------------
 # 提权执行（UAC）：删不动的残留交给管理员子进程
 # ---------------------------------------------------------------------------
-def elevated_uninstall_main(payload_b64):
-    """`Yuhub.exe --uninstall-elevated <base64-json>` 的入口。
-
-    payload 里是待删除的残留项与回传文件路径。在管理员权限下删完，
-    把结果写成 JSON 回传（和 cleaner 的 elevated_clean_main 同一套路）。
-    """
-    import base64
-    try:
-        payload = json.loads(base64.b64decode(payload_b64.encode("ascii"))
-                             .decode("utf-8"))
-    except Exception:
-        return 2
-
-    items_raw = payload.get("items") or []
-    out_file = payload.get("out") or ""
-    if not items_raw or not out_file:
-        return 3
-
-    hive_map = {
-        "HKLM": winreg.HKEY_LOCAL_MACHINE,
-        "HKLM32": winreg.HKEY_LOCAL_MACHINE,
-        "HKCU": winreg.HKEY_CURRENT_USER,
-        "HKCU32": winreg.HKEY_CURRENT_USER,
-        "HKCR": winreg.HKEY_CLASSES_ROOT,
-    }
-
-    items = []
-    for d in items_raw:
-        it = Leftover(
-            kind=d.get("kind", "file"),
-            path=d.get("path", ""),
-            size=int(d.get("size") or 0),
-            hive=d.get("hive", ""),
-            subkey=d.get("subkey", ""),
-            safe=True, checked=True,
-        )
-        it.hive_handle = hive_map.get(it.hive, winreg.HKEY_LOCAL_MACHINE)
-        if it.hive == "HKLM32":
-            # WOW6432Node 路径已经带上前缀，句柄仍用 HKLM
-            pass
-        items.append(it)
-
-    res = clean_leftovers(items)
-    try:
-        # 原子写：先写临时文件再改名，避免主进程读到写了一半的 JSON
-        tmp = out_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "freed": res.freed,
-                "removed": res.removed,
-                "failed": res.failed,
-                "messages": res.messages,
-                "retryable": res.retryable,
-            }, f, ensure_ascii=False)
-        os.replace(tmp, out_file)
-    except OSError:
-        return 4
-    return 0
-
-
-def run_elevated_clean(items, timeout=180):
-    """以管理员权限清理残留（弹一次 UAC）。
-
-    返回结果 dict；None 表示 UAC 被取消或超时。
-    """
-    if not items:
-        return {"freed": 0, "removed": 0, "failed": 0, "messages": []}
-
-    exe = sys_executable()
-    capable, why = elevation_capable(exe)
-    if not capable:
-        return {"freed": 0, "removed": 0, "failed": len(items),
-                "messages": [why]}
-
-    payload = {
-        "items": [
-            {"kind": it.kind, "path": it.path, "size": it.size,
-             "hive": it.hive, "subkey": it.subkey}
-            for it in items if it.checked
-        ],
-    }
-    tmpdir = tempfile.mkdtemp(prefix="yuhub_uninst_")
-    out_file = os.path.join(tmpdir, "result.json")
-    payload["out"] = out_file
-
-    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    import base64
-    b64 = base64.b64encode(raw).decode("ascii")
-
-    try:
-        # ⚠️ ShellExecuteW 返回 HINSTANCE（指针宽度），必须显式声明 restype，
-        # 否则 ctypes 默认按 32 位 c_long 取，高位非零时被截成小值 →
-        # 下面 `int(r) <= 32` 会把成功当失败。
-        fn = ctypes.windll.shell32.ShellExecuteW
-        fn.restype = ctypes.c_void_p
-        fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
-                       ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
-        r = fn(None, "runas", exe, f'--uninstall-elevated {b64}', None, 0)
-        if not r or int(r) <= 32:
-            return None          # 用户取消 UAC
-    except Exception:
-        return None
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if os.path.exists(out_file):
-            try:
-                with open(out_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return data
-            except (OSError, ValueError):
-                pass
-        time.sleep(0.4)
-
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    return None
-
-
-def sys_executable():
-    """提权时要启动的可执行文件路径。
-
-    必须是**打包后的 Yuhub.exe**，因为提权子进程靠 `--uninstall-elevated`
-    这个开关来识别"我是被叫来清理残留的"，而只有 Yuhub.exe 认识它。
-    源码模式下 `sys.executable` 是 python.exe：把它 runas 起来，参数会被
-    当成脚本名（报 "can't open file '--uninstall-elevated'"），而且
-    python.exe 是控制台程序，runas 还会闪一个黑窗口。
-
-    所以这里和 etier.py 用同一套策略：冻结时用自己；否则在本目录里找
-    构建好的 Yuhub.exe；确实找不到才回退（调用方会给出明确提示）。
-    """
-    import sys
-    if getattr(sys, "frozen", False):
-        exe = sys.executable
-        if exe and os.path.isfile(exe):
-            return exe
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(here, "Yuhub.exe"),
-                 os.path.join(here, "dist", "Yuhub.exe")):
-        if os.path.isfile(cand):
-            return cand
-    return sys.executable
-
-
-def elevation_capable(exe_path=None):
-    """能不能走 UAC 提权通道。返回 (bool, 给人看的原因)。
-
-    源码模式且没构建 Yuhub.exe 时，提权必然失败（黑窗一闪、什么都不做），
-    提前告诉用户"请先构建或直接用打包版"，比让他盯着 UAC 弹窗莫名其妙好得多。
-    """
-    exe = exe_path or sys_executable()
-    if not exe:
-        return False, "找不到可执行文件，无法提权"
-    if os.path.basename(exe).lower() == "python.exe":
-        return False, ("当前是源码运行且未找到构建好的 Yuhub.exe，"
-                       "无法请求管理员权限。请先运行 build.bat 构建，"
-                       "或直接使用打包后的 Yuhub.exe。")
-    return True, ""
-
-
 # ---------------------------------------------------------------------------
 # 后台工作线程
 # ---------------------------------------------------------------------------
@@ -2367,8 +2404,11 @@ class UninstallWorker(threading.Thread):
         try:
             if self._mode == "scan":
                 # 只扫残留（强制卸载 / 重新扫描）
-                items = scan_leftovers(self._app, on_status=self._on_status)
-                self._on_done({"step": "scanned", "leftovers": items})
+                stats = {}
+                items = scan_leftovers(self._app, on_status=self._on_status,
+                                       stats=stats)
+                self._on_done({"step": "scanned", "leftovers": items,
+                               "scan_stats": stats})
                 return
 
             ok, msg, code = run_uninstall(self._app, silent=False,
@@ -2379,8 +2419,10 @@ class UninstallWorker(threading.Thread):
             if self._stop.is_set():
                 return
             self._on_status("正在扫描残留文件与注册表…")
-            items = scan_leftovers(self._app, on_status=self._on_status)
+            stats = {}
+            items = scan_leftovers(self._app, on_status=self._on_status,
+                                   stats=stats)
             self._on_done({"step": "scanned", "leftovers": items,
-                           "message": msg})
+                           "message": msg, "scan_stats": stats})
         except Exception as e:
             self._on_done({"step": "failed", "message": str(e)})

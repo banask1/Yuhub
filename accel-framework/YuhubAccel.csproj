@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>YuhubAccel</AssemblyName>
+    <RootNamespace>YuhubAccel</RootNamespace>
+
+    <!-- Native AOT：单文件、无需 .NET 运行时。
+         实测（v1.0.7 探针，同样带 YARP + HTTPS + 动态证书）：16.24 MB -->
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <StripSymbols>true</StripSymbols>
+    <OptimizationPreference>Size</OptimizationPreference>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+  </PropertyGroup>
+
+  <!-- 加速内核用 Kestrel / ASP.NET Core 中间件做本地 443 反向代理 -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+</Project>

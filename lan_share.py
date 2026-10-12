@@ -51,13 +51,38 @@ MAX_FILE_BYTES = 8 * 1024 * 1024 * 1024
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
+def room_code_key(code):
+    """房间码的**归一化口径**，必须与「加入房间」时用的完全一致。
+
+    🔴 血泪（用户反馈"云盘用不了、看不到朋友分享的文件"）：
+    加入房间时送给 EasyTier 的网络名是 `"yuhub-" + code.lower().replace(" ", "")`
+    —— 也就是说 **大小写与空格都不参与房间判定**：`ABC123` 和 `abc 123`
+    会进同一个房间、成员列表里互相可见。而云盘 token 原先直接吃**原始输入**，
+    于是这两个人的 token 不同 → 对方拉清单被 403 拒绝 → 界面上什么都看不到
+    （错误还被静默吞掉）。只要两边打的字格式不一致就复现，属于必炸的间歇 bug。
+    所以 token 的派生必须走同一套归一化。
+    """
+    return (code or "").strip().lower().replace(" ", "")
+
+
+def room_secret_key(password):
+    """密码的归一化口径：去掉首尾空白。
+
+    与「加入房间」保持一致（那边也用这个值当 secret）。理由同上：
+    末尾一个看不见的空格会让两边算出不同的 token，而房间却建得起来
+    （或者相反，连房间都进不去却看不出原因）。
+    """
+    return (password or "").strip()
+
+
 def make_token(room_code, password):
     """由「房间码 + 密码」派生共享 token。
 
-    同一个房间的人算出来必然一致（两边输入本来就要求完全相同），
-    虚拟网外的请求拿不到这个值。
+    同一个房间的人算出来必然一致——因为两侧都先过归一化
+    （见 room_code_key / room_secret_key），而不是直接吃原始输入。
     """
-    raw = ("%s|%s" % (room_code or "", password or "")).encode("utf-8")
+    raw = ("%s|%s" % (room_code_key(room_code),
+                      room_secret_key(password))).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:24]
 
 

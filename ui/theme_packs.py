@@ -905,12 +905,12 @@ QPlainTextEdit#LanLog {
 /* ---------- 滚动区域 ---------- */
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 3px 2px; }
 QScrollBar::handle:vertical { background: $scrollbar_handle; border-radius: 4px; min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: $accent; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px 3px; }
 QScrollBar::handle:horizontal { background: $scrollbar_handle; border-radius: 4px; min-width: 30px; }
 QScrollBar::handle:horizontal:hover { background: $accent; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }

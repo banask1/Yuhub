@@ -605,14 +605,12 @@ def paint_glass_panel(painter, widget, backdrop, src, blur=10.0,
 
 
 def paint_backdrop(painter, size, palette, cell=GRID_CELL):
-    """画窗口底层纹理：极淡方格 + 两团柔光。
+    """画窗口底层纹理（水墨版）：纯色纸面 + 四角极淡的墨晕。
 
-    这层的唯一使命是「让玻璃有东西可模糊」。没有它，玻璃盖在纯色上，
-    模糊前后都是纯色，毛玻璃就等于白做。
-
-    强度是调出来的：网格线大约 8% 不透明度，柔光约 17%。远看仍是干净的
-    纯色底，但玻璃盖上去之后能看出被糊开的方格与明暗——这才是毛玻璃的
-    "证据"。调更低就完全看不出来了（第一版就是调太低，等于没做）。
+    水墨重做（2026-10-11）后，中间内容区要求是**干净的纯色**（宣纸白 /
+    玄墨黑），不再铺方格。这层的使命仍是为毛玻璃控件提供"可模糊的内容"：
+    四角与两腰各一团低透明度墨晕，玻璃糊上去之后能看到极其轻微的明暗
+    变化，但中央区域看起来仍是纯色。
     """
     w, h = int(size.width()), int(size.height())
     if w <= 0 or h <= 0:
@@ -625,31 +623,17 @@ def paint_backdrop(painter, size, palette, cell=GRID_CELL):
     # 底色（保证背板自身就是不透明的，玻璃取到的背景才稳定）
     painter.fillRect(QRect(0, 0, w, h), qcolor(palette.get("window_top"), "#101216"))
 
-    # 方格
-    grid_alpha = 15 if dark_mode else 20
-    grid_color = "#ffffff" if dark_mode else "#0b1220"
-    pen = QPen(rgba(grid_color, grid_alpha))
-    pen.setWidth(1)
-    painter.setPen(pen)
-    x = cell
-    while x < w:
-        painter.drawLine(x, 0, x, h)
-        x += cell
-    y = cell
-    while y < h:
-        painter.drawLine(0, y, w, y)
-        y += cell
-
-    # 两团柔光（右上 + 左下，用 accent 提色），给玻璃的模糊提供明暗变化。
-    # 强度要克制：太强会把标题栏整条染成浅蓝，一眼看出"这不是玻璃，是块蓝条"。
-    accent = qcolor(palette.get("accent"), "#3b82f6")
-    glow_alpha = 18 if dark_mode else 15
-    for cx, cy, rad in ((int(w * 0.88), int(h * 0.06), int(max(w, h) * 0.42)),
-                        (int(w * 0.04), int(h * 0.96), int(max(w, h) * 0.40))):
+    # 墨晕：以"墨色"（文本前景色）而非 accent 提色，保持水墨的中性灰调。
+    # 强度必须克制：中央看不出、玻璃上有得糊才算合格。
+    ink_c = qcolor(palette.get("text", "#ecebe5" if dark_mode else "#1d1d1b"))
+    wash_alpha = 12 if dark_mode else 10
+    for cx, cy, rad in ((int(w * 0.90), int(h * 0.08), int(max(w, h) * 0.38)),
+                        (int(w * 0.06), int(h * 0.94), int(max(w, h) * 0.36)),
+                        (int(w * 0.10), int(h * 0.06), int(max(w, h) * 0.30))):
         g = QRadialGradient(cx, cy, max(1, rad))
-        g.setColorAt(0.0, rgba(accent, glow_alpha))
-        g.setColorAt(0.55, rgba(accent, int(glow_alpha * 0.35)))
-        g.setColorAt(1.0, rgba(accent, 0))
+        g.setColorAt(0.0, rgba(ink_c, wash_alpha))
+        g.setColorAt(0.6, rgba(ink_c, int(wash_alpha * 0.4)))
+        g.setColorAt(1.0, rgba(ink_c, 0))
         painter.setPen(Qt.NoPen)
         painter.setBrush(g)
         painter.drawRect(QRect(0, 0, w, h))

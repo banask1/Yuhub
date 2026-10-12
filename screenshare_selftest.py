@@ -202,23 +202,68 @@ def run(out_file, timeout_sec=60):
     chk("心跳帧零负载（长度字段必须是 0，否则观看端会去读不存在的负载）",
         len(idle) == 17 and ss.HEADER.unpack(idle)[5] == 0,
         (len(idle), ss.HEADER.unpack(idle)))
-    presets_ok = (len(ss.QUALITY_PRESETS) == 4
-                  and all(len(p) == 4 for p in ss.QUALITY_PRESETS)
+    presets_ok = (len(ss.QUALITY_PRESETS) == 3
+                  and all(len(p) == 3 for p in ss.QUALITY_PRESETS)
                   and all(isinstance(p[0], str) for p in ss.QUALITY_PRESETS)
                   and [p[1] for p in ss.QUALITY_PRESETS] ==
                   sorted(p[1] for p in ss.QUALITY_PRESETS)
-                  and all(1 <= p[2] <= 30 for p in ss.QUALITY_PRESETS))
-    chk("画质挡位表合法（四项、最长边递增、帧率≤30）",
+                  and all(p[2] >= 300_000 for p in ss.QUALITY_PRESETS))
+    chk("画质挡位表合法（**三档**、最长边递增、都带目标码率）",
         presets_ok and 0 <= ss.DEFAULT_QUALITY < len(ss.QUALITY_PRESETS),
         ss.QUALITY_PRESETS)
-    # 默认挡位必须是 30 帧：这是用户报"为什么不像原版一样能跑 30 帧"之后
-    # 立的目标。挡位表被人改回 8/10/12 时，这条会立刻炸出来。
-    chk("★ 默认挡位就是 30 帧（用户要的 30fps 守门员）",
-        ss.QUALITY_PRESETS[ss.DEFAULT_QUALITY][2] == 30,
-        ss.QUALITY_PRESETS[ss.DEFAULT_QUALITY])
+    # 2026-10-11 用户要求：只留 480p/720p/1080p 三档，且**取消帧率上限**。
+    # 挡位表里不该再有"帧率"这个字段（不然又会有人拿它当上限用）。
+    chk("★ 三档就是 480p / 720p / 1080p（用户指定的三挡）",
+        [p[0] for p in ss.QUALITY_PRESETS] == ["480p", "720p", "1080p"],
+        [p[0] for p in ss.QUALITY_PRESETS])
+    chk("★ 挡位里的最长边就是 480p/720p/1080p 对应的宽度",
+        [p[1] for p in ss.QUALITY_PRESETS] == [854, 1280, 1920],
+        [p[1] for p in ss.QUALITY_PRESETS])
+    chk("★ 不再有帧率上限（挡位表里不携带 fps 语义，第 3 位是码率）",
+        all(p[2] >= 300_000 for p in ss.QUALITY_PRESETS)
+        and not hasattr(ss, "MAX_FPS"),
+        ss.QUALITY_PRESETS)
     chk("每档带宽提示条数与挡位一一对应（界面 tooltip 直接按下标取）",
         len(ss.QUALITY_BANDWIDTH) == len(ss.QUALITY_PRESETS),
         (len(ss.QUALITY_BANDWIDTH), len(ss.QUALITY_PRESETS)))
+
+    # ---- 自适应码率控制器（纯逻辑，任何环境都能验）----
+    # 用户要的"像 Piik 那样自适应"：带宽不够就降、富余就升，且不能来回抖。
+    try:
+        def _drive(bps, seconds=14, base=5_000_000):
+            ctrl = ss.AdaptiveBitrate(base)
+            acts = []
+            t = 1000.0
+            for _ in range(seconds):
+                acts.append(ctrl.feed(bps, 25, now=t))
+                t += 1.0
+            return ctrl, [a for a in acts if a]
+
+        c_low, a_low = _drive(300_000)          # 2.4 Mbps 链路 vs 5 Mbps 目标
+        chk("★ 链路不够 → 码率目标下调（且不会无限下探）",
+            "down" in a_low and c_low.target < c_low.base
+            and c_low.target >= c_low.floor,
+            (a_low, c_low.target))
+        c_ok, a_ok = _drive(1_200_000)          # 9.6 Mbps 链路
+        chk("★ 链路富余 → 码率目标上调（且有天花板，不会无限涨）",
+            "up" in a_ok and c_ok.target > c_ok.base
+            and c_ok.target <= c_ok.ceil,
+            (a_ok, c_ok.target))
+        # 单位回归：字节/秒 与 比特/秒 搞混过一次（会把富余链路判成不够）
+        c_unit, a_unit = _drive(1_200_000, seconds=6)
+        chk("★ 单位正确：9.6Mbps 的送达量绝不能被判成'带宽不够'",
+            "down" not in a_unit, a_unit)
+        # 极窄链路：压到下限之后必须给出"该降分辨率"的信号
+        c_tiny, a_tiny = _drive(50_000, seconds=20)
+        chk("★ 压到下限仍不够 → 报 preset_down（调用方降分辨率）",
+            "preset_down" in a_tiny and c_tiny.target <= c_tiny.floor + 1,
+            (a_tiny, c_tiny.target))
+        # 迟滞：临界点上不许来回抖
+        c_h, a_h = _drive(3_400_000, seconds=30)
+        chk("★ 临界带宽下不来回抖（升降动作有界）",
+            len([a for a in a_h if a == "up"]) <= 3, a_h)
+    except Exception as exc:                                  # noqa: BLE001
+        chk("自适应码率控制器", False, repr(exc))
 
     # ---- 静止画面的判定：用合成数据验取舍，不依赖屏幕当前在放什么 ----
     # 背景：本机桌面上**总有一个 20×20 的小块在闪**（实测每帧稳定产生约
@@ -272,6 +317,12 @@ def run(out_file, timeout_sec=60):
         ss.make_token("ROOM-1", "pw") != ss.make_token("ROOM-2", "pw"))
     chk("房间观看码长度 24 位（与云盘 token 等长）",
         len(ss.make_token("A", "B")) == 24, len(ss.make_token("A", "B")))
+    # 归一化：与「加入房间」的判定口径一致（大小写/空格不参与）
+    chk("★ 观看码忽略房间码大小写与空格（否则房间通了也看不了）",
+        ss.make_token("ABC 123", "pw") == ss.make_token("abc123", "pw")
+        == ss.make_token("  aBc123 ", "pw"), ss.make_token("ABC 123", "pw"))
+    chk("★ 观看码忽略密码首尾空白",
+        ss.make_token("room", " pw ") == ss.make_token("room", "pw"))
 
     # ========================================================= C 房间与端口发布
     ss.set_active_room()
@@ -431,13 +482,20 @@ def run(out_file, timeout_sec=60):
 
     # 抓屏坐标系必须自洽：窗口矩形要落在显示器矩形的并集里。这条能抓出一个
     # 真实存在的坑——**非 DPI 感知**的进程里 EnumDisplayMonitors 报的是逻辑
-    # 像素、DWM 报的是物理像素，两者差一个缩放倍率（这台 150% 缩放的机器上
-    # 是 1707 对 2560）。此时"只共享某个窗口"会抓到旁边那块区域。
-    if wins and screens:
-        left = min(s["x"] for s in screens)
-        top = min(s["y"] for s in screens)
-        right = max(s["x"] + s["w"] for s in screens)
-        bottom = max(s["y"] + s["h"] for s in screens)
+    # 像素、DWM 报的是物理像素，两者差一个缩放倍率（本机 125% 缩放下是
+    # 2048 对 2560）。此时"只共享某个窗口"会抓到旁边那块区域。
+    # ⚠️ 显示器列表必须**在这里重新读一次**：上面那份 `screens` 是在 Qt 初始化
+    # 之前采样的，而 Qt/系统会在进程生命周期内改变 DPI 感知状态 —— 拿"感知前
+    # 的逻辑值"去比"感知后的物理值"会得到假失败（2026-10-11 冻结态自检实测）。
+    if wins:
+        screens_now = ss.list_screens() or screens
+        scale_now = ss.screen_dc_scale()
+        info("coord_space", {"screens": [[s["w"], s["h"]] for s in screens_now],
+                             "dc_scale": round(scale_now, 3)})
+        left = min(s["x"] for s in screens_now)
+        top = min(s["y"] for s in screens_now)
+        right = max(s["x"] + s["w"] for s in screens_now)
+        bottom = max(s["y"] + s["h"] for s in screens_now)
         checked, over = 0, []
         for w in wins:
             r = ss.window_rect(w.hwnd)
@@ -450,7 +508,10 @@ def run(out_file, timeout_sec=60):
             if max(ox, oy) > 32:
                 over.append((w.title[:24], r))
         chk("★ 窗口矩形与显示器在同一坐标系（差一个量级＝「共享某个窗口」抓错区域）",
-            checked == 0 or not over, (checked, over[:2]))
+            checked == 0 or not over,
+            {"checked": checked, "over": over[:2],
+             "screens": [[s["w"], s["h"]] for s in screens_now],
+             "scale": round(scale_now, 3)})
     else:
         info("window_in_screen_space", "skipped：没有窗口或显示器可测")
 
@@ -489,7 +550,7 @@ def run(out_file, timeout_sec=60):
         stubs = [_StubViewer() for _ in range(ss.MAX_VIEWERS)]
         with srv._lock:
             srv._viewers.extend(stubs)
-        full = ss.FrameClient("127.0.0.1", port, token, on_frame=lambda *a: None)
+        full = ss.FrameClient("127.0.0.1", port, token, on_frame=lambda *a: None, caps=(ss.CAP_H264,))
         ok_full, msg_full = full.start()
         full.stop()
         with srv._lock:
@@ -502,7 +563,8 @@ def run(out_file, timeout_sec=60):
         cli = ss.FrameClient(
             "127.0.0.1", port, token,
             on_frame=lambda typ, seq, w, h, payload:
-                got.append((typ, seq, w, h, payload)))
+                got.append((typ, seq, w, h, payload)),
+            caps=(ss.CAP_H264,))
         ok_cli, peer = cli.start()
         chk("持正确观看码握手成功并拿到对端名字",
             ok_cli and peer == "SelfTestHost", (ok_cli, peer))
@@ -512,37 +574,41 @@ def run(out_file, timeout_sec=60):
             any(k == "viewer_join" and p.get("total") == 1 for k, p in events),
             [k for k, _ in events])
 
-        jpeg1 = os.urandom(4096)                   # 假装是一帧 JPEG
+        # 2026-10-11：JPEG 编码模式已删除。push 只认 h264/h264_key/idle；
+        # "画面没变就不重发"的判定在**页面的编码线程**里做（采样签名），
+        # 引擎层只负责忠实投递。
+        h264_1 = b"\x00\x00\x00\x01\x65" + os.urandom(64)
         chk("投递画面帧返回 True",
-            srv.push(jpeg1, 1600, 1000) is True)
+            srv.push(h264_1, 1600, 1000, kind="h264_key") is True)
         chk("观看端收到这一帧", _wait(lambda: len(got) >= 1, 3.0), len(got))
         if got:
             typ, _seq, w, h, payload = got[0]
             chk("帧类型/宽高/负载逐字节正确",
-                typ == ss.TYPE_FRAME and (w, h) == (1600, 1000)
-                and payload == jpeg1, (typ, w, h, len(payload)))
+                typ == ss.TYPE_H264_KEY and (w, h) == (1600, 1000)
+                and payload == h264_1, (typ, w, h, len(payload)))
         else:
             chk("帧类型/宽高/负载逐字节正确", False, "没收到帧")
 
-        # ---- 画面没变就不重发：异地经中继时省流量的命根子
+        # ---- 明确的心跳（抓屏失败保活 / 画面静止时由页面编码线程发）
         before = srv.bytes_sent
-        again = srv.push(jpeg1, 1600, 1000)
-        chk("★ 画面没变时只发 17 字节心跳、不重发整帧",
-            again is False and (srv.bytes_sent - before) == ss.HEADER.size,
-            (again, srv.bytes_sent - before))
+        chk("心跳投递返回 False（心跳不算画面帧）",
+            srv.push(None, 1600, 1000, kind="idle") is False)
         chk("心跳也送到了观看端（让他知道连接还活着）",
             _wait(lambda: len(got) >= 2, 3.0), len(got))
         if len(got) >= 2:
             chk("心跳帧类型正确且负载为空",
                 got[1][0] == ss.TYPE_IDLE and got[1][4] == b"",
                 (got[1][0], len(got[1][4])))
+        chk("心跳只花 17 字节（长度字段为 0）",
+            (srv.bytes_sent - before) == ss.HEADER.size,
+            srv.bytes_sent - before)
 
-        jpeg2 = os.urandom(4096)
-        chk("画面变了就重新发整帧", srv.push(jpeg2, 1600, 1000) is True)
+        h264_2 = b"\x00\x00\x00\x01\x41" + os.urandom(64)
+        chk("差帧照常投递", srv.push(h264_2, 1600, 1000, kind="h264") is True)
         chk("新画面到达观看端", _wait(lambda: len(got) >= 3, 3.0), len(got))
         if len(got) >= 3:
-            chk("新帧负载与旧帧不同（没被误判成「画面没变」）",
-                got[2][4] != jpeg1 and got[2][4] == jpeg2, len(got[2][4]))
+            chk("新帧负载与旧帧不同",
+                got[2][4] != h264_1 and got[2][4] == h264_2, len(got[2][4]))
 
         stats = srv.viewer_stats()
         chk("观看者统计（谁在看/看了多少）可用",
@@ -575,12 +641,28 @@ def run(out_file, timeout_sec=60):
     shell._lock = threading.Lock()
     shell._slot = None
     shell._event = threading.Event()
+    shell.dropped = 0
     for i in range(200):
         shell.offer(b"x" * i, True)
     chk("★ 慢观看者的待发帧只有一格（覆盖而不是排队堆积）",
         shell._slot is not None and shell._slot[0] == b"x" * 199
         and not isinstance(shell._slot, list),
         type(shell._slot).__name__)
+    # 丢帧计数：这是判"链路吃不下当前帧率"最直接的证据（送达 < 发出时
+    # 界面会据此提示"链路带宽不够"，不再把 4fps 说成"画面没变"）。
+    chk("★ 被顶掉的画面帧被计数（判定链路受限的依据）",
+        shell.dropped == 199, shell.dropped)
+    shell._slot = None
+    shell.offer(b"FRAME", True)
+    _d0 = shell.dropped
+    shell.offer(b"BEAT", False)
+    chk("心跳被丢弃不算丢帧（它本来就不含信息）", shell.dropped == _d0,
+        shell.dropped)
+    shell._slot = None
+    shell.offer(b"BEAT", False)          # 只有心跳在格子里
+    shell.offer(b"FRAME", True)          # 帧把它替换掉：不算丢帧
+    chk("帧替换掉心跳不算丢帧（格子里原本没有画面帧）",
+        shell.dropped == _d0, shell.dropped)
 
     # 心跳不许顶掉还没发出去的画面帧。真机上暴露过一次：画面静止时编码
     # 线程按抓屏节奏发心跳，而一帧上百 KB 的 JPEG 还没 sendall 完，心跳就把
@@ -611,7 +693,7 @@ def run(out_file, timeout_sec=60):
         # 一个只完成握手、之后再也不读的观看者（模拟异地带宽不够的那端）
         raw = socket.create_connection(("127.0.0.1", srv2.port), timeout=3)
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
-        raw.sendall(("%s %s\n" % (ss.PROTOCOL, token2)).encode("utf-8"))
+        raw.sendall(("%s %s h264\n" % (ss.PROTOCOL, token2)).encode("utf-8"))
         line = ss._recv_line(raw, ss.MAX_HELLO)
         chk("只连不读的观看者也能握手成功", bool(line), line)
         chk("他被正常登记", _wait(lambda: srv2.viewers == 1, 3.0), srv2.viewer_list())
@@ -655,6 +737,326 @@ def run(out_file, timeout_sec=60):
             except OSError:
                 pass
         srv2.stop()
+
+    # ====================================== H2 加固项（2026-10-11 审阅修复）
+    # 三处都是"审阅时发现、真机上会出问题"的点，逐条钉住。
+
+    # ① 观看端帧头校验：对端声明 4GB 负载时不许去分配内存
+    fake = None
+    try:
+        fake = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        fake.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        fake.bind(("127.0.0.1", 0))
+        fake.listen(1)
+        fake_port = fake.getsockname()[1]
+
+        def fake_serve():
+            try:
+                conn, _addr = fake.accept()
+                conn.settimeout(3.0)
+                ss._recv_line(conn, ss.MAX_HELLO)          # 吃握手
+                conn.sendall(b"OK FakeHost\n")
+                # 一个合法的帧头 + 一个不可能的负载长度
+                conn.sendall(ss.HEADER.pack(ss.MAGIC, ss.TYPE_FRAME, 1,
+                                            8, 8, 0xFFFFFFFF))
+                time.sleep(0.6)
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=fake_serve, daemon=True).start()
+        got_frame = []
+        cli = ss.FrameClient("127.0.0.1", fake_port, "x",
+                             on_frame=lambda *a: got_frame.append(a))
+        ok_c, msg_c = cli.start()
+        chk("假服务端握手成功（下面那条断言的前提）", ok_c, msg_c)
+        ended = _wait(lambda: (not cli.running) and bool(cli.error), 6.0)
+        chk("★ 帧头声明超长负载 → 客户端拒收并退出（不会去分配 4GB）",
+            ended and "数据异常" in cli.error,
+            "ended=%s error=%s" % (ended, cli.error))
+        chk("★ 没有把畸形负载当画面交出去",
+            not got_frame, got_frame[:1])
+        cli.stop()
+    except Exception as exc:                                    # noqa: BLE001
+        chk("帧头校验（超长负载）", False, repr(exc))
+    finally:
+        if fake is not None:
+            try:
+                fake.close()
+            except OSError:
+                pass
+
+    # ② 观看者的**发送**超时：只连不读的死连接必须被销号，不能永久占名额
+    try:
+        token3 = ss.make_token("STALL-TEST", "pw")
+        srv3 = ss.ShareServer(token3)
+        ok3, res3 = srv3.start("127.0.0.1", 0, name="StallHost")
+        chk("第三个共享实例能起（发送超时用例的前提）", ok3, res3)
+        saved_timeout = ss.VIEWER_SEND_TIMEOUT
+        ss.VIEWER_SEND_TIMEOUT = 0.5          # 别让自检真等 20 秒
+        raw = None
+        try:
+            raw = socket.create_connection(("127.0.0.1", srv3.port), timeout=3)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+            raw.sendall(("%s %s h264\n" % (ss.PROTOCOL, token3)).encode("utf-8"))
+            ss._recv_line(raw, ss.MAX_HELLO)              # 握手成功后**永不读**
+            chk("死连接已被登记为观看者（前提）",
+                _wait(lambda: srv3.viewers == 1, 3.0), srv3.viewer_list())
+            # 灌满它的缓冲：**单帧必须明显大于内核缓冲**（发送端 SNDBUF 默认
+            # 约 64KB、对端 RCVBUF 只有 2KB），否则 sendall 一口吞下、根本
+            # 不会阻塞，就测不到发送超时（第一版用 64KB 帧正是这么假通过的）。
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and srv3.viewers:
+                srv3.push(os.urandom(512 * 1024), 1280, 720)
+                time.sleep(0.02)
+            gone = _wait(lambda: srv3.viewers == 0, 8.0)
+            chk("★ 只连不读的死连接会被发送超时销号（不再永久占名额）",
+                gone, "viewers=%d" % srv3.viewers)
+        finally:
+            ss.VIEWER_SEND_TIMEOUT = saved_timeout
+            if raw is not None:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+            srv3.stop()
+    except Exception as exc:                                    # noqa: BLE001
+        chk("观看者发送超时销号", False, repr(exc))
+
+    # ③ 观看码错误限速：前两次不延迟，之后逐次加长（挡 6 位数字的爆破）
+    try:
+        srv4 = ss.ShareServer(ss.make_token("THROTTLE", "pw"))
+        d1 = srv4._note_bad_token("10.0.0.9")
+        d2 = srv4._note_bad_token("10.0.0.9")
+        d3 = srv4._note_bad_token("10.0.0.9")
+        d6 = [srv4._note_bad_token("10.0.0.9") for _ in range(3)]
+        other = srv4._note_bad_token("10.0.0.10")
+        chk("★ 观看码错误限速：前两次不延迟（正常用户输错无感）",
+            d1 == 0.0 and d2 == 0.0, (d1, d2))
+        chk("★ 第三次起开始延迟，且随次数递增、有上限",
+            d3 > 0.0 and max(d6) <= 1.5 and d6[-1] >= d3, (d3, d6))
+        chk("★ 限速按来源 IP 计（不误伤其他观看者）", other == 0.0, other)
+        srv4.stop()
+    except Exception as exc:                                    # noqa: BLE001
+        chk("观看码限速", False, repr(exc))
+
+    # ④ 抓屏失败时必须发心跳保活（锁屏 / 切安全桌面 / 显示器休眠）
+    #    以前 `if raw:` 才往下走 → 抓不到画面就什么都不发 → 对端要等
+    #    RECV_TIMEOUT×3 才判死并报"连接已断开"，用户看到的是"画面卡住，
+    #    然后莫名其妙断开"。这条守着"抓屏失败也要让对端知道连接还在"。
+    try:
+        from PySide6.QtWidgets import QApplication as _QA
+        _app = _QA.instance() or _QA([])
+        import ui.pages.share_page as sp
+
+        class _Rec(object):
+            def __init__(self):
+                self.events = []
+
+            def emit(self, *args):
+                self.events.append(args)
+
+        class _Bridge(object):
+            pass
+
+        class _Srv(object):
+            viewers = 1                     # 有人在看（保活才有意义）
+
+            def __init__(self):
+                self.pushes = []
+
+            def push(self, jpeg, *wh):
+                self.pushes.append((jpeg, wh))
+                return jpeg is not None
+
+        class _CapStub(object):
+            """抓屏永远失败：模拟锁屏 / 安全桌面。"""
+
+            def fit(self, w, h, edge):
+                return (w, h)
+
+            def grab(self, rect, w, h):
+                return None
+
+            def close(self):
+                pass
+
+        srv = _Srv()
+        bridge = _Bridge()
+        bridge.event = _Rec()
+        sender = sp._Sender(srv, bridge)
+        saved_cap = ss.GdiCapture
+        ss.GdiCapture = lambda: _CapStub()
+        try:
+            sender.start()
+            time.sleep(1.4)
+            # 在 stop() **之前**取快照：stop() 本身会（正常地）发一次
+            # sender_stopped，拿它当失败信号是假失败（第一版就这么错了）。
+            mid_events = list(bridge.event.events)
+            sender.stop()
+        finally:
+            ss.GdiCapture = saved_cap
+        beats = [p for p in srv.pushes if p[0] is None]
+        chk("★ 抓屏失败（锁屏/安全桌面）时发心跳保活，不让对端莫名断开",
+            len(beats) >= 2,
+            "心跳 %d 次 / 总投递 %d 次" % (len(beats), len(srv.pushes)))
+        chk("抓屏一直失败也不会自己停掉共享（还在共享，只是暂时没画面）",
+            not any(e and e[0] == "sender_stopped" for e in mid_events),
+            mid_events[:2])
+    except Exception as exc:                                    # noqa: BLE001
+        chk("抓屏失败心跳保活", False, repr(exc))
+
+    # ====================================== H3 H.264（2026-10-11）：能力协商 + 往返
+    # JPEG 编码已删除：**不带 h264 能力位的旧客户端在握手阶段就被拒**
+    # （ERR codec），而不是连上后看黑屏 —— 这是"只保留 H.264"之后唯一
+    # 正确的旧版兼容姿势。
+    try:
+        token5 = ss.make_token("H264-TEST", "pw")
+        srv5 = ss.ShareServer(token5)
+        ok5, res5 = srv5.start("127.0.0.1", 0, name="H264Host")
+        chk("H.264 用例的共享实例能起", ok5, res5)
+        legacy = socket.create_connection(("127.0.0.1", srv5.port), timeout=3)
+        # 老格式握手：只有 协议 + 观看码，**不带**能力位
+        legacy.sendall(("%s %s\n" % (ss.PROTOCOL, token5)).encode("utf-8"))
+        reply = ss._recv_line(legacy, ss.MAX_HELLO)
+        chk("★ 旧客户端握手被明确拒绝（ERR codec），不是连上后看黑屏",
+            reply is not None and reply.startswith(b"ERR codec"),
+            None if reply is None else reply[:40])
+        chk("★ 被拒的旧客户端不计入观看者名单",
+            srv5.viewers == 0, srv5.viewer_list())
+
+        def _read_packet(sock):
+            head = ss._recv_exact(sock, ss.HEADER.size)
+            if head is None:
+                return None, b""
+            typ = ss.HEADER.unpack(head)[1]
+            ln = ss.HEADER.unpack(head)[5]
+            body = ss._recv_exact(sock, ln) if ln else b""
+            return typ, body or b""
+
+        # 带能力位的新客户端：正常进入，H.264 帧用 3/4 号类型
+        # 带能力位的新客户端：正常进入，H.264 帧用 3/4 号类型
+        # （⚠️ push 必须在观看者进场**之后**：push 是"只发给在场者"，
+        #   先 push 再连 = 数据发给了空气，读取就会超时）
+        legacy2 = socket.create_connection(("127.0.0.1", srv5.port), timeout=3)
+        legacy2.sendall(("%s %s h264\n" % (ss.PROTOCOL, token5))
+                        .encode("utf-8"))
+        ss._recv_line(legacy2, ss.MAX_HELLO)
+        _wait(lambda: srv5.viewers == 1, 3.0)
+        srv5.push(b"\x00\x00\x00\x01\x65key", 640, 360, kind="h264_key")
+        typ_key, body_key = _read_packet(legacy2)
+        srv5.push(b"\x00\x00\x00\x01\x41delta", 640, 360, kind="h264")
+        typ_delta, _b = _read_packet(legacy2)
+        chk("★ 关键帧/差帧走 3/4 号类型（没有复用 JPEG 的 1 号）",
+            typ_key == ss.TYPE_H264_KEY and typ_delta == ss.TYPE_H264,
+            (typ_key, typ_delta))
+        chk("H.264 帧的负载原样送达（含起始码）",
+            body_key == b"\x00\x00\x00\x01\x65key", body_key[:16])
+        legacy2.close()
+        srv5.stop()
+
+        # 声明了 h264 的新客户端 → 才允许发 H.264
+        srv6 = ss.ShareServer(token5)
+        ok6, _r6 = srv6.start("127.0.0.1", 0, name="H264Host2")
+        chk("第二个 H.264 实例能起", ok6, "")
+        newc = ss.FrameClient("127.0.0.1", srv6.port, token5,
+                              lambda *a: None, caps=(ss.CAP_H264,))
+        ok_c, msg_c = newc.start()
+        chk("带 h264 能力位的新客户端能握手", ok_c, msg_c)
+        chk("★ 声明 h264 之后才允许发 H.264（协商生效）",
+            _wait(lambda: srv6.all_viewers_h264(), 3.0), srv6.viewer_stats())
+        newc.stop()
+        srv6.stop()
+    except Exception as exc:                                    # noqa: BLE001
+        chk("H.264 能力协商", False, repr(exc))
+
+    # 真编解码往返（DLL 未内置时**如实跳过**，不算失败 —— 那时会退回 JPEG）
+    try:
+        import h264codec as _h264
+        if not _h264.available():
+            chk("H.264 组件未内置 → 分屏自动退回 JPEG（可接受状态）", True,
+                "未找到 avcodec/avutil/swscale（见 resources/ffmpeg/BUILD.md）")
+            # 把"为什么没找到"如实记下来：用户把 DLL 放进去了却仍然不可用时，
+            # 这几条是唯一能定位的证据（候选目录 / 命中的目录 / 加载异常）
+            try:
+                info("h264_candidate_dirs", _h264.candidate_dirs())
+                info("h264_pick_dir", _h264.pick_dir())
+                try:
+                    _h264._load_libs()
+                    info("h264_load", "ok")
+                except Exception as _le:                    # noqa: BLE001
+                    info("h264_load_error", repr(_le))
+            except Exception:                               # noqa: BLE001
+                pass
+        else:
+            _W, _H = 320, 180
+            # 渐变 + 色块：纯色帧压缩到几十字节目录会掩盖真实行为
+            _raw = bytearray()
+            for _y in range(_H):
+                for _x in range(_W):
+                    _raw += bytes((_x % 256, _y % 256, (_x + _y) % 256, 255))
+            _frame = bytes(_raw)
+            _enc = _h264.H264Encoder(_W, _H, fps=30, bitrate=800_000)
+            _pkts = []
+            for _i in range(6):
+                _pkts.extend(_enc.encode(_frame, _W * 4))
+            _enc.close()
+            _dec = _h264.H264Decoder()
+            _got = None
+            for _d, _k in _pkts:
+                _r = _dec.decode(_d)
+                if _r:
+                    _got = _r
+            _dec.close()
+            chk("★ H.264 编码 → 解码往返出图、尺寸正确",
+                _got is not None and _got[0] == _W and _got[1] == _H,
+                None if not _got else _got[:2])
+            chk("★ 选到的编码后端会被记录（谁在用哪个编码器，看这里）",
+                bool(_enc.name), _enc.name)
+            info("h264_encoder", _enc.name)
+            info("h264_packets", len(_pkts))
+    except Exception as exc:                                    # noqa: BLE001
+        chk("H.264 往返", False, repr(exc))
+
+    # ---- H4 组件按需下载（ffmpeg_pack）：解压逻辑用合成包验，不联网 ----
+    try:
+        import tempfile
+        import zipfile as _zf
+        import ffmpeg_pack as _fp
+        _tmp = tempfile.mkdtemp(prefix="yuhub_ffpack_")
+        _zp = os.path.join(_tmp, "pack.zip")
+        with _zf.ZipFile(_zp, "w") as _z:
+            _z.writestr("ffmpeg.exe", b"x" * 1024)             # 必须被排除
+            _z.writestr("bin/avcodec-63.dll", b"A" * 2048)
+            _z.writestr("bin/avutil-61.dll", b"B" * 1024)
+            _z.writestr("bin/swscale-10.dll", b"C" * 512)
+            _z.writestr("bin/swresample-7.dll", b"D" * 256)
+            _z.writestr("bin/avformat-63.dll", b"F" * 4096)    # 必须被排除
+        _dest = os.path.join(_tmp, "out")
+        _got = _fp.extract_zip(_zp, _dest)
+        chk("★ 组件包只解出需要的 DLL（通用包里 90% 的东西不要）",
+            sorted(_got) == ["avcodec-63.dll", "avutil-61.dll",
+                             "swresample-7.dll", "swscale-10.dll"]
+            and not os.path.exists(os.path.join(_dest, "avformat-63.dll"))
+            and not os.path.exists(os.path.join(_dest, "ffmpeg.exe")),
+            sorted(_got))
+        chk("★ 组件安装目录在用户可写区（单 exe + 按需组件，与 EasyTier 同款）",
+            os.path.normpath(_fp.INSTALL_DIR) == os.path.normpath(
+                os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"),
+                             "Yuhub", "ffmpeg")),
+            _fp.INSTALL_DIR)
+        _zp2 = os.path.join(_tmp, "empty.zip")
+        with _zf.ZipFile(_zp2, "w") as _z:
+            _z.writestr("readme.txt", b"hi")
+        _empty_err = ""
+        try:
+            _fp.extract_zip(_zp2, os.path.join(_tmp, "out2"))
+        except ValueError as _ve:
+            _empty_err = str(_ve)
+        chk("★ 空包/坏包如实报错（绝不假装安装成功）",
+            bool(_empty_err), _empty_err[:60])
+    except Exception as exc:                                    # noqa: BLE001
+        chk("组件按需下载", False, repr(exc))
 
     # ============================================================ I 信标 ss 键
     # 队友的成员行靠这个键长出「看屏幕」按钮。开着才发、停掉就消失，
@@ -847,6 +1249,9 @@ def _ui_e2e(chk, info, ss):
             watch._full.hasMouseTracking(), watch._full.hasMouseTracking())
         # 新到的一帧要**同时**刷到页面里那份和全屏那份 —— 只刷其中一份的话
         # 全屏看的就是一张定格图（最典型的"能全屏但画面不动"）。
+        # ⚠️ 走的是**真实契约**：JPEG 在接收线程里解码（`SharePage._on_frame`），
+        # 主线程那侧（_on_engine）收到的是已经解好的 QImage。直接往
+        # `_on_engine` 喂 JPEG 字节是不对的 —— 那是旧契约。
         from PySide6.QtCore import QBuffer, QIODevice
         _img = QImage(96, 64, QImage.Format.Format_RGB32)
         _img.fill(0x3366CC)
@@ -857,11 +1262,24 @@ def _ui_e2e(chk, info, ss):
         _buf.close()
         watch._view._pix = None
         watch._full._view._pix = None
-        watch._on_engine("frame", _data)
-        pump(0.2)
+        # 记录跨线程投递的载荷类型：解码必须在接收线程完成，主线程只收 QImage
+        _payloads = []
+        watch._bridge.event.connect(
+            lambda k, p: _payloads.append((k, type(p).__name__)))
+        # ⚠️ 用**数字类型号**（引擎回调用的就是它），不要写字面量 "frame"：
+        #    写字符串时 `_on_frame` 直接不匹配、什么都不做，检查就变成了
+        #    "指望真实流量在那 0.2 秒里恰好来一帧" —— 而画面静止时发送端只发
+        #    心跳（每秒才兜底重发一次），这条断言会时红时绿。
+        watch._on_frame(ss.TYPE_FRAME, 1, 96, 64, _data)
+        pump(0.3)
+        chk("★ 接收线程把 JPEG 解成 QImage 再投给主线程（解码不在主线程做）",
+            any(k == "frame" and t == "QImage" for k, t in _payloads),
+            _payloads[:4])
         chk("★ 新帧同时刷到页面与全屏两份画面（否则全屏看到的是一张定格图）",
             watch._view._pix is not None and watch._full._view._pix is not None,
             (watch._view._pix is not None, watch._full._view._pix is not None))
+        # 注：这里**不**断言 _pix 的尺寸 —— 此时共享端还在往里推真实帧，
+        # 合成的那张小图随时会被真实画面覆盖（第一版就是照尺寸断言、假失败）。
 
         from PySide6.QtCore import QEvent, QPointF
         from PySide6.QtGui import QKeyEvent, QMouseEvent

@@ -40,12 +40,23 @@ def tray_available():
 
 
 def menu_qss():
-    """托盘菜单样式（与主界面同一套色板，跟随主题）。"""
+    """托盘菜单样式（与主界面同一套色板，跟随主题）。
+
+    ⚠️ 底色**必须**用主题的菜单专用键 `menu_bg` / `menu_border`，不能退回
+    `card_top` / `border_strong`。原因（sky glass 主题实测反馈的 bug）：
+    玻璃系主题的 `card_top` 是**半透明**的（深色下只有 `rgba(255,255,255,26)`
+    约 10% 不透明度）—— 卡片压在主窗口的模糊背板上没问题，但托盘菜单是
+    独立顶层弹窗、背后没有任何东西可透，于是整个菜单变成"没底的浮字"，
+    深色模式下几乎不可读。`menu_bg` 正是为主题作者准备的**近实心**菜单底色
+    （默认色板里也有，sky glass 的 theme.qss 同样用它）。
+    """
     p = theme.current()
+    bg = p.get("menu_bg") or p.get("card_top", "#1a1a1f")
+    border = p.get("menu_border") or p.get("border_strong", "#3a3a44")
     return (
         "QMenu {"
-        f" background: {p['card_top']};"
-        f" border: 1px solid {p['border_strong']};"
+        f" background: {bg};"
+        f" border: 1px solid {border};"
         " border-radius: 6px; padding: 5px;"
         f" color: {p['text']};"
         " }"
