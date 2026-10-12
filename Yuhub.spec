@@ -25,10 +25,13 @@ _datas = [
     ("single_instance.py", "."),
     # winadmin.py：提权判定（TokenElevation）—— 不能用 IsUserAnAdmin 判组。
     ("winadmin.py", "."),
-    # v1.0.7 内嵌加速框架（Native AOT 单文件，2.69MB）：进「网络加速」页时
-    # 自动复制到 %LOCALAPPDATA%\Yuhub\accel —— 不再需要手动选文件 / 下载。
-    # 注意必须是 out/ 下这份 2.69MB 的 AOT 产物；bin/Release/.../ 下还有个
-    # 151KB 的 apphost 壳（旁边要同名 .dll 才能跑），千万别收错。
+    # 内嵌加速框架（Native AOT 单文件，11,615,232 B ≈ 11.1MB）：进「网络加速」
+    # 页时自动复制到 %LOCALAPPDATA%\Yuhub\accel —— 不需要手动选文件 / 下载。
+    # 注意必须是 out/ 下这份 AOT 产物（由 accel-framework/_build_aot.cmd 产出）；
+    # bin/Release/net8.0/win-x64/ 下还有个约 150KB 的 apphost 壳（旁边要同名
+    # .dll 才能跑），千万别收错。
+    # ⚠️ accel-framework/out/ 被 .gitignore 排除 → 新克隆的仓库里没有这份二进制，
+    #   必须先跑一次 _build_aot.cmd（build.bat 已自动处理，见它的第 [1/3] 步）。
     ("accel-framework/out/YuhubAccel.exe", "accel"),
 ]
 for _root, _dirs, _files in os.walk("resources"):

@@ -55,6 +55,7 @@ _*.exe
 accel-framework/bin/
 accel-framework/obj/
 accel-framework/out/
+accel-framework/out-aot/
 accel-framework/*.log
 
 # ---- 本地工作目录（开发日志 / 调试截图 / Dism++ 源数据）：不入库 ----

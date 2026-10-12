@@ -1,6 +1,8 @@
 # 内置 FFmpeg（H.264）—— 构建与放置说明
 
-分屏的 H.264 编解码靠 **三个 DLL**：`avcodec` + `avutil` + `swscale`。
+分屏的 H.264 编解码靠 **`avcodec` + `avutil` + `swscale`** 三个 DLL——不过
+**现成的完整构建**里 `avcodec` 常常还依赖 `swresample`，所以下载/解压链路
+（`ffmpeg_pack.KEEP_PREFIXES`）会**一并带上这四个**。
 **不需要** `avformat`（Yuhub 有自己的 TCP 协议，H.264 直接传裸 NAL）。
 极简自编译后**约 4~6MB**；官方完整包是 30~120MB，差的就是这些用不到的模块。
 
@@ -17,10 +19,17 @@ resources/ffmpeg/
     avcodec-63.dll      ← 版本号随 FFmpeg 版本变，代码按前缀匹配
     avutil-61.dll
     swscale-10.dll
+    swresample-7.dll    ← 完整包里 avcodec 常依赖它；自编译极简版可省
 ```
 
-**没有这些 DLL 也不会坏**：`h264codec.available()` 返回 False，分屏自动退回 JPEG，
-观看端也不会声明 `h264` 能力，旧版对端照样能看。
+**没有这些 DLL 也不会坏，但也不会"退回 JPEG"**：`h264codec.available()`
+返回 False，于是**发送端不产画面帧、只发心跳保活**（界面会提示组件正在下载）；
+`ffmpeg_pack.ensure_installed` 会在首次开启共享时后台把组件拉到候选目录 1，
+装好后**下一帧自动切 H.264，不用重启、也不用重开共享**。
+
+⚠️ 但**观看端的兼容性确实变差了**：自从只保留 H.264（JPEG 编码已从发送端
+删除）之后，握手时不声明 `h264` 能力的**旧版客户端会被直接回绝**（`ERR codec`），
+没有"退回去用 JPEG"这条兼容路。所以屏幕共享要求双方版本一致。
 
 ### ⚠️ 用现成完整包时，别只拷三个
 

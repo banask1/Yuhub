@@ -107,6 +107,21 @@ build.bat
 
 打包产物为 `dist/Yuhub.exe`。仓库内另有十二套打包后自检脚本（主题包 / 卸载页 / 跨网房间 / 房间聊天 / 自动更新 / 显卡 / 云盘 / 节点测速 / 内存优化 / 底部提示 / 屏幕共享 / 空间清理），用 `Yuhub.exe --<名字>-selftest <结果.json>` 运行。
 
+> **从源码打包需要先有加速框架的 AOT 产物。** `Yuhub.spec` 会把
+> `accel-framework/out/YuhubAccel.exe`（Native AOT 单文件，11,615,232 字节
+> ≈ 11.1 MB）打进 exe，而 `out/` 是构建产物、**不入库** —— 所以新克隆的仓库
+> 第一次打包前要先跑一次：
+>
+> ```bash
+> accel-framework\_build_aot.cmd
+> ```
+>
+> 它需要 **.NET 8 SDK** + **MSVC**（Visual Studio 生成工具的「使用 C++ 的桌面开发」
+> 工作负载，Native AOT 要用 `cl.exe` / `link.exe`）。脚本会自动探测工具链位置，
+> `build.bat` 也已接好这一步 —— 缺工具链时会明确报错，而不是打包到一半莫名失败。
+>
+> 只想要现成程序的话，直接下载 Releases 里的 `Yuhub.exe` 就行，**不需要任何工具链**。
+
 ---
 
 ## 目录结构
@@ -136,7 +151,7 @@ Yuhub/
 ├── *_selftest.py            # 打包后自检脚本
 ├── build.bat / build_icon.py# 图标生成与一键打包
 ├── resources/               # 图标、品牌 logo、Qt 中文翻译、EasyTier 二进制
-├── accel-framework/         # 加速框架（.NET 8 + YARP + **Native AOT** 子工程；AOT 单文件 10.9MB 已打进 exe，不需要 .NET 运行时）
+├── accel-framework/         # 加速框架（.NET 8 + YARP + **Native AOT** 子工程）；AOT 单文件约 11.1MB 已打进 exe，不需要 .NET 运行时。构建用 `_build_aot.cmd`
 └── ui/                      # 界面层：主题、组件、托盘、主窗口与各页面
 ```
 
@@ -174,13 +189,15 @@ Yuhub/
 
 ## 许可
 
-本项目内嵌了第三方可执行文件，按各自的原许可证随包携带，许可证原文就在对应的
+Yuhub 自身代码按 **MIT** 许可发布，全文见 **[LICENSE](LICENSE)**。
+
+发行包里另外内嵌了第三方组件，各按其原许可证分发，许可证原文就在对应的
 `resources/` 子目录里：
 
 - **EasyTier**（Apache 2.0）—— 异地联机的虚拟局域网内核，`resources/easytier/`
 
 屏幕共享的传输层是**自研实现**（`screenshare.py`，纯标准库手写 17 字节帧头协议）；
-H.264 编解码使用 FFmpeg 的 `libavcodec` / `avutil` / `swscale`，按 **LGPL-2.1+**
-动态链接方式调用（构建参数与合规要点见 `resources/ffmpeg/BUILD.md`，不含 GPL 组件）。
-该组件**不随 exe 打包**，由程序首次开启共享时按需下载，因此仓库与发行包里都不含
-这些第三方二进制。
+H.264 编解码使用 FFmpeg 的 `libavcodec` / `avutil` / `swscale`（现成的完整包还会
+带上 `swresample`），按 **LGPL-2.1+** 动态链接方式调用（构建参数与合规要点见
+`resources/ffmpeg/BUILD.md`，不含 GPL 组件）。该组件**不随 exe 打包**，由程序首次
+开启共享时按需下载 —— 因此仓库与发行包里都不含这些第三方二进制。
