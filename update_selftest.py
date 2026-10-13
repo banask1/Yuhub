@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import socketserver
+import subprocess
 import sys
 import tempfile
 import threading
@@ -731,6 +732,157 @@ def _test_selftest_mode_guarded():
     _add("空路径 → 拒绝执行", rc2 == 3, "返回码=%r" % rc2)
 
 
+def _test_elevation_decision():
+    """回归：替换器**必须提权启动** —— 自动更新曾 100% 静默失效。
+
+    2026-10-13 用户实测：v1.1 下载完更新包，程序关了、版本没变。
+    根因不是网络也不是文件锁，而是**用非提权方式启动了一个带
+    `requireAdministrator` 清单的 exe**，Windows 直接拒绝：
+    `WinError 740「请求的操作需要提升」`，替换器从未真正运行。
+
+    而旧 `needs_elevation()` 只探测**目标目录能不能写**。exe 躺在桌面
+    这类可写目录 → 判 False → 走不带 runas 的 `subprocess.Popen` →
+    必撞 740。**"副本需要提权"与"目录可写"完全是两件事。**
+
+    这组断言把根因钉死，任何人再把判据改回"只看目录可写"都会立刻变红。
+    """
+    # ---- ① 清单识别：带 requireAdministrator 的 exe 必须判为需要提权 ----
+    d = tempfile.mkdtemp(prefix="Yuhub_elev_")
+    try:
+        # 造一个"带清单标记"的假 exe：只需含 requestedExecutionLevel
+        # 与 requireAdministrator 两段文本，判据即命中
+        fake_req = os.path.join(d, "req.exe")
+        with open(fake_req, "wb") as f:
+            f.write(b"MZ" + b"\0" * 64 +
+                    b'<requestedExecutionLevel level="requireAdministrator" />'
+                    + b"\0" * 64)
+        got_req = updater.exe_requires_elevation(fake_req)
+        _add("清单识别：requireAdministrator → 需要提权", got_req is True,
+             "返回 %r" % (got_req,))
+
+        fake_as = os.path.join(d, "asInvoker.exe")
+        with open(fake_as, "wb") as f:
+            f.write(b"MZ" + b"\0" * 64 +
+                    b'<requestedExecutionLevel level="asInvoker" />'
+                    + b"\0" * 64)
+        got_as = updater.exe_requires_elevation(fake_as)
+        _add("清单识别：asInvoker → 不需要提权", got_as is False,
+             "返回 %r" % (got_as,))
+
+        # 真 exe（冻结态）也该判 True —— 这是本项目的常态
+        if getattr(sys, "frozen", False):
+            got_real = updater.exe_requires_elevation(sys.executable)
+            _add("真 exe（uac_admin=True）判为需要提权", got_real is True,
+                 "返回 %r" % (got_real,))
+
+        # ---- ② needs_elevation 不能只看目录可写 ----
+        # 目录一定可写（temp），但副本要求提权 → 必须判 True。
+        # 旧实现在这里返回 False，这就是自动更新失效的直接原因。
+        target_in_tmp = os.path.join(d, "Yuhub.exe")
+        with open(target_in_tmp, "wb") as f:
+            f.write(b"MZ" + b"\0" * 64)
+        legacy = updater.needs_elevation(target_in_tmp)          # 旧语义
+        fixed = updater.needs_elevation(target_in_tmp,
+                                        updater_exe=fake_req)     # 新语义
+        _add("旧判据漏判（目录可写 → False，复现事故成因）",
+             legacy is False, "返回 %r" % (legacy,))
+        _add("新判据正确判 True（副本要求提权）", fixed is True,
+             "返回 %r" % (fixed,))
+    except Exception as e:
+        _add("提权判据自检未崩溃", False, repr(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ---- ③ 参数编码：base64 与带空格路径必须完整送达替换器 ----
+    # 旧实现把参数裸拼成字符串给 ShellExecuteW，被按空格拆词。
+    payload = {
+        "new_exe": os.path.join(tempfile.gettempdir(), "aa bbb", "Yuhub.exe"),
+        "target_exe": r"C:\Program Files\Yuhub\Yuhub.exe",
+        "old_pid": 1, "new_version": "v1.1.3",
+        "launch_args": [], "backup": True,
+    }
+    b64 = updater.encode_payload(payload)
+    params = " ".join(updater._quote_win_arg(a)
+                      for a in ["--apply-update", b64])
+    _add("参数逐个加引号（4 个引号）", params.count('"') == 4,
+         "引号数 %d" % params.count('"'))
+    # 往返：交给 Windows 命令行解析器还原，载荷必须一字不差
+    rd = tempfile.mkdtemp(prefix="Yuhub_quote_")
+    try:
+        out = os.path.join(rd, "argv.json")
+        rec = os.path.join(rd, "rec.py")
+        with io.open(rec, "w", encoding="utf-8") as f:
+            f.write("import sys, json\n"
+                    "open(r'%s', 'w', encoding='utf-8')"
+                    ".write(json.dumps(sys.argv[1:]))\n"
+                    % out.replace("\\", "\\\\"))
+        subprocess.run('python "%s" %s "%s"' % (rec, params, out),
+                       shell=True, capture_output=True, timeout=60)
+        with io.open(out, encoding="utf-8") as f:
+            got = f.read()
+        _add("base64 载荷经命令行往返后完整（含 = 未被吃掉）",
+             b64 in got, "长度 %d" % len(got))
+    except Exception as e:
+        _add("参数编码往返检查未崩溃", False, repr(e))
+    finally:
+        shutil.rmtree(rd, ignore_errors=True)
+
+    # ---- ④ 非提权启动撞 740 时必须自动升级为提权 ----
+    # 740 是本项目常态（副本带 uac_admin 清单），不该当异常抛给用户。
+    seen = {}
+    real = updater._runas_launch
+
+    def fake_runas(exe, args):
+        seen["args"] = args
+        return True, "已请求管理员权限启动更新"
+
+    updater._runas_launch = fake_runas
+    try:
+        # 模拟 Popen 抛 740：用一个不存在的可执行路径触发 OSError 不够真实，
+        # 这里直接验证 elevated=True 分支确实走 _runas_launch 且载荷完整
+        ok, msg = updater.launch_updater(
+            r"C:\nonexistent\Yuhub_updater.exe", payload, elevated=True)
+        args = seen.get("args") or []
+        _add("elevated=True 走提权启动", ok is True, msg)
+        _add("提权启动传参完整（模式 + 载荷）",
+             len(args) == 2 and args[0] == "--apply-update" and args[1] == b64,
+             "参数 %r" % (args[:1],))
+    except Exception as e:
+        _add("提权启动分支未崩溃", False, repr(e))
+    finally:
+        updater._runas_launch = real
+
+    # ---- ⑤ 残留目录清理：只删超龄的，不碰本进程与新鲜目录 ----
+    tmp = tempfile.gettempdir()
+    old_d = os.path.join(tmp, "Yuhub_upd_888801")
+    new_d = os.path.join(tmp, "Yuhub_upd_888802")
+    try:
+        for p in (old_d, new_d):
+            shutil.rmtree(p, ignore_errors=True)
+            os.makedirs(p, exist_ok=True)
+        past = time.time() - 7200
+        os.utime(old_d, (past, past))          # 2 小时前 → 该删
+        n = updater._sweep_stale_updater_dirs(keep_pid=os.getpid())
+        _add("残留清理：只删超龄目录", n == 1, "清理 %d 个" % n)
+        _add("残留清理：超龄目录已删", not os.path.isdir(old_d))
+        _add("残留清理：新鲜目录保留", os.path.isdir(new_d))
+    except Exception as e:
+        _add("残留清理检查未崩溃", False, repr(e))
+    finally:
+        shutil.rmtree(old_d, ignore_errors=True)
+        shutil.rmtree(new_d, ignore_errors=True)
+
+    # ---- ⑥ 替换器日志可写：静默故障必须留痕 ----
+    try:
+        lp = updater.updater_log_path()
+        _add("替换器日志路径可用", bool(lp), lp)
+        if lp:
+            updater._ulog("自检写入")
+            _add("替换器日志可写（故障可追溯）", os.path.isfile(lp))
+    except Exception as e:
+        _add("替换器日志检查未崩溃", False, repr(e))
+
+
 def _test_checker_signals_connectable():
     """回归：UpdateChecker 的 Qt 信号必须能 connect。
 
@@ -850,6 +1002,7 @@ def run(out_path):
         _test_replace_flow(port, tag, sha, fake_exe)
         _test_selftest_mode_guarded()
         _test_package_guard()
+        _test_elevation_decision()
         _test_checker_signals_connectable()
 
     except Exception as e:

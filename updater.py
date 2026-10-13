@@ -905,8 +905,17 @@ def stage_updater(payload):
 
     PyInstaller onefile 的 exe 拷到别处能独立运行（依赖解到 _MEIxxxx），
     已实测 22/22 自检通过，所以这条路是通的。
+
+    ⚠️ 残留清理（2026-10-13）：每次更新会在 %TEMP% 留一个 ~50MB 的目录。
+    替换器成功时自己会删（_cleanup_self），但**启动失败 / 被杀 / 崩**时
+    就永远留着 —— 用户机器上已积压 2 个共 100MB。这里在拷贝前先扫
+    一遍，把「本进程之外的、看起来没在跑的」旧目录清掉。
+    只删名字符合 `Yuhub_upd_<数字>` 的目录，且**跳过自己那个**，
+    不碰任何其他临时文件。
     """
     me = current_exe()
+    _sweep_stale_updater_dirs(keep_pid=os.getpid())
+
     d = os.path.join(tempfile.gettempdir(), "Yuhub_upd_%d" % os.getpid())
     os.makedirs(d, exist_ok=True)
     upd = os.path.join(d, "Yuhub_updater.exe")
@@ -919,38 +928,131 @@ def stage_updater(payload):
     return upd
 
 
+def _sweep_stale_updater_dirs(keep_pid=None, max_age=1800.0):
+    """清理 %TEMP% 下残留的替换器目录（保留 keep_pid 那个）。返回清理个数。
+
+    判据三条同时成立才删，避免误删正在用的：
+      * 目录名匹配 `Yuhub_upd_<pid>` 或 `Yuhub_upd_<pid>.exe` 形态；
+      * 不是本次要用的（keep_pid）；
+      * mtime 超过 max_age 秒（默认 30 分钟，给正在跑的替换器留足时间）。
+
+    删不掉的（文件还被占用）静默跳过 —— 真正的清理由替换器自己
+    在成功路径末尾完成，这里只是兜底。
+    """
+    tmp = tempfile.gettempdir()
+    now = time.time()
+    removed = 0
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("Yuhub_upd_"):
+            continue
+        tail = name[len("Yuhub_upd_"):].split(".")[0]
+        if not tail.isdigit():
+            continue
+        if keep_pid is not None and int(tail) == int(keep_pid):
+            continue
+        path = os.path.join(tmp, name)
+        try:
+            if (now - os.path.getmtime(path)) < max_age:
+                continue                  # 太新，可能正在替换
+        except OSError:
+            continue
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def launch_updater(updater_path, payload, elevated=False):
     """拉起替换器进程。返回 (ok, message)。
 
-    elevated=True 时走 ShellExecuteW("runas")——用于 exe 装在
-    Program Files 之类需要管理员权限才能改名的位置。
+    elevated=True 时走 ShellExecuteW("runas") —— 替换器副本带
+    requireAdministrator 清单时**必须**走这条，见 needs_elevation 的说明。
+
+    ⚠️ elevated=False 但启动仍被 Windows 拒绝（WinError 740）时，
+    自动回退到提权重试一次。以前这里是直接抛异常 → 消息弹一下 →
+    用户看到「窗口关了、版本没变」，自动更新等于静默失效。
     """
-    b64 = encode_payload(payload)
-    args = ["--apply-update", b64]
+    args = ["--apply-update", encode_payload(payload)]
 
     if elevated:
-        try:
-            import ctypes
-            SW_SHOWNORMAL = 1
-            r = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", updater_path, " ".join(args), None, SW_SHOWNORMAL)
-            if int(r) > 32:
-                return True, "已请求管理员权限启动更新"
-            return False, "提权启动失败（用户取消？）"
-        except Exception as e:
-            return False, "提权启动异常：%s" % (e,)
+        return _runas_launch(updater_path, args)
 
     try:
         subprocess.Popen([updater_path] + args,
                          creationflags=_CREATE_NO_WINDOW,
                          close_fds=True)
         return True, "更新程序已启动"
-    except Exception as e:
+    except OSError as e:
+        # 740 = ERROR_ELEVATION_REQUIRED：exe 自带 requireAdministrator，
+        # 非提权 CreateProcess 被拒。这是本项目的常态（uac_admin=True），
+        # 所以这里必须自动升级为提权启动，而不是把失败抛给用户。
+        if getattr(e, "winerror", None) == 740:
+            return _runas_launch(updater_path, args)
+        return False, "启动更新程序失败：%s" % (e,)
+    except Exception as e:  # noqa: BLE001
         return False, "启动更新程序失败：%s" % (e,)
 
 
-def needs_elevation(target_exe):
-    """目标 exe 所在目录是否不可写（需要提权才能改名）。"""
+def exe_requires_elevation(exe_path):
+    """这个 exe 自身是否带 requireAdministrator 清单。
+
+    ⚠️ 这与「目标目录能不能写」是**两件事**，混起来会让自动更新 100% 失效
+    （2026-10-13 用户实测：下载完成、程序关闭、版本没变）。
+
+    Yuhub.spec 里 `uac_admin=True`，产物清单写死了
+    `<requestedExecutionLevel level="requireAdministrator" />`
+    —— 也就是**任何进程启动它都必须提权**，哪怕它就躺在可写的桌面目录上。
+    原来的 `needs_elevation()` 只探测目录可写性，对桌面返回 False，
+    于是走 `subprocess.Popen`（不带 runas）去启动这个 exe，
+    Windows 直接拒绝：**WinError 740「请求的操作需要提升」**。
+    替换器根本没起来，而主窗口已经打出「正在更新」并开始退出，
+    用户看到的就是「下载完了、窗口关了、打开还是旧版」。
+
+    判据：读 PE 的 manifest。做法是搜 `requestedExecutionLevel` 附近的
+    `level="..."`，比解析完整清单轻量得多，且对 PyInstaller 产物可靠
+    （PyInstaller 把 XML 清单作为 RT_MANIFEST 资源嵌进去）。
+    读不到 / 不是 PE 一律返回 True —— 宁可多弹一次 UAC，
+    也不能让更新静默失败。
+    """
+    if not exe_path or not os.path.isfile(exe_path):
+        return False
+    try:
+        with open(exe_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return True                     # 读不到就按需要提权处理（保守）
+
+    # 快速排除：不是 PE 就不是我们要判断的东西
+    if b"requestedExecutionLevel" not in data:
+        return False
+    idx = data.find(b"requestedExecutionLevel")
+    window = data[idx:idx + 200].lower()
+    return b"requireadministrator" in window or b"highestavailable" in window
+
+
+def needs_elevation(target_exe, updater_exe=None):
+    """替换流程是否必须提权。
+
+    两个来源，任一成立就得提权：
+      * `updater_exe`（替换器副本）自身带 requireAdministrator 清单
+        —— 这是**常态**，因为它就是本程序自己的副本；
+      * `target_exe` 所在目录不可写（如装在 Program Files）。
+
+    ⚠️ 旧实现只看第二条，在桌面/下载目录这种可写位置会漏判，
+    而恰恰此时替换器副本仍要求提权 —— 于是必撞 740。
+    `updater_exe` 传 None 时退回只判目录（保持旧语义，供自检使用）。
+    """
+    if updater_exe and exe_requires_elevation(updater_exe):
+        return True
     d = os.path.dirname(os.path.abspath(target_exe)) or "."
     probe = os.path.join(d, ".yuhub_write_test_%d" % os.getpid())
     try:
@@ -962,7 +1064,110 @@ def needs_elevation(target_exe):
         return True
 
 
+def _quote_win_arg(a):
+    r"""把一个参数编码成 Windows 命令行里可安全传递的形式（加引号）。
+
+    ⚠️ 这个项目的两个参数里都有必须引起来的东西：base64 载荷含
+    `+` `/` `=`（尾部 `=` 尤其易被吃掉），而 Windows 路径
+    （形如 C:\Users\<用户名>\AppData\Local\...）含空格。
+    裸拼给 ShellExecuteW 会被 CommandLineToArgvW 按空格拆词，
+    替换器收到残缺载荷 → return 2 → 静默不更新。
+
+    规则（与 CRT / CommandLineToArgvW 一致）：整体加双引号，
+    内部出现的 `"` 与紧邻的反斜杠按 Windows 规则成对转义。
+    这里参数都是我们自己生成的（不含引号），但仍按完整规则实现，
+    避免以后有人往 launch_args 里塞带引号的值时静默出错。
+
+    ⚠️ 本 docstring 用 r 前缀：里面的 C:\Users 不是转义序列。
+    """
+    a = str(a)
+    out = ['"']
+    n_bs = 0                      # 连续反斜杠计数
+    for ch in a:
+        if ch == "\\":
+            n_bs += 1
+            continue
+        if ch == '"':
+            # n 个反斜杠 + 一个引号 → 2n 个反斜杠 + 一个转义引号
+            out.append("\\" * (n_bs * 2 + 1))
+            out.append('"')
+            n_bs = 0
+            continue
+        if n_bs:
+            out.append("\\" * n_bs)
+            n_bs = 0
+        out.append(ch)
+    # 收尾：结尾的反斜杠要双写，否则会转义掉闭合引号
+    if n_bs:
+        out.append("\\" * (n_bs * 2))
+    out.append('"')
+    return "".join(out)
+
+
+def _runas_launch(exe_path, args):
+    """用 ShellExecuteW(runas) 提权启动 exe。返回 (ok, message)。
+
+    ⚠️ 旧实现把参数用空格裸拼成字符串传给 lpParameters，
+    base64 载荷（含 `+` `/` `=`）与带空格的路径都会被拆词，
+    替换器收到残缺载荷直接 return 2。现在逐个参数加引号（见
+    _quote_win_arg），这是 lpParameters 唯一可行的传参方式。
+    """
+    SW_SHOWNORMAL = 1
+    params = " ".join(_quote_win_arg(a) for a in args)
+    try:
+        r = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", exe_path, params, None, SW_SHOWNORMAL)
+        if int(r) > 32:
+            return True, "已请求管理员权限启动更新"
+        # 5 = ERROR_ACCESS_DENIED，最常见的是用户在 UAC 上点了「否」
+        return False, "提权启动被拒绝（请在弹出的 UAC 窗口点「是」）"
+    except Exception as e:  # noqa: BLE001
+        return False, "提权启动异常：%s" % (e,)
+
+
 # ================================================================ 替换器侧
+
+def updater_log_path():
+    """替换器日志路径：%LOCALAPPDATA%\\Yuhub\\update\\replace.log。
+
+    ⚠️ 为什么必须有（2026-10-13 事故）：替换器是**独立的 GUI 子系统进程**，
+    它的一举一动对用户完全不可见 —— 窗口关了、版本没变，没有任何提示。
+    以前出问题时现场只剩两个 %TEMP% 残留目录，要靠推断才能定位。
+    现在每一步都写这里，下次再坏可以直接看这个文件。
+    """
+    d = update_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return ""
+    return os.path.join(d, "replace.log")
+
+
+_RC_MEANING = {
+    0: "成功：旧版已备份、新版已就位并启动",
+    2: "载荷解不开（base64/json 损坏）",
+    3: "文件缺失或路径非法（新包或目标 exe 不存在）",
+    4: "旧进程不退出，放弃替换（未动任何文件）",
+    5: "旧 exe 改名失败（权限不足或被占用）",
+    6: "新包就位失败，已回滚",
+    7: "新包启动失败，已回滚",
+    8: "新版秒退且非 0，已回滚",
+    9: "新包体检不合格，未动任何文件",
+}
+
+
+def _ulog(msg):
+    """写替换器日志（尽力而为，任何异常都不能影响替换主流程）。"""
+    p = updater_log_path()
+    if not p:
+        return
+    try:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("%s [%d] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                      os.getpid(), msg))
+    except OSError:
+        pass
+
 
 def apply_update_main(b64_payload):
     """`Yuhub.exe --apply-update <base64-json>` 模式（在 main() 里早返回）。
@@ -981,9 +1186,11 @@ def apply_update_main(b64_payload):
         8  新版秒退且非 0（已回滚）
         9  **新包体检不合格，未动任何文件**（损坏 / 架构不符）
     """
+    _ulog("替换器启动：argv 载荷长度=%d" % len(b64_payload or ""))
     try:
         p = decode_payload(b64_payload)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        _ulog("载荷解码失败：%r -> rc=2" % (exc,))
         return 2
 
     new_exe = p.get("new_exe") or ""
@@ -992,7 +1199,12 @@ def apply_update_main(b64_payload):
     do_backup = bool(p.get("backup", True))
     launch_args = p.get("launch_args") or []
 
+    _ulog("目标=%s 新包=%s 旧PID=%s 备份=%s"
+          % (target, new_exe, old_pid, do_backup))
+
     if not new_exe or not target or not os.path.isfile(new_exe):
+        _ulog("前置校验失败：新包存在=%s -> rc=3"
+              % (os.path.isfile(new_exe) if new_exe else False))
         return 3
 
     # ---- ⓪ 体检新包：不合格就地返回，一个文件都不动 ----
@@ -1003,14 +1215,20 @@ def apply_update_main(b64_payload):
     silence_loader_dialogs()               # 兜底：之后任何失败都不弹框
     fine, why = check_package_runnable(new_exe)
     if not fine:
+        _ulog("新包体检不合格：%s -> rc=9" % (why,))
         return 9
+    _ulog("新包体检通过：%d 字节" % (os.path.getsize(new_exe),))
 
     # ---- ① 等旧进程彻底退出 ----
     if old_pid and _pid_alive(old_pid):
+        _ulog("旧进程 %d 仍在，等待退出…" % old_pid)
         if not wait_pid_exit(old_pid, WAIT_OLD_PID_TIMEOUT):
+            _ulog("等待超时，强杀旧进程 %d" % old_pid)
             kill_pid(old_pid)             # 超时不退就强杀
             if not wait_pid_exit(old_pid, 5.0):
+                _ulog("强杀后旧进程仍存活 -> rc=4（不动文件）")
                 return 4                  # 还是活着，放弃（不动文件，保证可回退）
+    _ulog("旧进程已退出")
 
     bak = target + ".bak"
 
@@ -1019,12 +1237,14 @@ def apply_update_main(b64_payload):
     if os.path.exists(bak):
         try:
             os.remove(bak)
+            _ulog("删除残留 .bak：成功")
         except OSError:
             # 删不掉就改个名让开位置，避免下面 rename 失败
             try:
                 os.replace(bak, bak + ".%d" % int(time.time()))
-            except OSError:
-                pass
+                _ulog("残留 .bak 改名让位：成功")
+            except OSError as e:
+                _ulog("残留 .bak 让位也失败 winerror=%s" % (e.winerror,))
 
     # ---- ③ 两步改名（本方案的核心）----
     # 运行中的 exe 不能覆盖写，但可以改名（只改目录项，不动内容）。
@@ -1033,16 +1253,21 @@ def apply_update_main(b64_payload):
             os.rename(target, bak)        # 旧 → .bak
         else:
             os.remove(target)
+        _ulog("③a 旧版改名/删除：成功（备份=%s）" % do_backup)
     except OSError as e:
+        _ulog("③a 失败 winerror=%s %s -> rc=5" % (e.winerror, e))
         return 5                          # 连改名都失败：权限/占用，保持原样退出
 
     try:
         os.replace(new_exe, target)       # 新 → 原路径
+        _ulog("③b 新包就位：成功")
     except OSError as e:
         # 新文件就位失败 → 回滚旧版，保证用户至少还能用
+        _ulog("③b 失败 winerror=%s %s -> 回滚 -> rc=6" % (e.winerror, e))
         try:
             if do_backup and os.path.exists(bak):
                 os.replace(bak, target)
+                _ulog("回滚成功")
         except OSError:
             pass
         return 6
@@ -1052,8 +1277,10 @@ def apply_update_main(b64_payload):
         proc = subprocess.Popen([target] + list(launch_args),
                                 cwd=os.path.dirname(target) or None,
                                 close_fds=True)
-    except Exception:
+        _ulog("④ 新版已启动 pid=%d" % (proc.pid,))
+    except Exception as e:
         # 打不开新版 → 回滚
+        _ulog("④ 启动新版异常 %r -> 回滚 -> rc=7" % (e,))
         _rollback(bak, target, do_backup)
         return 7
 
@@ -1065,6 +1292,8 @@ def apply_update_main(b64_payload):
         code = None                       # 活着超过宽限期，认为正常
 
     if code is not None and code != 0:
+        _ulog("⑤ 新版 %s 秒内退出，码=%s -> 回滚 -> rc=8"
+              % (NEW_EXE_GRACE, code))
         try:
             proc.kill()
         except Exception:
@@ -1083,6 +1312,7 @@ def apply_update_main(b64_payload):
         for _ in range(5):
             try:
                 os.remove(bak)
+                _ulog("⑥ 删除 .bak：成功")
                 break
             except OSError:
                 time.sleep(0.4)
@@ -1090,6 +1320,7 @@ def apply_update_main(b64_payload):
     # ---- ⑦ 清理自己的临时目录 ----
     _cleanup_self()
 
+    _ulog("替换完成 rc=0 —— %s" % (_RC_MEANING.get(0),))
     return 0
 
 

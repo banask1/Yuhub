@@ -320,6 +320,37 @@
 #        绘制带余量 11% → 15%（否则加大的摆幅会把尾巴切掉）；池内边距
 #        26px → 30px（贴边的鱼摆尾会甩出池外）；推进起伏 ±14% → ±11%
 #        （幅度大了再叠一层明显加减速就显出"一鼓一鼓"的机械感）。
-VERSION = "1.1.2"
+# 1.1.3：修「**自动更新完全失效**」（用户实测：v1.1 里下载完更新包，
+#      程序关了、版本没变、再打开还是 v1.1）。**从 v1.0 起就一直是坏的**，
+#      此前没人报告是因为下载环节确实正常，只有最后一步替换在静默失败。
+#      根因（已实测复现，非推理）：**用非提权方式启动了一个带
+#      `requireAdministrator` 清单的 exe，Windows 直接拒绝**——
+#      `WinError 740「请求的操作需要提升」`，替换器**从未真正运行**。
+#      三个缺陷叠加：
+#      ① `needs_elevation()` 只探测**目标目录能不能写**。exe 躺在桌面这类
+#         可写目录 → 返回 False → 走 `subprocess.Popen`（不带 runas）去启动
+#         替换器副本。而副本是**本程序自己的拷贝**，`Yuhub.spec` 的
+#         `uac_admin=True` 让它带上了 requireAdministrator 清单 ——
+#         **"副本需要提权"与"目标目录可写"是两件事**，混在一起必然漏判。
+#         实测对照：旧语义 False（漏判）→ 新语义 True（正确）。
+#      ② `elevated=True` 分支把参数用空格**裸拼**成字符串传给
+#         `ShellExecuteW` 的 lpParameters。base64 载荷含 `+` `/` `=`、
+#         路径还含空格 → 被 CommandLineToArgvW 拆词 → 替换器收到残缺载荷
+#         → return 2。改用 `_quote_win_arg()` 逐参数按 Windows 规则加引号。
+#      ③ 失败对用户**完全静默**：740 被 `except Exception` 吞成一句 toast，
+#         而主窗口此时已打出「正在更新」并开始退出 —— 用户看到的是
+#         「窗口关了、版本没变」，没有任何可查线索。
+#      修：`exe_requires_elevation()` 直接读 PE 清单里的
+#      requestedExecutionLevel（读不到一律按需要提权处理，宁可多弹一次
+#      UAC 也不静默失败）；`launch_updater` 非提权路径遇 740 **自动升级为
+#      提权重试**（740 本就是这个项目的常态，不该当异常抛给用户）。
+#      ⚠️ 附带：替换器是独立的 GUI 子系统进程，天然静默 —— 新增
+#      `%LOCALAPPDATA%\Yuhub\update\replace.log`，把每一步与返回码落盘
+#      （`_RC_MEANING` 表给出 0~9 各自的含义），下次再坏可直接查证。
+#      附带清理：每次更新在 %TEMP% 留一个 ~50MB 的 `Yuhub_upd_<pid>`，
+#      替换器成功时自删，但**启动失败/被杀/崩溃时就永久残留**
+#      （本机已积压 2 个共 100MB）。`stage_updater` 拷贝前先扫一遍，
+#      只删「非本进程 + 超过 30 分钟」的同名目录（`_sweep_stale_updater_dirs`）。
+VERSION = "1.1.3"
 VERSION_LABEL = f"v{VERSION} 正式版"
 APP_NAME = "Yuhub"

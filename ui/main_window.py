@@ -1052,7 +1052,12 @@ class MainWindow(QWidget):
                 new_version=info.tag,
             )
             staged = updater.stage_updater(payload)
-            need_admin = updater.needs_elevation(payload["target_exe"])
+            # ⚠️ 必须把 staged（替换器副本）传进去判提权：副本带
+            # requireAdministrator 清单，跟目标目录可不可写无关。
+            # 漏传会让桌面/下载目录这种可写位置判成"不需要提权"，
+            # 非提权启动副本 → WinError 740 → 自动更新静默失效。
+            need_admin = updater.needs_elevation(payload["target_exe"],
+                                                 updater_exe=staged)
             ok, msg = updater.launch_updater(staged, payload, elevated=need_admin)
         except Exception as e:
             show_toast(self, "启动更新失败：%s" % (e,))
