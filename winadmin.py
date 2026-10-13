@@ -29,7 +29,17 @@ import sys
 IS_WIN = sys.platform.startswith("win")
 
 _TOKEN_QUERY = 0x0008        # TOKEN_QUERY
-_TOKEN_ELEVATION = 20        # TokenElevation
+# 🔴 这个常量**绝对不能**再叫 _TOKEN_ELEVATION —— 下面那个结构体同名，会把
+#    它的数值覆盖成"类对象"。真实事故（2026-10-13，别的电脑上报"明明要求
+#    管理员启动，却说未以管理员权限运行"）就是这么来的：
+#      常量先定义 → class _TOKEN_ELEVATION 把它顶掉 → GetTokenInformation 的
+#      第二个参数（要求 int 的 TOKEN_INFORMATION_CLASS）收到一个类对象 →
+#      ctypes 抛 TypeError → 外层 `except Exception: return None` 把它当
+#      "API 不可用"吞掉 → is_elevated() **在任何机器上恒为 False**。
+#    而它绝不报错：内存优化不再做系统级清理、C盘清理里需要管理员的规则被
+#    静默跳过、卸载残留不再走 take-ownership —— 全是"看着正常、其实没做"。
+#    名字上带 _CLASS 就再也不会撞。
+_TOKEN_ELEVATION_CLASS = 20  # TokenElevation（TOKEN_INFORMATION_CLASS 枚举值）
 
 
 class _TOKEN_ELEVATION(ctypes.Structure):        # noqa: N801
@@ -37,7 +47,14 @@ class _TOKEN_ELEVATION(ctypes.Structure):        # noqa: N801
 
 
 def _token_elevated():
-    """GetTokenInformation(TokenElevation)。API 不可用/失败返回 None。"""
+    """GetTokenInformation(TokenElevation)。
+
+    返回 True / False；**只有 API 真的不可用时才返回 None**。
+    ⚠️ 注意别把"写错了"和"问不到"混为一谈：调用参数写错会抛 TypeError，
+    被下面的 except 吞成 None，于是上层把它当成"未提权"，一路静默失效。
+    所以 selftest 里有一条断言专门盯 `isinstance(_token_elevated(), bool)`
+    —— 那是这个坑唯一守得住的防线。
+    """
     try:
         k32 = ctypes.windll.kernel32
         a32 = ctypes.windll.advapi32
@@ -60,7 +77,7 @@ def _token_elevated():
             val = _TOKEN_ELEVATION()
             need = ctypes.c_uint32()
             if not a32.GetTokenInformation(
-                    handle, _TOKEN_ELEVATION, ctypes.byref(val),
+                    handle, _TOKEN_ELEVATION_CLASS, ctypes.byref(val),
                     ctypes.sizeof(val), ctypes.byref(need)):
                 return None
             return bool(val.TokenIsElevated)

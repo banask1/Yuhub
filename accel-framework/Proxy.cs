@@ -271,6 +271,11 @@ internal static class Proxy
             var (ok, msg) = Hosts.Apply(map);
             Console.WriteLine(msg);
             if (!ok) return 5;
+            // 落盘"脏标记"：从这一刻起 hosts 已被改写，之后任何一条退出路径都必须
+            // 把它还原、把标记抹掉（还原点有三处：下面的 catch / finally，以及
+            // Program.Main 的顶层兜底）。谁都没来得及跑的场景（AOT fail-fast、
+            // 任务管理器强杀）由 Yuhub 侧靠这枚标记识别并自动收拾。
+            Hosts.MarkDirty();
         }
 
         // ---- ③ 起本地 443 ----
@@ -343,20 +348,19 @@ internal static class Proxy
                 Console.Error.WriteLine(
                     "端口 443 已被占用：可能是上一次的加速内核还没退出，"
                     + "请先在 Yuhub 里点「停止加速」或重启电脑后再试。");
-            if (hostsMode == "hosts")
-            {
-                Hosts.Clean();
-                Console.WriteLine("已清理 hosts");
-            }
-            try { File.Delete(pidPath); } catch { }
-            return 6;
+            return 6;                 // 还原交给下面的 finally，不要写两遍
         }
         finally
         {
+            // 🔴 收尾必须放在 finally 里：正常停止、启动失败、转发期异常三条路
+            //    都要走到这里。留一个"域名指向 127.0.0.1、443 却没人监听"的
+            //    hosts 状态，等于把用户所有相关网页一起打挂。
             if (hostsMode == "hosts")
             {
-                Hosts.Clean();
-                Console.WriteLine("已清理 hosts");
+                var (okC, msgC) = Hosts.Clean();
+                Console.WriteLine(okC ? "已清理 hosts" : "清理 hosts 失败：" + msgC);
+                // 只有真还原成功才抹标记；失败就把它留着，让 Yuhub 下次重试
+                if (okC) Hosts.ClearDirty();
             }
             try { File.Delete(pidPath); } catch { }
         }

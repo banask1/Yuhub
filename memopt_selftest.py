@@ -301,6 +301,28 @@ def _run_all(mark):
          len(memopt.list_processes()) >= len(before) - 3,
          "%d -> %d" % (len(before), len(memopt.list_processes())))
 
+    # 🔴 真·绊线：直接问 winadmin 要一次 TokenElevation，断言**确实拿到了布尔**。
+    #    2026-10-13 的事故：winadmin 里 `_TOKEN_ELEVATION = 20` 这个常量被下面
+    #    同名的结构体类顶掉，GetTokenInformation 的第二参数（要求 int）收到一个
+    #    类对象 → ctypes 抛 TypeError → 被 except 吞成 None → is_elevated()
+    #    **在任何机器上恒为 False**。后果全是静默的：内存优化不再做系统级清理、
+    #    C盘清理里需要管理员的规则被跳过、卸载残留不再 takeown —— 而界面上只
+    #    显示一句"当前未以管理员权限运行"。
+    #    为什么原来的断言守不住：本套件其它涉及权限的断言不是打桩
+    #    (memopt.is_admin = lambda: True)，就是自洽比较（下面那条比的也是
+    #    同一次调用，两边一起错就一起"通过"）。所以必须真调用 + 判类型：
+    #    API 真的不可用时它返回 None，那正是"提权判定已失效"的现场，必须红。
+    try:
+        import winadmin as _wa
+        _tev = _wa._token_elevated()
+        mark("★ 提权判定真的能拿到布尔（TokenElevation 未被静默降级）",
+             isinstance(_tev, bool),
+             "_token_elevated() = %r（type=%s；None = API 调用失败/参数写错）"
+             % (_tev, type(_tev).__name__))
+    except Exception as _exc:                                  # noqa: BLE001
+        mark("★ 提权判定真的能拿到布尔（TokenElevation 未被静默降级）",
+             False, "winadmin 不可用：%r" % (_exc,))
+
     ops = res.get("system_ops") or {}
     # 这两条分支互斥：管理员下跑 3 条真·系统调用断言，非管理员下跑 2 条
     # "如实标记 skip" 断言。所以本套件总数会随进程提权状态变化（103/104）。

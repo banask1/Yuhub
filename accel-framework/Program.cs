@@ -24,19 +24,49 @@ internal static class Program
         try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
         var cmd = args.Length > 0 ? args[0].TrimStart('-').ToLowerInvariant() : "help";
 
-        return cmd switch
+        // 🔴 顶层兜底：Native AOT 的未捕获异常会以 **fail-fast（0xc0000409）** 收场 ——
+        //    Windows 会弹"基于堆栈的缓冲区溢出"这种恐吓对话框，而且**一个字都留不下**
+        //    （本体是 GUI 子系统，stderr 根本没人接）。别的电脑上"加速框架没跑起来"
+        //    却拿不到任何线索，根因就在这里没兜住。
+        //    现在一律转成一行可读的 EXC + 退出码 8，由 Yuhub 写进 serve.log。
+        //
+        //    同时**尽力还原 hosts**：异常可能发生在"已经写好 hosts、内核却没起来"
+        //    之后，那正是最坏的状态（所有加速域名被指向 127.0.0.1，而 443 上没人
+        //    监听 → 浏览器/Steam 直接打不开页面）。这里不是万无一失（fail-fast
+        //    本身拦不住），所以还有一层落盘标记 `hosts_dirty` 给 Yuhub 侧兜底。
+        try
         {
-            "gen-ca" => GenCa(),
-            "status" => args.Length > 1 && args[1].TrimStart('-').ToLowerInvariant() == "json"
-                        ? StatusJson() : Status(),
-            "install-ca" => InstallCa(),
-            "uninstall-ca" => UninstallCa(),
-            "issue" => Issue(args.Length > 1 ? args[1] : ""),
-            "serve" => Proxy.RunAsync(args.Skip(1).ToArray()).GetAwaiter().GetResult(),
-            "hosts-clean" => HostsClean(),
-            "help" or "" => Help(),
-            _ => Unknown(cmd),
-        };
+            return cmd switch
+            {
+                "gen-ca" => GenCa(),
+                "status" => args.Length > 1 && args[1].TrimStart('-').ToLowerInvariant() == "json"
+                            ? StatusJson() : Status(),
+                "install-ca" => InstallCa(),
+                "uninstall-ca" => UninstallCa(),
+                "issue" => Issue(args.Length > 1 ? args[1] : ""),
+                "serve" => Proxy.RunAsync(args.Skip(1).ToArray()).GetAwaiter().GetResult(),
+                "hosts-clean" => HostsClean(),
+                "help" or "" => Help(),
+                _ => Unknown(cmd),
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"EXC {cmd}：{ex.GetType().Name}: {ex.Message}");
+            if (cmd == "serve" && !args.Contains("--no-hosts"))
+            {
+                try
+                {
+                    var (ok, _m) = Hosts.Clean();
+                    if (ok) Hosts.ClearDirty();
+                    Console.Error.WriteLine(ok
+                        ? "异常退出：已还原 hosts"
+                        : "异常退出：hosts 还原失败（请到 Yuhub 网络加速页点「一键修复」）");
+                }
+                catch { }
+            }
+            return 8;
+        }
     }
 
     // ---------------------------------------------------------------- 命令
@@ -94,6 +124,9 @@ internal static class Program
     private static int HostsClean()
     {
         var (ok, msg) = Hosts.Clean();
+        // 还原成功 = 状态回到干净起点 → 顺手抹掉"脏退"标记，
+        // 否则 Yuhub 下次进页面还会把它当成"上次异常退出"再报一次。
+        if (ok) Hosts.ClearDirty();
         Console.WriteLine((ok ? "[OK] " : "[失败] ") + msg);
         return ok ? 0 : 1;
     }

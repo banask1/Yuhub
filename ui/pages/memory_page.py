@@ -202,6 +202,10 @@ class IntervalPicker(QFrame):
         self.spin.setRange(MIN_MINUTES, MAX_MINUTES)
         self.spin.setSuffix(" 分钟")
         self.spin.setFixedWidth(104)
+        # 定高：QSpinBox 没有 #IntervalSpin 的 QSS 规则，天然 sizeHint 只有
+        # 20px（旁边的挡位按钮是 30px）——文字会被上下裁掉，看着像空框
+        #（用户报的"自定义时间显示不全"）。取 30 与挡位按钮对齐。
+        self.spin.setFixedHeight(30)
         self.spin.setAlignment(Qt.AlignCenter)
         # 极简色块风格不要那对系统小箭头。QSS 里也压了一道 width:0，
         # 但 Qt 对 QSpinBox 子控件的样式匹配不如代码可靠，这里直接关掉。

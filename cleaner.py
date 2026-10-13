@@ -1597,32 +1597,93 @@ def _dism_output_text(raw: bytes) -> str:
     return raw.decode("utf-8", "ignore")
 
 
-def _parse_dism_size(text: str) -> int:
-    """从 AnalyzeComponentStore 输出里取「实际大小」。
+#: DISM 体积数字 + 单位。单位认 GB/MB/KB（西文）与「字节」（中文），
+#: 大小写不敏感。数字部分允许千位分隔符与小数点（中英文系统分别用 , 或 .）。
+_DISM_NUM_RE = re.compile(
+    r"(\d[\d.,]*)\s*(GB|MB|KB|字节|BYTES)", re.IGNORECASE)
 
-    输出里有多个体积数字（组件存储总大小 / 实际大小 / 与 Windows 共享 /
-    备份和已禁用功能 / 缓存和临时数据），第一个是**总大小**而非可回收量，
-    直接取第一个会严重虚高。优先匹配「实际大小 / Actual Size」那一行的
-    数字；匹配不到再退回第一个体积（作为上限估算并如实告知）。
+
+def _dism_to_bytes(val_s: str, unit_s: str) -> int:
+    """把 DISM 输出的本地化体积数字转成字节。
+
+    不同系统区域设置下，小数/千位分隔符可能是「.」也可能是「,」：
+      美/中：  1,234.56 GB   → 1234.56
+      欧陆：    1.234,56 GB   → 1234.56
+    先归一化再转 float，避免中文/欧陆系统上把「4,55 GB」解析成 0。
     """
-    candidates = re.findall(r"(\d+(?:\.\d+)?)\s*(GB|MB|KB)", text, re.IGNORECASE)
-    if not candidates:
+    s = val_s.strip()
+    if "," in s and "." in s:
+        # 谁在最后谁就是小数点
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        # 单独逗号：逗号后仅 1~3 位数字视为小数点，否则是千位分隔符
+        head, _, tail = s.rpartition(",")
+        if tail.isdigit() and len(tail) in (1, 2, 3):
+            s = head + "." + tail
+        else:
+            s = s.replace(",", "")
+    mult = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3,
+            "字节": 1, "BYTES": 1}
+    try:
+        return int(float(s) * mult[unit_s.upper()])
+    except (ValueError, KeyError):
         return 0
 
-    def _to_bytes(val_s, unit_s):
-        mult = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}[unit_s.upper()]
-        try:
-            return int(float(val_s) * mult)
-        except ValueError:
-            return 0
 
-    # 找「实际大小」关键词所在行里的体积（中英文系统都认）
+def _parse_dism_size(text: str) -> int:
+    """从 AnalyzeComponentStore 输出里估算「可回收量」。
+
+    DISM **不会**直接告诉你「能清理多少」，只给出组件存储各分项体积：
+      * 组件存储目录大小   —— 含硬链接的总占用（虚高，不能当可回收量）
+      * 实际大小         —— 去重后的真实占用（可作为可回收上限）
+      * 备份和已禁用的功能 —— 保留给「卸载更新 / 回退」的旧版本（ResetBase 才清）
+      * 缓存和临时数据     —— 临时缓存
+    最贴近「被取代组件」可清理量的是「备份和已禁用的功能 + 缓存和临时数据」，
+    取不到时退回「实际大小」作为上限估计（并如实标注为估计）。
+
+    ⚠️ 中文 DISM 的字段是「备份和已禁**用**的功能」（中间有个"的"）——早期
+    只写了「备份和已禁用功能」，匹配失败就退回「实际大小」→ 把整个组件存储
+    （含 8GB 硬链接共享部分）误报成可清理量，这就是"11GB 被取代组件清不掉"
+    的由来。这里同时认「已禁用的功能」这个更短的关键词。
+
+    ★ 以 CBS 的判定为准（保证"扫得出来 = 清得掉"）：`AnalyzeComponentStore`
+    会给出「可回收的程序包数」和「推荐使用组件存储清理」两项。当可回收包数为
+    0（或明确"不推荐清理"）时，**直接返回 0** —— 因为删掉 WinSxS 的"幽灵包"
+    之后，CBS 就报"可回收:0/不推荐清理"，而「备份和已禁用的功能」里仍有 2GB+
+    的**不可回收保留负载**（可选功能暂存负载 / 系统基线包）；若照旧把这些报成
+    可清理，就会出现"扫描得到、点了清不掉"。不报 = 不误导。
+    """
+    if re.search(r"可回收的程序包数\s*[:：]\s*0(?:\D|$)", text) or \
+            re.search(r"Reclaimable\s+Packages\s*[:：]\s*0(?:\D|$)",
+                      text, re.IGNORECASE) or \
+            re.search(r"推荐使用组件存储清理\s*[:：]\s*否", text) or \
+            re.search(r"Cleanup\s+Recommended\s*[:：]\s*No",
+                      text, re.IGNORECASE):
+        return 0
+    actual = None
+    reclaim = 0
     for line in text.splitlines():
-        if re.search(r"实际大小|Actual\s+Size", line, re.IGNORECASE):
-            m = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB|KB)", line, re.IGNORECASE)
+        if actual is None and re.search(
+                r"实际大小|Actual\s*Size|组件存储实际大小", line, re.IGNORECASE):
+            m = _DISM_NUM_RE.search(line)
             if m:
-                return _to_bytes(m.group(1), m.group(2))
-    return _to_bytes(*candidates[0])
+                actual = _dism_to_bytes(m.group(1), m.group(2))
+        for key in ("已禁用的功能", "备份和已禁用功能", "Backups and disabled",
+                    "缓存和临时数据", "Cache and temporary"):
+            if re.search(key, line, re.IGNORECASE):
+                m = _DISM_NUM_RE.search(line)
+                if m:
+                    reclaim += _dism_to_bytes(m.group(1), m.group(2))
+                break
+    if reclaim > 0:
+        return reclaim
+    if actual:
+        return actual
+    m = _DISM_NUM_RE.search(text)
+    return _dism_to_bytes(m.group(1), m.group(2)) if m else 0
 
 
 #: DISM 分析结果缓存（TTL 秒）。`Dism /AnalyzeComponentStore` 单项要
@@ -1664,8 +1725,68 @@ def _dism_component_scan(force=False) -> int:
     return val
 
 
+def _dism_deeply_superseded_packages(log_path=None) -> list:
+    """从 CBS.log 里找出「top-level 且 deeply superseded」的包名。
+
+    Windows 11 24H2 起有个已知问题：`AnalyzeComponentStore` 会把安装介质自带
+    的几个旧包（典型是 `Package_for_RollupFix~...26100.1742.1.10` 及其子包
+    `Microsoft-Windows-FodMetadataServicing-Desktop-Metadata-Package~...26100.1742`）
+    算作"可回收"，但 `StartComponentCleanup`（含 /ResetBase）**永远不删**它们
+    （CBS 判定 targeted: Staged）——于是"扫描得出来、清不掉"。
+
+    社区验证（ElevenForum / Ed Tittel，2025-03）唯一可靠的回收办法：显式
+    `Dism /Online /Remove-Package /PackageName:<名字>`，删父包会连子包一起删，
+    之后再 StartComponentCleanup 回收；且"即使不是元凶，该命令也只会失败而
+    不会破坏组件存储"。
+
+    包名只在 CBS.log 里以「is a top-level package and is deeply superseded」
+    的形式出现，故从日志尾部解析（AnalyzeComponentStore 会重新写一遍）。
+    """
+    log = log_path or os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "Logs", "CBS", "CBS.log")
+    if not os.path.isfile(log):
+        return []
+    try:
+        with open(log, "r", encoding="utf-8", errors="ignore") as fp:
+            tail = fp.readlines()[-4000:]
+    except OSError:
+        return []
+    names = []
+    pat = re.compile(
+        r"\[([^\]]+?)\]\s+is a top-level package and is deeply superseded")
+    for line in tail:
+        m = pat.search(line)
+        if m:
+            nm = m.group(1).strip()
+            if nm and "~" in nm and nm not in names:
+                names.append(nm)
+    return names
+
+
 def _dism_component_clean(res: CleanResult, cancel=None, progress=None):
-    """DISM 组件清理（对应 DismComponentCleanup，不带 /ResetBase）。"""
+    """被取代的 WinSxS 组件清理（外层包装：清理后失效分析缓存）。
+
+    清理会改变组件存储，必须让 10 分钟的分析缓存失效，否则清理后的自动重扫
+    会拿到旧值（"明明清干净了还显示原大小"）。
+    """
+    try:
+        _dism_component_clean_impl(res, cancel=cancel, progress=progress)
+    finally:
+        _DISM_CACHE["t"] = 0.0
+
+
+def _dism_component_clean_impl(res: CleanResult, cancel=None, progress=None):
+    """被取代的 WinSxS 组件清理。
+
+    做法（2026-10-13，依据社区验证的 Windows 11 24H2 修复方法）：
+      ① 先刷新分析：`AnalyzeComponentStore` 会把「deeply superseded」的包名写进
+         CBS.log，供下一步解析（这正是"幽灵可回收包"的来源）。
+      ② 显式删除幽灵包：安装介质自带的旧包（Package_for_RollupFix~… 及其子包
+         FodMetadataServicing~…）StartComponentCleanup **永不删**，只能用
+         `Dism /Online /Remove-Package /PackageName:<名字>`；删父包连子包一起删。
+      ③ `StartComponentCleanup /ResetBase`（失败退回标准清理）回收释放的空间。
+    释放量不靠估算，而由 clean_rule 用真实磁盘可用空间变化（disk_delta）回填。
+    """
     dism = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                         "System32", "Dism.exe")
     if not os.path.isfile(dism):
@@ -1673,27 +1794,81 @@ def _dism_component_clean(res: CleanResult, cancel=None, progress=None):
         res.failed = 1
         return
     if progress:
-        progress("DISM 组件清理（可能持续数分钟到几十分钟）")
+        progress("DISM 组件清理（可能持续数分钟到几十分钟，期间请勿关机）")
+
+    def _run(args, timeout=7200):
+        try:
+            return subprocess.run(
+                [dism] + args, capture_output=True, timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
+            ), None
+        except subprocess.TimeoutExpired:
+            return None, "timeout"
+        except Exception as exc:                            # noqa: BLE001
+            return None, str(exc)
+
+    def _errline(r):
+        err = _dism_output_text((r.stderr if r is not None else b"") or b"")
+        for line in err.splitlines():
+            if re.search(r"0x|错误|error|无法|失败|pending|reboot|重新启动",
+                         line, re.IGNORECASE):
+                return line.strip()[:200]
+        return ""
+
+    # ---- ① 刷新分析，让 CBS.log 写下 deeply superseded 的包名 ----
     try:
-        r = subprocess.run(
-            [dism, "/Online", "/Cleanup-Image", "/StartComponentCleanup"],
-            capture_output=True, timeout=7200,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
-        )
-        if r.returncode == 0:
-            res.freed = res.estimated
-            res.removed_bytes = res.estimated
-            res.verified = False      # DISM 不会逐项报告，按分析估算
-            res.messages.append("DISM 组件清理完成，释放量按分析值估算")
+        _dism_component_scan(force=True)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    # ---- ② 显式删除「deeply superseded」幽灵包（StartComponentCleanup 不删）----
+    try:
+        ghosts = _dism_deeply_superseded_packages()
+    except Exception:                                        # noqa: BLE001
+        ghosts = []
+    removed = []
+    for nm in ghosts:
+        if progress:
+            progress("移除幽灵组件包 %s…" % nm.split("~")[0])
+        r, _e = _run(["/Online", "/Remove-Package", "/PackageName:" + nm,
+                      "/NoRestart"])
+        if r is not None and r.returncode == 0:
+            removed.append(nm)
         else:
-            res.failed = 1
-            res.messages.append(f"DISM 返回码 {r.returncode}，清理未完成")
-    except subprocess.TimeoutExpired:
-        res.failed = 1
-        res.messages.append("DISM 清理超时（>2 小时），已中止等待")
-    except Exception as exc:
-        res.failed = 1
-        res.messages.append(f"异常：{exc}")
+            res.messages.append(
+                "移除包 %s 未成功（返回码 %s）"
+                % (nm, None if r is None else r.returncode))
+    if removed:
+        res.messages.append("已移除 %d 个幽灵组件包" % len(removed))
+
+    # ---- ③ 组件清理（含 ResetBase，失败降级为标准清理）----
+    r1, e1 = _run(["/Online", "/Cleanup-Image",
+                   "/StartComponentCleanup", "/ResetBase"])
+    if r1 is not None and r1.returncode == 0:
+        res.verified = False      # 释放量由磁盘实际变化回填
+        res.messages.append("DISM 组件清理完成（含重置组件存储，已无法卸载更新）")
+        return
+    # 带 /ResetBase 失败（挂起更新、组件存储被维护…）→ 退回标准清理再试
+    if progress:
+        progress("重置组件存储未完成，改用标准清理再试一次…")
+    r2, e2 = _run(["/Online", "/Cleanup-Image", "/StartComponentCleanup"])
+    if r2 is not None and r2.returncode == 0:
+        res.verified = False
+        res.messages.append("DISM 组件清理完成（标准模式，未重置组件存储）")
+        reason = _errline(r1) or ("超时" if e1 == "timeout" else "")
+        if reason:
+            res.messages.append("  重置失败原因：" + reason)
+        return
+    # 两次都失败：如实汇报，并给出关键错误行
+    res.failed = 1
+    res.messages.append(
+        "DISM 清理未完成（返回码 %s / %s）"
+        % (None if r1 is None else r1.returncode,
+           None if r2 is None else r2.returncode))
+    reason = (_errline(r1) or _errline(r2)
+              or ("超时" if "timeout" in (e1, e2) else (e1 or e2 or "")))
+    if reason:
+        res.messages.append("  " + reason)
 
 
 def _stop_service(names, start=False):
@@ -1901,16 +2076,37 @@ def clean_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
     after = drive_space(drive)["free_bytes"]
     res.disk_delta = after - before
 
+    # 结论口径：以「真实被删对象体积」为准；特殊条目（DISM/还原点）无法逐项
+    # 计数，改用「磁盘可用空间真实变化」回填——这比估计值诚实。
     res.freed = res.removed_bytes
-    if res.removed_bytes == 0 and res.estimated > 0 and res.removed_count == 0 \
-            and not res.verified:
-        # 特殊条目失败（DISM 出错等）：如实报告
-        res.freed = 0
-    if res.removed_bytes == 0 and res.estimated > 0 and res.removed_count == 0 \
-            and res.verified and rule.special not in _SPECIALS:
-        res.verified = False
-        if not any("失败" in m or "占用" in m for m in res.messages):
-            res.messages.append("未能删除任何对象（可能被占用或权限不足）")
+    if res.removed_bytes == 0 and res.disk_delta > 0:
+        res.freed = res.disk_delta
+        res.verified = True
+    if res.freed == 0 and res.estimated > 0 and res.removed_count == 0:
+        # 真的一字节都没释放：如实说明，而不是把估计值当成果。
+        hit = any(re.search(r"失败|占用|无法|未完成|异常|超时", m)
+                  for m in res.messages)
+        if rule.special not in _SPECIALS and res.verified:
+            # 普通目录条目：扫描说有、却删不动 → 多半被占用/权限不足
+            res.verified = False
+            if not hit:
+                res.messages.append("未能删除任何对象（可能被占用或权限不足）")
+        else:
+            # 特殊条目（DISM 等）：命令成功但磁盘没变化
+            if not hit:
+                if rule.special == "dism_component":
+                    # 实测（2026-10-13）：DISM 报成功却一字节没释放，不是程序的
+                    # 问题——组件存储里的「备份和已禁用的功能」多为**可选功能
+                    # (FOD) 的暂存负载**与**系统基线包**，CBS 会主动跳过/保留
+                    # （日志原文：Skip FODs ... state: Staged / targeted: Staged）。
+                    # 如实告诉用户，别让他以为是清理失败。
+                    res.messages.append(
+                        "DISM 报告成功，但系统未释放空间：这部分是可选功能(FOD)"
+                        "暂存负载与系统基线包，Windows 会主动保留，组件清理"
+                        "（含 /ResetBase）不会删除它们")
+                else:
+                    res.messages.append("无可清理内容")
+            res.verified = False
     return res
 
 

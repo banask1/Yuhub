@@ -60,8 +60,8 @@ from .base_page import BasePage
 #: 不能直接跑 _MEIPASS 里的临时文件：程序一退出就被清掉，serve 也活不过本体）。
 _FRAMEWORK_DIR = r"%LOCALAPPDATA%\Yuhub\accel"
 _FRAMEWORK_EXE = "YuhubAccel.exe"
-#: 实测体积（win-x64 / Native AOT 单文件），用于文案里的预期管理
-_FRAMEWORK_SIZE = "2.69 MB"
+#: 实测体积（win-x64 / Native AOT 单文件，含 YARP + HTTPS），用于文案里的预期管理
+_FRAMEWORK_SIZE = "11.1 MB"
 
 #: 设置键：用户勾选的平台
 _SETTINGS_KEY = "accel/services"
@@ -72,6 +72,11 @@ _CREATE_NO_WINDOW = 0x08000000
 #: 加速内核（serve）的 pid 文件与运行日志 —— 框架启动时写、退出时删
 _PID_NAME = "serve.pid"
 _LOG_NAME = "serve.log"
+#: 「hosts 已被改写」的脏标记。**必须与框架 Hosts.DirtyFlagPath 同名同目录**
+#: （框架写、Yuhub 读；改单边等于这条防线直接失效）。
+_DIRTY_NAME = "hosts_dirty"
+#: hosts 里本框架标记块的开头（判"hosts 到底写进去没有"）
+_HOSTS_BEGIN = "# >>> YuhubAccel v1 >>>"
 
 
 def _process_alive(pid):
@@ -203,6 +208,97 @@ def _sha256(path):
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# 脏退自愈：上次加速没走完收尾 → 域名还指向一个没人监听的 127.0.0.1
+#
+# 🔴 这是"别的电脑上加速坏了、网页全打不开"的最后一层防线。
+#   框架写 hosts 之后、内核真正监听之前，任何一步暴死（AOT fail-fast /
+#   被强杀）都来不及跑自己的 finally，而残留的后果最严重：**所有加速域名被
+#   指向 127.0.0.1 的 443，那里没人监听** —— 浏览器、Steam 直接打不开页面。
+#   框架因此会在改写 hosts 时落一枚 `hosts_dirty` 标记、还原成功才抹掉；
+#   这里负责"发现标记还在 + 内核没在跑"时替它收拾干净，并如实说一句人话。
+# ---------------------------------------------------------------------------
+def dirty_flag_path():
+    return os.path.join(framework_dir(), _DIRTY_NAME)
+
+
+def hosts_dirty():
+    try:
+        return os.path.isfile(dirty_flag_path())
+    except OSError:
+        return False
+
+
+def _hosts_text_path():
+    # 口径必须与框架 Hosts.Path 一致：%SystemRoot%\**System32**\drivers\etc\hosts
+    # （Environment.SpecialFolder.System 就是 System32，别漏这一层 ——
+    #   少写一层会得到一个不存在的路径，判据永远返回"读不到 hosts"）
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", "drivers", "etc", "hosts")
+
+
+def hosts_has_block():
+    """hosts 里有没有本框架的标记块。返回 (bool, 说明)。
+
+    "内核在跑" 与 "hosts 真的写进去了" 是两件事：内核起来了但 hosts 没落地，
+    流量根本不会经过它 —— 界面上一切正常、实际一点没加速。这条判据就是用来
+    把这种静默失效挡在"加速已开启"这句文案之外的。读 hosts 不需要管理员。
+    """
+    try:
+        with open(_hosts_text_path(), "r", encoding="utf-8",
+                  errors="replace") as fh:
+            return (_HOSTS_BEGIN in fh.read(), "标记块不存在")
+    except OSError as exc:
+        return (False, "读不到 hosts（%s）" % exc)
+
+
+def recover_dirty_hosts():
+    """把上次脏退留下的 hosts 还原回去。返回 (是否动过手, 人话说明)。
+
+    ⚠️ 调用方必须先确认**内核确实没在跑** —— 内核活着时那份 hosts 正是它
+    要的，清了反而把正常加速打断。
+    """
+    if not hosts_dirty():
+        return (False, "")
+    rc, out, err = run_framework(["hosts-clean"], timeout=20)
+    lines = (out or err or "").strip().splitlines()
+    tail = lines[-1] if lines else ""
+    if rc == 0:
+        try:
+            os.remove(dirty_flag_path())
+        except OSError:
+            pass
+        return (True, "上次加速异常退出，已自动还原 hosts"
+                + ("（%s）" % tail if tail else ""))
+    if rc == -1:
+        return (True, "上次加速异常退出，但加速框架不在，hosts 未能还原：%s" % tail)
+    return (True, "上次加速异常退出，hosts 还原失败（%s）—— 可点「一键修复」" % tail)
+
+
+def clear_dirty_flag():
+    try:
+        os.remove(dirty_flag_path())
+    except OSError:
+        pass
+
+
+def framework_running_by_name():
+    """按进程名判加速内核在不在跑。
+
+    为什么不能只看 pid 文件：pid 文件可能被安全软件/清垃圾工具删掉，而内核还
+    活得好好的。判活的判据一旦漏掉这种情况，"脏退自愈"会在**内核正常运行**时
+    去清 hosts，直接把正在用的加速打断 —— 那比不修还糟。
+    """
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq " + _FRAMEWORK_EXE, "/NH"],
+            capture_output=True, timeout=8, creationflags=_CREATE_NO_WINDOW)
+        out = (r.stdout or b"").decode("utf-8", "replace").lower()
+        return _FRAMEWORK_EXE.lower() in out
+    except Exception:
+        return False
+
+
 def install_framework(progress=None):
     """把**内嵌**的框架写入落点并确保 CA 就绪。返回 (ok, 说明)。
 
@@ -260,6 +356,9 @@ def repair_framework(progress=None, should_cancel=None):
 
     p("正在清理 hosts 中的加速记录…")
     run_framework(["hosts-clean"], timeout=20)
+    # 顺手把"脏退"标记抹掉：修复的语义就是"状态回到干净的起点"，
+    # 标记留着会让下次进页面又报一遍"上次异常退出"。
+    clear_dirty_flag()
 
     before = framework_status() or {}
     was_trusted = bool(before.get("trusted"))
@@ -827,6 +926,21 @@ class AccelPage(BasePage):
         self._ca = self._ca_status() if self._framework else None
         trusted = bool(self._ca and self._ca.get("trusted"))
         running = self._accel_pid()
+
+        # 脏退自愈（见本文件上方 recover_dirty_hosts 的长注释）：
+        # 标记还在 且 内核确实没在跑 ⇒ 上次那一轮没走完收尾，此刻 hosts 正把所有
+        # 加速域名指向一个没人监听的 443，浏览器/Steam 会直接打不开页面。
+        # 主动还原 + 说人话，别让用户对着报错页猜。
+        # ⚠️ 两道判活都要过（pid 文件 + 进程名）：pid 文件被清垃圾工具删掉而内核
+        #    还在跑时误清 hosts，会把正在用的加速打断。
+        if not running and not framework_running_by_name():
+            did, dmsg = recover_dirty_hosts()
+            if did:
+                self.toast(dmsg)
+                # hosts 刚被我们改过，框架状态重读一次更准
+                self._ca = self._ca_status() if self._framework else self._ca
+                trusted = bool(self._ca and self._ca.get("trusted"))
+
         n = len(self._selected)
 
         if not self._framework:
@@ -1012,9 +1126,16 @@ class AccelPage(BasePage):
         log.close()                     # 子进程已持有继承句柄，父进程这边可关
 
         # 等内核就绪：pid 文件出现 + 本地 443 能建 TCP 连接。
-        # 启动前要对全部域名做节点测速（每域名最多 6 个 IP 并发 TLS 握手），
-        # 正常 2~5 秒，网络差时更久 —— 给 25 秒余量。
-        deadline = time.time() + 25
+        # 启动前要对全部域名做节点测速（每域名最多 8 个 IP 并发 TLS 握手），
+        # 正常 2~5 秒、网络差时更久；**首次启动还要更慢** —— 刚解包出来的
+        # 11MB exe 会被杀软实时扫描一遍，远程规则也要在线拉一次。
+        # 🔴 所以这里不能像旧版那样死写 25 秒：别的电脑上"第一次点加速就失败"
+        #    多半就是它（机器慢/杀软卡 → 内核在就绪前被掐掉），而用户只看到
+        #    一句"启动失败"，根本分不清是自己机器慢还是程序真出错。
+        first_run = not os.path.isfile(
+            os.path.join(self._framework_dir(), "rules-cache.json"))
+        budget = 75 if first_run else 30
+        deadline = time.time() + budget
         ready = False
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -1043,17 +1164,31 @@ class AccelPage(BasePage):
             except Exception:
                 pass
             self._run_framework(["hosts-clean"], timeout=10)
+            # 内核是被 TerminateProcess 掐掉的，跑不到它自己的收尾，
+            # 标记得我们这边抹 —— 刚清过 hosts，状态已回到干净起点。
+            clear_dirty_flag()
             try:
                 with open(self._log_path(), encoding="utf-8", errors="replace") as fh:
                     tail = fh.read().strip()
             except OSError:
                 tail = ""
             self.accelStarted.emit(
-                "25 秒内没就绪，已停止并还原 hosts —— 可直接重试。"
-                "失败详情：%s" % tail[-120:].replace("\n", " / "))
+                "%d 秒内没就绪（首次启动会更慢：杀软扫描新解包的 exe + 在线拉规则），"
+                "已停止并还原 hosts —— 可直接重试。失败详情：%s"
+                % (budget, tail[-120:].replace("\n", " / ")))
         else:
-            self.accelStarted.emit(
-                "加速已开启：本地 127.0.0.1:443 正在接管所选平台的流量")
+            # 就绪了也别急着报"已开启"：内核在跑 ≠ 流量会经过它。hosts 要是没
+            # 写进去（被安全软件拦住、被别的加速器覆盖），加速等于一点没生效，
+            # 而界面上一切正常 —— 那正是本项目最忌讳的"静默失效"。
+            # 所以这里把 hosts 里到底有没有我们的标记块也验一遍。
+            wrote, note = hosts_has_block()
+            if wrote:
+                self.accelStarted.emit(
+                    "加速已开启：本地 127.0.0.1:443 正在接管所选平台的流量")
+            else:
+                self.accelStarted.emit(
+                    "内核已就绪，但 hosts 里没有加速记录（%s）—— 加速不会生效，"
+                    "请点「一键修复」" % note)
 
     def _on_accel_started(self, msg):
         """工作线程回传（跨线程信号，槽在 UI 线程内执行）。"""
@@ -1082,6 +1217,7 @@ class AccelPage(BasePage):
                 ["taskkill", "/IM", _FRAMEWORK_EXE, "/F"],
                 capture_output=True, creationflags=_CREATE_NO_WINDOW)
         _rc, out, err = self._run_framework(["hosts-clean"], timeout=10)
+        clear_dirty_flag()          # 内核被强杀，标记得由这边抹（同上）
         msg = (out or err).strip().splitlines()
         self.toast("加速已停止：%s" % (msg[0] if msg else "hosts 已还原"))
         self._refresh_toolbar()

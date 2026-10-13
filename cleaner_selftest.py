@@ -65,6 +65,89 @@ def run(out_path):
     except Exception as exc:
         check("表达式求值", False, f"异常: {exc}")
 
+    # ---------- B2. DISM 体积解析（修复：逗号小数 + 中英文关键词 + 可清理量）----------
+    try:
+        # 中文样本：用**真机实测**的字段名（注意「备份和已禁用的功能」中间有个"的"）
+        zh = (
+            "Windows 资源管理器报告的组件存储大小 : 11.76 GB\n"
+            "组件存储的实际大小: 11.57 GB\n"
+            "    已与 Windows 共享 : 8.21 GB\n"
+            "    备份和已禁用的功能 : 3.36 GB\n"
+            "    缓存和临时数据 : 0 bytes\n"
+            "可回收的程序包数 : 2\n"
+        )
+        v_zh = cl._parse_dism_size(zh)
+        # 可清理量应取「备份和已禁用的功能」(3.36GB)，**不是**整个实际大小(11.57GB)
+        check("DISM 解析-中文取可清理量（3.36GB，非整库 11.57GB）",
+              abs(v_zh - int(3.36 * 1024 ** 3)) <= 1024 ** 3 // 20, v_zh)
+
+        # 逗号小数（欧陆/部分区域设置）：4,55 GB → 4.55 GB
+        comma = "实际大小: 4,55 GB\n备份和已禁用功能: 0 字节\n"
+        v_c = cl._parse_dism_size(comma)
+        check("DISM 解析-逗号小数 4,55GB→4.55GB",
+              abs(v_c - int(4.55 * 1024 ** 3)) <= 1024 ** 3 // 100, v_c)
+
+        # 英文样本：Actual size / Backups and disabled features
+        en = (
+            "Size of the component store: 5.10 GB\n"
+            "Actual size of the component store: 4.80 GB\n"
+            "Shared with Windows: 3.00 GB\n"
+            "Backups and disabled features: 900 MB\n"
+            "Cache and temporary data: 12 MB\n"
+        )
+        v_en = cl._parse_dism_size(en)
+        # 可清理量 = 900MB + 12MB
+        check("DISM 解析-英文取可清理量（912MB）",
+              abs(v_en - int(912 * 1024 ** 2)) <= 1024 ** 2, v_en)
+
+        # 退化样本：只有「实际大小」没有分项 → 退回实际大小（上限估计）
+        only_actual = "实际大小: 2.00 GB\n"
+        v_o = cl._parse_dism_size(only_actual)
+        check("DISM 解析-无分项时退回实际大小（2GB）",
+              abs(v_o - int(2.0 * 1024 ** 3)) <= 1024 ** 3 // 100, v_o)
+
+        # 可回收包数为 0 / 明确"不推荐清理" → 报 0（不把不可回收的保留负载当可清理）
+        zero = ("组件存储的实际大小: 10.40 GB\n"
+                "备份和已禁用的功能: 2.21 GB\n"
+                "可回收的程序包数 : 0\n"
+                "推荐使用组件存储清理 : 否\n")
+        check("★ 可回收包数=0 时报 0（保证「扫得出来=清得掉」）",
+              cl._parse_dism_size(zero) == 0, cl._parse_dism_size(zero))
+        rec_no = "备份和已禁用的功能: 5.00 GB\n推荐使用组件存储清理 : 否\n"
+        check("不推荐清理时也报 0", cl._parse_dism_size(rec_no) == 0)
+        with_pkgs = "备份和已禁用的功能: 3.36 GB\n可回收的程序包数 : 2\n"
+        check("有可回收包时仍报出体积",
+              cl._parse_dism_size(with_pkgs) > 0, cl._parse_dism_size(with_pkgs))
+
+        # 幽灵包解析：从 CBS.log 提取「deeply superseded」的 top-level 包名
+        cbs_dir = tempfile.mkdtemp(prefix="yuhub_cbs_")
+        try:
+            cbs = os.path.join(cbs_dir, "CBS.log")
+            with open(cbs, "w", encoding="utf-8") as f:
+                f.write(
+                    "2026-10-13 09:42:14, Info CBS [Package_for_RollupFix"
+                    "~31bf3856ad364e35~amd64~~26100.1742.1.10] is a top-level "
+                    "package and is deeply superseded\n"
+                    "2026-10-13 09:42:14, Info CBS [Microsoft-Windows-"
+                    "FodMetadataServicing-Desktop-Metadata-Package"
+                    "~31bf3856ad364e35~amd64~~10.0.26100.1742] is a top-level "
+                    "package and is deeply superseded\n"
+                    "2026-10-13 09:42:14, Info CBS [Foo-Bar~31bf3856ad364e35"
+                    "~amd64~~1.2.3] is superseded\n")   # 非 deeply → 不该命中
+            names = cl._dism_deeply_superseded_packages(log_path=cbs)
+            check("★ 幽灵包解析（只取 deeply superseded 的 top-level 包）",
+                  names == [
+                      "Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.1742.1.10",
+                      "Microsoft-Windows-FodMetadataServicing-Desktop-Metadata-"
+                      "Package~31bf3856ad364e35~amd64~~10.0.26100.1742"], names)
+            check("幽灵包解析-日志缺失返回空（不崩）",
+                  cl._dism_deeply_superseded_packages(
+                      log_path=os.path.join(cbs_dir, "nope.log")) == [])
+        finally:
+            shutil.rmtree(cbs_dir, ignore_errors=True)
+    except Exception as exc:
+        check("DISM 体积解析", False, f"异常: {exc}")
+
     # ---------- C. 安全护栏 ----------
     try:
         crit = cl._critical_roots()
@@ -264,6 +347,58 @@ def run(out_path):
         check("跨设备兼容性", False, f"异常: {exc}")
     finally:
         shutil.rmtree(sandbox2, ignore_errors=True)
+
+    # ---------- I. 静态守卫：main.py 无「函数内 import 遮蔽模块级名字」 ----------
+    # 2026-10-13 踩坑：为排查 WinSxS 组件，在 main() 里写了 `import os` /
+    # `import subprocess` —— Python 会把该名字当成**整个函数的局部变量**，
+    # 于是 main() 中更早的 os.xxx 调用（第 696 行 icon_path）直接抛
+    # UnboundLocalError → **启动即崩**（PyInstaller 弹 "Failed to execute
+    # script 'main'"）。这里用 AST 把这类风险在自检期就抓出来：任何函数体内
+    # 的 import，若名字同时是模块级导入的名字，就判红。
+    try:
+        import ast
+        cands = []
+        try:
+            cands.append(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "main.py"))
+        except Exception:                                    # noqa: BLE001
+            pass
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(os.path.join(meipass, "main.py"))
+        cands.append(os.path.join(os.getcwd(), "main.py"))
+        mp = next((p for p in cands if os.path.isfile(p)), None)
+        if mp is None:
+            check("main.py 静态守卫", False, "找不到 main.py 源码")
+        else:
+            with open(mp, encoding="utf-8") as fp:
+                tree = ast.parse(fp.read())
+            module_level = set()
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        module_level.add((a.asname or a.name).split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        module_level.add(a.asname or a.name)
+            hazards = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for sub in ast.walk(node):
+                        names = []
+                        if isinstance(sub, ast.Import):
+                            names = [(a.asname or a.name).split(".")[0]
+                                     for a in sub.names]
+                        elif isinstance(sub, ast.ImportFrom):
+                            names = [a.asname or a.name for a in sub.names]
+                        for nm in names:
+                            if nm in module_level:
+                                hazards.append("%s(): import %s"
+                                               % (node.name, nm))
+            check("★ main.py 无函数内 import 遮蔽模块级名字（防启动崩溃）",
+                  not hazards, str(hazards[:5]))
+    except Exception as exc:
+        check("main.py 静态守卫", False, f"异常: {exc}")
 
     result = {
         "ok": all(c["ok"] for c in checks),

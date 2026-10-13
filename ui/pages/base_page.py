@@ -8,44 +8,40 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QFrame,
+    QLayout,
 )
 
 from .. import theme
 
 
-class _ViewportHeightSync(QObject):
-    """把滚动区内容控件的高度锁到 max(视口高, 内容布局最小高)。
+class _CardMinHeightSync(QObject):
+    """让「含自动换行说明文字」的卡片，最小高度跟得上当前宽度。
 
-    修 Qt（PySide6 6.x 实测）的一个怪脾气：`widgetResizable=True` 时，
-    如果内容布局的 sizeHint 高于视口，滚动区会把内容控件撑到 sizeHint
-    高度——而且这个数是在竖向滚动条弹出**之前**那一拍算的；之后滚动条
-    出现、视口变窄，只有宽度被同步，高度卡在旧值上。结果是页面平白多出
-    一截滚动，"上 1/3 / 下 2/3"这类分比例布局全乱。
+    Qt 在计算布局最小尺寸时用的宽度和卡片最终宽度不一定一致：含 wordWrap
+    说明文字的卡片会被**低估**——实测「启动与托盘」卡真实需要 281px，
+    上层父布局只给 221px。多出来的 60px 亏空就从卡片内部抠：最下面的
+    「立即检查更新」按钮被压成 14~19px（sizeHint 是 37），文字被裁掉。
+    内存页、清理页的卡片同理。
 
-    这里在视口每次 resize 时按 max(视口, 最小高) 锁一次高度。用
-    `setFixedHeight` 而不是普通 `resize()`：后者会被滚动区下一刻弹回
-    旧值，锁死（min=max）则任何时刻的重算都被夹到我们想要的高度。
-    视口高度小于内容最小高时（小窗口），want 取最小高 → 正常出滚动条，
-    滚动量就是真实的内容溢出，不会多出一截。
+    修法：卡片每次 resize 后，按**当前宽度**问布局要真实需要的高度
+    （`heightForWidth`），把它写成卡片的 minimumHeight。explicit 最小尺寸
+    在 Qt 里是权威值（父布局的 minimumSize 计算必须尊重它），卡片就再也
+    压不扁了；内容变高触发 LayoutRequest，外层滚动区会跟着长。
     """
-
-    def __init__(self, scroll, parent=None):
-        super().__init__(parent)
-        self._scroll = scroll
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Resize:
-            self.sync()
+            lay = obj.layout()
+            if lay is not None:
+                try:
+                    need = (lay.heightForWidth(obj.width())
+                            if lay.hasHeightForWidth()
+                            else lay.minimumSize().height())
+                except (TypeError, RuntimeError):
+                    return False
+                if need and need > 0 and abs(obj.minimumHeight() - need) > 1:
+                    obj.setMinimumHeight(need)
         return False
-
-    def sync(self):
-        widget = self._scroll.widget()
-        viewport = self._scroll.viewport()
-        if widget is None or viewport is None:
-            return
-        want = max(viewport.height(), widget.minimumSizeHint().height())
-        if widget.height() != want:
-            widget.setFixedHeight(want)
 
 
 class BasePage(QWidget):
@@ -117,11 +113,32 @@ class BasePage(QWidget):
         self._content.setContentsMargins(0, 0, 6, 0)
         self._content.setSpacing(12)
         self._content.setAlignment(Qt.AlignTop)
+
+        # 🔴 内容控件的高度**交给 Qt 自己维护**：SetMinimumSize 让布局在每次
+        #    激活时把「控件最小高」同步成「布局最小高」。
+        #
+        # 这里是"软件卸载列表整片空白"的根治点，记下来别再改回去：
+        #   旧实现用事件过滤器 + setFixedHeight(max(视口高, 最小高)) 锁高度，
+        #   而重算那一步是**延后一拍用 0ms 定时器**做的（还带一个 _pending
+        #   去重标志）。LayoutRequest 与那次定时器都可能被丢掉/晚到，于是
+        #   内容控件被钉死在**视口高**、可它的布局最小高已经涨到几千像素。
+        #   QBoxLayout 在"可用空间 < 最小需求"时不会溢出，而是把**每一项
+        #   压成 0 高**——110 行程序全部渲染成 0 像素。表现就是：
+        #   表头在、"共 110 个程序 · 已知体积合计 17.1 GB"在、"已找到 110 个
+        #   程序"在，**列表区域全空**，且滚不动（滚动条范围也是 0）。
+        #   （本机实测复现：show() 之后立刻重建列表 → 行几何 = QRect(x,y,w,0)。）
+        #
+        #   它同时解释了"为什么只有别的电脑上出问题"：死不死取决于那两拍
+        #   事件的先后，机器快慢/字体度量/DPI 一变就可能落在坏的那一侧。
+        #
+        # 改用 SetMinimumSize 后，最小高由 C++ 在布局激活时维护，没有任何
+        # 时序竞态；而原先那段 setFixedHeight 想解决的"内容被撑到 sizeHint、
+        # 平白多出一截滚动"也不会回来——滚动区是按 clamp(视口, 最小, 最大)
+        # 给内容控件定尺寸的，用的是布局**最小**高而不是 sizeHint。
+        self._content.setSizeConstraint(QLayout.SetMinimumSize)
+
         scroll.setWidget(self._content_widget)
         root.addWidget(scroll, 1)
-
-        # 内容控件高度同步（见 _ViewportHeightSync 的 docstring）
-        scroll.viewport().installEventFilter(_ViewportHeightSync(scroll, scroll))
 
         # 暴露给子页面，用于响应式布局
         self.scroll = scroll
@@ -152,6 +169,27 @@ class BasePage(QWidget):
 
     def add_stretch(self):
         self._content.addStretch(1)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 页面每次显示时把「卡片最小高度同步」挂到所有 CARD 上（幂等）。
+        # 放这里而不是 _build_content 之后，是因为卡片也可能在页面构建
+        # 之后动态创建，show 时扫一遍最省心。
+        self._install_card_height_sync()
+
+    def _install_card_height_sync(self):
+        """给所有 #Card 卡片装最小高度同步（见 _CardMinHeightSync）。"""
+        sync = getattr(self, "_card_sync_obj", None)
+        if sync is None:
+            sync = _CardMinHeightSync(self)
+            self._card_sync_obj = sync
+        for card in self._content_widget.findChildren(QFrame):
+            if card.objectName() != "Card":
+                continue
+            if getattr(card, "_minh_sync_on", False):
+                continue
+            card._minh_sync_on = True
+            card.installEventFilter(sync)
 
     def on_shown(self):
         """页面被切换到前台时调用（子类可覆盖做惰性初始化 / 自动刷新）。

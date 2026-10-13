@@ -455,6 +455,10 @@ class CleanerPage(BasePage):
             row = self.rows.get(r.key)
             if row:
                 row.set_size("…", muted=True)
+                # 重扫时把上一轮的置灰/禁用**复位**：否则一条规则一旦被判成
+                # 0（本轮解析失败、或上轮不可用），再也不会重新变成可勾选。
+                row.set_dim(False)
+                row.check.setEnabled(True)
         self._status.setText("正在扫描（只统计体积，不会删除任何文件）")
 
         ok = self._scanner.start(
@@ -469,12 +473,19 @@ class CleanerPage(BasePage):
     def _on_rule_scanned(self, rule):
         row = self.rows.get(rule.key)
         if row:
-            if rule.size > 0:
-                row.set_size(cl.human_bytes(rule.size))
+            # 可清理性看 rule.available，而不是体积是否 > 0 ——
+            # 「被取代的 WinSxS 组件」这类"调用系统工具"的条目，体积只是参考，
+            # 解析不出来也照样能清，绝不能因此把它置灰、禁用勾选框。
+            if rule.available:
+                row.set_dim(False)
+                row.check.setEnabled(True)
+                row.set_size(cl.human_bytes(rule.size) if rule.size > 0
+                             else "可清理")
             else:
                 row.set_size("0 B", muted=True)
                 row.set_dim(True)
                 row.check.setEnabled(False)
+                row.set_checked(False)
         self._bar.setValue(self._bar.value() + 1)
         self._status.setText(f"正在扫描　{rule.name}")
 
@@ -610,7 +621,9 @@ class CleanerPage(BasePage):
         self._status.setText(f"已清理　{res.name}　释放 {cl.human_bytes(res.freed)}")
         row = self.rows.get(res.key)
         if row:
-            if res.removed_count > 0:
+            # DISM 这类"无逐项计数"的条目 freed 来自磁盘变化，removed_count 恒为 0，
+            # 只判 removed_count 会把"确实清出了空间"误显示成「无可清理」。
+            if res.removed_count > 0 or res.freed > 0:
                 row.set_size(f"已清理 {cl.human_bytes(res.freed)}", muted=True)
             elif res.failed:
                 row.set_size("部分被占用", muted=True)

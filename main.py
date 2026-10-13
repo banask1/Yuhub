@@ -14,6 +14,7 @@ import base64
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -314,6 +315,108 @@ def main():
             import cleaner_selftest
             sys.exit(cleaner_selftest.run(rest[0]))
         except Exception:
+            sys.exit(5)
+
+    # ---- dism-probe 模式：抓取本机 DISM 组件存储分析的真实输出（只读诊断）----
+    # 用法： Yuhub.exe --dism-probe <输出txt路径>
+    # 用于排查「被取代的 WinSxS 组件」扫不出体积 / 清不掉的问题：把 DISM 的
+    # stdout/stderr、返回码、引擎解析出的估算值原样落盘，不用去猜中文输出格式。
+    if "--dism-probe" in sys.argv:
+        idx = sys.argv.index("--dism-probe")
+        rest = sys.argv[idx + 1:]
+        out = rest[0] if rest else "dism_probe.txt"
+        try:
+            # 注意：os / subprocess / re 都已在模块顶部导入，这里**不能**再写
+            # 行内 import —— 函数内 import 会把该名字变成整个函数的局部变量，
+            # 导致 main() 中更早的 os.xxx 调用抛 UnboundLocalError（2026-10-13 踩过）。
+            import cleaner as cl
+            try:
+                from winadmin import is_elevated
+                admin = is_elevated()
+            except Exception:
+                admin = "?"
+            dism = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                "System32", "Dism.exe")
+            lines = ["dism=%s exists=%s" % (dism, os.path.isfile(dism)),
+                     "elevated=%s" % admin]
+            try:
+                r = subprocess.run(
+                    [dism, "/Online", "/Cleanup-Image", "/AnalyzeComponentStore"],
+                    capture_output=True, timeout=420,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                lines.append("returncode=%s" % r.returncode)
+                _raw = r.stdout or b""
+
+                def _ok(enc):
+                    try:
+                        _raw.decode(enc)
+                        return True
+                    except Exception:                          # noqa: BLE001
+                        return False
+
+                lines.append("---- decode ----")
+                lines.append("stdout_len=%d utf8_ok=%s gbk_ok=%s"
+                             % (len(_raw), _ok("utf-8"), _ok("gbk")))
+                lines.append("---- stdout ----")
+                lines.append(cl._dism_output_text(r.stdout or b""))
+                lines.append("---- stderr ----")
+                lines.append(cl._dism_output_text(r.stderr or b""))
+                lines.append("---- parsed ----")
+                lines.append("estimate=%d" % cl._dism_component_scan(force=True))
+            except Exception as exc:                       # noqa: BLE001
+                lines.append("EXC=%r" % (exc,))
+            with open(out, "w", encoding="utf-8") as fp:
+                fp.write("\n".join(lines))
+            sys.exit(0)
+        except Exception:
+            sys.exit(5)
+
+    # ---- dism-clean 模式：真跑一次组件存储清理并前后对比（**破坏性**，需提权）----
+    # 用法： Yuhub.exe --dism-clean <报告txt路径>
+    # 仅用于验证「被取代的 WinSxS 组件」清理是否真的生效；会执行 /ResetBase
+    # （清理后无法卸载已安装的更新）。非排障请勿随意调用。
+    if "--dism-clean" in sys.argv:
+        idx = sys.argv.index("--dism-clean")
+        rest = sys.argv[idx + 1:]
+        out = rest[0] if rest else "dism_clean.txt"
+        try:
+            # 走**真实的 clean_rule 路径**：验证的就是 app 里点「清理选中项」
+            # 执行的同一段代码（含新增的"删幽灵包"逻辑）。
+            import cleaner as cl
+            LOG = []
+
+            def analyze(tag):
+                cl._DISM_CACHE["t"] = 0.0        # 清缓存，强制重新分析
+                v = cl._dism_component_scan(force=True)
+                LOG.append("%s reclaim=%.2f GB" % (tag, v / 1024 ** 3))
+                return v
+
+            before = analyze("before")
+            try:
+                ghosts = cl._dism_deeply_superseded_packages()
+            except Exception as exc:                         # noqa: BLE001
+                ghosts = ["<解析失败 %r>" % (exc,)]
+            LOG.append("deeply-superseded 幽灵包: %s" % (ghosts or "无"))
+
+            rule = {r.key: r for r in cl.build_rules()}["dism_component"]
+            rule.size = before
+            res = cl.clean_rule(rule, progress=lambda t: LOG.append("  .. " + t))
+            LOG.append("freed=%.2f GB  removed_count=%d  failed=%d  verified=%s"
+                       % (res.freed / 1024 ** 3, res.removed_count,
+                          res.failed, res.verified))
+            LOG.extend("  msg: " + m for m in res.messages)
+            after = analyze("after")
+            LOG.append("delta=%.2f GB" % ((before - after) / 1024 ** 3))
+
+            with open(out, "w", encoding="utf-8") as fp:
+                fp.write("\n".join(LOG))
+            sys.exit(0)
+        except Exception as exc:                             # noqa: BLE001
+            try:
+                with open(out, "w", encoding="utf-8") as fp:
+                    fp.write("EXC=%r" % (exc,))
+            except OSError:
+                pass
             sys.exit(5)
 
     # ---- theme-selftest 模式：无窗口自检主题包系统 ----

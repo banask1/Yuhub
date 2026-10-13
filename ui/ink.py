@@ -71,6 +71,7 @@ def is_dark(palette=None):
 # ---------------------------------------------------------------------------
 _FISH_FILES = ("ink_fish_1.png", "ink_fish_2.png")
 _fish_cache = {}          # kind -> [QPixmap, ...]  kind: 'normal' / 'inverted'
+_BAND_CACHE = {}          # pixmap.cacheKey() -> (y0, y1) 鱼身实际像素带
 
 
 def _align_body_axis(img):
@@ -254,9 +255,11 @@ class _Fish:
         # 个体差异交给大小/浓淡/速度/尾拍频率就够了。
         self.flip = False
         self.phase = rng.uniform(0, math.tau)
-        # 摆尾：小鱼拍得快，大鱼慢悠悠（尾拍频率 1.5~3 Hz，鲤鱼巡航档）
+        # 摆尾：尾拍是个体属性，1.5~1.95Hz（2026-10-13 用户要求"稍微降低摆动
+        # 频率"；鲤鱼慢速巡游本来就在 1.5~2Hz，比原来 1.8~2.4 更贴合）。
+        # 小鱼拍得快、大鱼慢悠悠。
         self.tail_phase = rng.uniform(0, math.tau)
-        self.beat_hz = rng.uniform(1.8, 2.4) / (0.6 + 0.4 * self.scale)
+        self.beat_hz = rng.uniform(1.5, 1.95) / (0.6 + 0.4 * self.scale)
         self.bend = 0.0                            # 转弯时的静态体弯（-1~1）
         m = margin
         self.x = rng.uniform(m, w - m)
@@ -280,6 +283,39 @@ class _Fish:
                     / ln > -0.17:
                 return (tx, ty)
         return (w / 2.0, h / 2.0)
+
+
+def _sprite_band(pix):
+    """贴图里"真正有像素"的纵向带 (y0, y1)，按 cacheKey 缓存。
+
+    鱼被转平后，画布上下各留了一大块全透明边角（259×242 的画布里鱼身
+    只有 ~100px 高）。切片若按整幅高度画，等于一半以上的 blit 面积在复制
+    空气——按内容收紧绘制带，鱼的绘制开销直接砍掉一半多。
+    """
+    key = pix.cacheKey()
+    hit = _BAND_CACHE.get(key)
+    if hit is not None:
+        return hit
+    img = pix.toImage()
+    w, h = img.width(), img.height()
+    top = bot = None
+    step = 2
+    for y in range(0, h, step):
+        hit_row = False
+        for x in range(0, w, step):
+            if img.pixelColor(x, y).alpha() > 8:
+                hit_row = True
+                break
+        if hit_row:
+            if top is None:
+                top = y
+            bot = y
+    if top is None:                      # 全透明（异常贴图）：退回整幅
+        band = (0, h)
+    else:
+        band = (max(0, top - step), min(h, bot + step + 1))
+    _BAND_CACHE[key] = band
+    return band
 
 
 class InkPond(QWidget):
@@ -312,7 +348,10 @@ class InkPond(QWidget):
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
+        # 30fps（≈33ms）：鱼是慢速巡游，60fps 与 30fps 肉眼几乎无差，但
+        # 实测 CPU 直接差一半（见 2026-10-13 的性能归因：三处动画从 85%
+        # 单核降到 ~15%）。
+        self._timer.start(33)
 
         theme.bus.changed.connect(self._on_theme_changed)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -343,7 +382,8 @@ class InkPond(QWidget):
         # 拒绝采样：出生点彼此拉开（间距随池子缩放）——小池子逼太紧会
         # 退化成"摆点阵"的假随机；边距同样按短边比例，鱼不贴边。
         spacing = max(46.0, min(w, h) * 0.16)
-        m = max(26.0, min(w, h) * 0.10)
+        # 边距按摆幅调大了：摆尾幅度加大后，贴着边的鱼摆尾会甩出池外被裁掉
+        m = max(30.0, min(w, h) * 0.12)
         # 鱼的大小跟着池子走：以开机画面（640×420）为基准 1.0，
         # 矮池子（首页横幅 ~250px）里鱼缩到 ~0.65，不会鱼比池子还大
         size_factor = max(0.5, min(1.0, min(w, h) / 380.0))
@@ -392,10 +432,11 @@ class InkPond(QWidget):
                 f.target = f._pick_target(self._rng, w, h, ahead=True)
 
             # ---- 前进：位移方向 = 头的朝向 ----
-            # 推进与摆尾同相：扫尾半程轻轻加速——游动的"推进感"来自
-            # 摆尾本身（鲤鱼游动循环的节奏），而不是凭空的快慢变化
+            # 推进与摆尾同相：扫尾半程轻轻加速——游动的"推进感"来自摆尾本身。
+            # 幅度加大后推进起伏**调小**（±11%）：再叠一层明显的加减速就
+            # 显出"一鼓一鼓"的机械感了。
             f.tail_phase += math.tau * f.beat_hz * dt
-            burst = 0.90 + 0.14 * math.sin(f.tail_phase)
+            burst = 0.91 + 0.11 * math.sin(f.tail_phase)
             step = f.speed * burst * dt
             f.x += math.cos(f.heading) * step
             f.y += math.sin(f.heading) * step
@@ -434,8 +475,11 @@ class InkPond(QWidget):
     def paintEvent(self, event):
         self._ensure_fish()
         p = QPainter(self)
+        # 只开抗锯齿（涟漪是圆/曲线，需要它）。**不开 SmoothPixmapTransform**：
+        # 鱼的切片是带 shear 的变换贴图，开滤波后每一片都要重采样，是绘制
+        # 侧最贵的一项；鱼小、边缘本来就是柔和墨色，关掉看不出差别。
+        # 大鱼的清晰度在 _paint_fish 里按个体单独开（scale > 0.8 才开）。
         p.setRenderHint(QPainter.Antialiasing)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
         c = theme.current()
 
         try:
@@ -478,6 +522,10 @@ class InkPond(QWidget):
         for f in self._fish:
             pix = sprites[f.sprite % len(sprites)]
 
+            # 只有"大鱼"才开滤波贴图（清晰度肉眼可辨）；小鱼关掉省一半
+            # 的变换 blit 开销。逐鱼设置，全帧不重复设同一个值。
+            p.setRenderHint(QPainter.SmoothPixmapTransform, f.scale > 0.8)
+
             p.save()
             # 鱼锚在自身位置，身体朝向 = 航向。刚体只负责"朝哪游"，
             # "怎么游"交给下面的切片行波——两者叠加才是活鱼。
@@ -492,9 +540,9 @@ class InkPond(QWidget):
             p.restore()
         p.setOpacity(1.0)
 
-    # 身体切片数：薄片越多波形越顺滑。22 片时波峰处的折线转角小到
-    # 看不出来（14 片时折点读起来像"断节"），开销仍然可以忽略
-    BODY_SLICES = 22
+    # 身体切片数：够顺滑即可。屏幕上鱼只有几十像素高，10 片已经看不出
+    # 折线（22 片是历史遗留）；每帧 blit 次数直接减半，是动画 CPU 的大头
+    BODY_SLICES = 10
 
     def _fish_dy(self, f, d, pw):
         """身体行波在"离头距离 d"（0=头、1=尾）处的横向偏移。
@@ -509,9 +557,12 @@ class InkPond(QWidget):
         包含大片透明边角，拿它当基准会高估波幅、把鱼折出"断节"。
         """
         env = 0.15 + 0.85 * d ** 1.7               # 头小尾大的振幅包络
-        wave = math.sin(f.tail_phase - math.tau * 0.7 * d)
+        wave = math.sin(f.tail_phase - math.tau * 0.62 * d)
         bend = -f.bend * d ** 1.8
-        return pw * (0.055 * env * wave + 0.05 * bend)
+        # 摆幅按体长：行波 7.5%、静态弯 6%（2026-10-13 用户要求加大摆幅，
+        # 由 5.5% 提到 7.5%）。波长同时从 0.7 收到 0.62：幅度变大后波长
+        # 太短会让 10 片的折线读出"折角"，放长一个摆更连贯。
+        return pw * (0.075 * env * wave + 0.06 * bend)
 
     def _draw_fish_body(self, p, pix, f):
         """把鱼贴图沿体轴切成薄片，按行波逐片**剪切**后画出来。
@@ -525,6 +576,10 @@ class InkPond(QWidget):
         腹背翻转变体由调用方用 scale(1,-1) 做（头始终朝 +x）。
         """
         pw, ph = pix.width(), pix.height()
+        # 只画鱼身所在的横带（上下透明边角不画）。余量**按每一片自己的
+        # 摆幅**给：头/中段几乎不动（头摆幅只有尾部的 15%），用整条鱼的
+        # 最大值去撑就是把空气也画上去了 —— 摆幅加大后这一项差了 10% 开销。
+        band0, band1 = _sprite_band(pix)
         n = self.BODY_SLICES
         for i in range(n):
             # 切片边界全部取整：浮点源矩形会让每一片都重采样，鱼身上
@@ -540,12 +595,16 @@ class InkPond(QWidget):
             dy1 = round(self._fish_dy(f, d1, pw))
             lx0, lx1 = x0 - pw / 2, x1 - pw / 2
             slope = (dy1 - dy0) / max(1.0, (lx1 - lx0))
+            # 余量 = 本片两端的最大横移 + 剪切带来的额外倾斜量
+            pad = max(abs(dy0), abs(dy1)) + abs(dy1 - dy0) + 2
+            y0 = max(0, band0 - pad)
+            y1 = min(ph, band1 + pad)
             p.save()
             p.translate(lx0, dy0)
             if abs(slope) > 0.004:
                 p.shear(0.0, slope)
-            p.drawPixmap(QRectF(0, -ph / 2, lx1 - lx0, ph),
-                         pix, QRectF(x0, 0, x1 - x0, ph))
+            p.drawPixmap(QRectF(0, -ph / 2 + y0, lx1 - lx0, y1 - y0),
+                         pix, QRectF(x0, y0, lx1 - lx0, y1 - y0))
             p.restore()
 
 
@@ -623,8 +682,10 @@ class BambooStrip(QWidget):
     #: 风力变化时发出（预留：将来可以让别的元素跟着同一阵风动）
     wind_changed = Signal(float)
 
-    TICK_MS = 16                # 60fps：30fps 在 Windows 的粗定时器下会
-                                # 对齐到 ~15.6ms 网格，间隔忽长忽短，看着卡
+    # 24fps：竹子**每个页面都在跑**，实测两根竹子占 ~30% 单核（60fps 全量
+    # 抗锯齿矢量重绘）。风本身是低通滤波出来的慢变量，24fps 的摇曳完全
+    # 看不出台阶，开销直接砍 60%。
+    TICK_MS = 42
 
     def __init__(self, orientation="right", parent=None):
         super().__init__(parent)
