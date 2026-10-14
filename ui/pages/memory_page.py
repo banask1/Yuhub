@@ -15,6 +15,7 @@
 """
 
 import json
+import sys
 import threading
 import time
 
@@ -476,6 +477,13 @@ class MemoryPage(BasePage):
         self.btn_optimize.clicked.connect(self._on_optimize_clicked)
         row.addWidget(self.btn_optimize)
         row.addStretch(1)
+        # 🔴 这一行别漏：`row` 是**无父控件**创建的布局，不 addLayout 进去就
+        #    永远不会被布局系统激活 —— 按钮停在默认的 QRect(0,0,640,480)、
+        #    isVisible() 为 False，**界面上就是"没有立即优化按键"**。
+        #    而且它**不抛任何异常**：按钮对象建好了、clicked 也连上了、代码
+        #    看着完全正常，只是没人把它摆到屏幕上。这类"孤儿布局"只能靠
+        #    「建了 QxBoxLayout() 却没 addLayout」的静态扫描发现。
+        lay2.addLayout(row)
 
         # 权限说明（原来这里是「管理员深度优化」开关；已改为常驻提示，
         # 因为程序本身就是管理员启动，深度清理不再是一个需要用户决定的事）
@@ -581,11 +589,34 @@ class MemoryPage(BasePage):
                 "当前以管理员权限运行：每次优化都会清空系统备用列表并收缩"
                 "文件缓存，可用内存通常还能再涨一截。")
         else:
-            # 打包版由 exe 清单保证管理员启动，正常到不了这里；
-            # 源码态调试时如实说明能力边界。
-            self._admin_hint.setText(
-                "当前未以管理员权限运行：只做逐进程内存回收（打包后的 "
-                "Yuhub.exe 以管理员启动，始终包含系统级清理）。")
+            # 没提权。**打包态走到这里本身是异常**：exe 清单写着
+            # requireAdministrator，双击只弹一次 UAC，之后全程在同一个提权
+            # 进程里跑。所以这里必须把"你现在没提权"说准、并告诉用户怎么恢复
+            # —— 只讲后果（"只做逐进程回收"）的话，用户看到的就是一句
+            # "需要管理员权限才能用"，既不知道原因也不知道怎么办。
+            # 源码态（python main.py）则是预期情况，按源码调试的措辞说。
+            if getattr(sys, "frozen", False):
+                # 把探针结果一并显示：这一行是给**远程排障**用的。三种值含义
+                # 完全不同 —— False = API 正常、进程真的没提权；None = API 调用
+                # 失败（那就该去查 winadmin 而不是查 UAC）；True 却走到这里 = 逻辑
+                # 自相矛盾。用户截图时能直接把真实状态带过来，不用再来回猜。
+                try:
+                    import winadmin as _wa
+                    _probe = _wa._token_elevated()
+                except Exception:                                  # noqa: BLE001
+                    _probe = "查询失败"
+                _probe_txt = {True: "已提权", False: "未提权",
+                              None: "查询失败"}.get(_probe, str(_probe))
+                self._admin_hint.setText(
+                    "当前进程未取得管理员权限（探针：%s，运行形态：打包态）。\n"
+                    "只做逐进程内存回收。本程序清单要求以管理员启动，正常不会"
+                    "到这里 —— 通常是 UAC 被安全软件拦掉、或从别的程序/脚本里"
+                    "拉起的。请直接双击 Yuhub.exe 重启一次"
+                    "（会弹一次 UAC，点「是」）。" % _probe_txt)
+            else:
+                self._admin_hint.setText(
+                    "当前未以管理员权限运行（源码态调试）：只做逐进程内存回收。"
+                    "打包后的 Yuhub.exe 以管理员启动，始终包含系统级清理。")
 
     # ------------------------------------------------------------ 优化流程
     def _on_optimize_clicked(self):

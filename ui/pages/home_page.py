@@ -31,6 +31,9 @@ import live_monitor
 
 
 class HomePage(BasePage):
+    # 首页是给用户看的第一屏，徽标写「正式版」而不是基类默认的「功能开发中」
+    # （后者在深色主题下是灰色徽标，看着像"这页还没做完"）。
+    BADGE = "正式版"
     TINT_KEY = "tile_1"
     # 主窗口会 connect 这个信号（页面内暂无跳转卡片，保留接口兼容）
     navigate = Signal(str)

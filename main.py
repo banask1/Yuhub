@@ -57,6 +57,62 @@ _bt("全部顶层模块导入完成")
 # 装完的翻译对象必须留一个引用，否则会被 GC 掉、翻译当场失效
 _TRANSLATORS = []
 
+# ---------------------------------------------------------------------------
+# 全局字体：苹方（PingFang SC）
+# ---------------------------------------------------------------------------
+# 为什么要"加载字体文件"而不是只改 font-family：苹方是 macOS 自带字体，用户
+# 机器上多半没装，所以随包带 OTFs，启动时用 QFontDatabase.addApplicationFont
+# 注册进**本进程**（不装进系统，退出即失效，不污染用户环境）。
+#
+# 🔴 必须先确认注册成功再 setFont：指定一个不存在的家族名时 Qt 会**静默**
+#    回退到默认字体，界面只是"看起来没变化"，没有任何报错 —— 那正是本项目
+#    最忌讳的静默失效。所以下面用 QFontDatabase.families() 反查，查到才用。
+#
+# ⚠️ 字重：v1.1.5 起**只带 Regular**（8.85MB）。原先是 Regular + Semibold
+#    （合计 25MB）， Semibold 一版砍掉了 —— exe 直接从 69.2MB 降到 52.9MB。
+#    代价：QSS 里 font-weight: 700 的标题改由 Qt **合成加粗**（笔画会略粗、
+#    不如真字重精致）。想恢复就把 PingFangSC-Semibold.otf 加进 _FONT_FILES
+#    （文件可从 https://github.com/ZWolken/PingFang 或 jsDelivr 镜像下载，
+#    构建脚本 build.bat 的 [2/4] 步会自动拉）。
+#    字体本身做过**子集化**（fontTools subset）：35,854 → 23,531 字符，
+#    裁掉的是 CJK 扩展 A~H（罕用字），中文/日文假名/注音/希腊/西里尔/
+#    全角半角/常用符号全覆盖。别为了再省一点去裁基本区——实测 Qt 缺字时
+#    **不会回退**（宽度照留、字形是空的），用户数据里的生僻字会直接消失。
+_FONT_DIR = os.path.join("resources", "fonts")
+_FONT_FILES = ("PingFangSC-Regular.otf",)
+_FONT_FAMILY = "PingFang SC"
+_FONT_FALLBACK = "Microsoft YaHei UI"
+
+
+def install_app_font(app):
+    """注册随包的苹方字体并把应用默认字体设成它。返回实际生效的家族名。"""
+    from PySide6.QtGui import QFontDatabase
+
+    base = resource_path(_FONT_DIR)
+    paths = [os.path.join(base, n) for n in _FONT_FILES]
+    if not all(os.path.isfile(p) for p in paths):
+        # 兜底：文件改名/少带一个时，把目录里的 otf 都试一遍（有总比没有好）
+        try:
+            import glob
+            paths = [p for p in paths if os.path.isfile(p)] or sorted(
+                glob.glob(os.path.join(base, "*.otf")))
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    for p in paths:
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            QFontDatabase.addApplicationFont(p)
+        except Exception:                                      # noqa: BLE001
+            pass                    # 字体注册失败不该拦住启动，走回退即可
+
+    families = QFontDatabase.families()
+    family = _FONT_FAMILY if _FONT_FAMILY in families else _FONT_FALLBACK
+    app.setFont(QFont(family, 9))
+    return family
+
+
 # 给 easytier-core.exe 启动用的标志位。0x08000000 = CREATE_NO_WINDOW，
 # 关键：阻止 Windows 给控制台子系统程序创建 conhost 子进程窗口，
 # 从根上消除「C:\Windows\System32\cmd.exe / conhost.exe 闪烁」。
@@ -645,7 +701,8 @@ def main():
     app.setApplicationName("Yuhub")
     app.setApplicationVersion(VERSION)
     app.setOrganizationName("Yuhub")
-    app.setFont(QFont("Microsoft YaHei UI", 9))
+    # 全局字体：苹方（随包注册；注册失败则回退微软雅黑，见 install_app_font）
+    _app_font = install_app_font(app)
 
     install_translations(app)
 

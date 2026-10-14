@@ -464,6 +464,25 @@ def _run_all(mark):
 
         page = MemoryPage(notify=lambda _t: None)
 
+        # 🔴 「内存优化没有立即优化按键」那次的绊线。
+        #    真根因是 `row = QHBoxLayout()` 建好后**忘了 addLayout(row)**：
+        #    无父控件的布局不接进父布局就永远不会被激活，按钮于是停在默认的
+        #    QRect(0,0,640,480)、isVisible() 为 False —— 界面上就是"没有按钮"，
+        #    而它**不抛任何异常**，对象建好了、clicked 也连上了，代码看着完全正常。
+        #    判据：沿 parent() 往上能不能走到 page 本身。接上了就一定能走到。
+        _w = page.btn_optimize
+        _chained = False
+        _p = _w.parent()
+        while _p is not None:
+            if _p is page:
+                _chained = True
+                break
+            _p = _p.parent()
+        mark("★ 立即优化按钮真的接在页面布局里（不是孤儿布局）",
+             _chained and _w.sizeHint().height() > 10,
+             "parent=%s 父链抵达页面=%s sizeHint=%s"
+             % (type(_w.parent()).__name__, _chained, _w.sizeHint().height()))
+
         mark("页面上有定时 / 过载两个独立开关",
              page.sw_auto is not None and page.sw_thr is not None, "")
         # 🔴 用户要求移除「管理员深度优化」开关：程序本身以管理员启动，

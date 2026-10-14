@@ -18,7 +18,7 @@ if /i "%~1"=="clean" (
     if exist "dist" rmdir /s /q "dist"
 )
 
-echo [1/3] Ensuring accel framework is built...
+echo [1/4] Ensuring accel framework is built...
 rem Yuhub.spec needs accel-framework\out\YuhubAccel.exe -- that Native AOT
 rem single file is embedded into the exe (accel\) and released to LOCALAPPDATA
 rem when the user opens the "Network Acceleration" page.
@@ -44,10 +44,32 @@ if not exist "accel-framework\out\YuhubAccel.exe" (
     echo       ok
 )
 
-echo [2/3] Generating icon...
+echo [2/4] Checking PingFang font...
+rem The subsetted font (8.85 MB) is committed under resources/fonts, so this
+rem normally just says ok. The download below is only a fallback for the case
+rem where the file was deleted -- without it the exe would SILENTLY fall back
+rem to Microsoft YaHei UI (install_app_font verifies registration and would
+rem otherwise look like "the font change did nothing").
+if not exist "resources\fonts\PingFangSC-Regular.otf" (
+    echo       missing, downloading from the jsDelivr mirror ...
+    if not exist "resources\fonts" mkdir "resources\fonts"
+    curl -sSL --max-time 300 -o "resources\fonts\PingFangSC-Regular.otf" https://cdn.jsdelivr.net/gh/ZWolken/PingFang@main/PingFangSC-Regular.otf
+    if errorlevel 1 (
+        echo [X] Font download failed - the packaged exe would fall back to
+        echo     Microsoft YaHei UI without any error. Fix the network and re-run.
+        pause
+        exit /b 1
+    )
+    echo       note: this is the FULL font ^(~13 MB^), not the committed subset
+    echo             ^(~8.85 MB^) - the exe will be about 4 MB larger.
+) else (
+    echo       ok
+)
+
+echo [3/4] Generating icon...
 "%PY%" build_icon.py
 
-echo [3/3] Building exe with PyInstaller...
+echo [4/4] Building exe with PyInstaller...
 rem 打包参数统一放在 Yuhub.spec 里（单一来源）。以前这里另抄了一份命令行
 rem 参数，结果 --hidden-import 列表跟不上（gpu/share/node 三套自检都漏了，
 rem 打包后 --*-selftest 会 ImportError），所以改成直接吃 spec。

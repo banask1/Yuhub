@@ -445,7 +445,7 @@ QPushButton#PrimaryButton:focus {
 
 SKY_QSS = """\
 * {
-    font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif;
+    font-family: "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
     outline: none;
     selection-background-color: $accent;
     selection-color: $accent_text;

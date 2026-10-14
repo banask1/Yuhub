@@ -6,14 +6,16 @@
 把整体进度 / 瞬时速度 / 剩余时间实时汇报给上层。
 
 用法：
-    task = DownloadTask(url, save_path, threads=dl.threads_for_level("mid"))
+    task = DownloadTask(url, save_path, threads=dl.auto_threads())
     task.start()
     ...
     snap = task.snapshot()        # 线程安全，UI 定时轮询即可
     task.cancel()
 
-线程数不要写死：`threads_for_level("low"/"mid"/"high")` 会按**本机逻辑核心数**
-换算成 1/4、1/2、全部核心数，同一份程序换电脑不用改代码。
+线程数不要写死：`auto_threads()` 取**本机逻辑处理器（硬件线程）数**并封顶
+MAX_THREADS，同一份程序换电脑自动适配。v1.1.5 起下载页不再提供低/中/高档位
+选择（档位本来就是按核心数换算的，让用户选只是多一次误操作的机会），
+`threads_for_level()` 保留给引擎侧/自检按档位构造场景用。
     """
 
 import os
@@ -38,8 +40,8 @@ DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Yuhub/0.5"
 )
-# 线程数不设固定默认值：见下方 THREAD_LEVEL_* 与 threads_for_level()，
-# 由本机逻辑核心数换算（低 1/4、中 1/2、高全部）。调用方不传 threads 时取中档。
+# 线程数上限：见下方 THREAD_LEVEL_* / auto_threads()。调用方不传 threads 时
+# 由 DownloadTask 自己取 auto_threads()（v1.1.5 起默认就是"本机全部线程"）。
 MAX_THREADS = 32
 CHUNK = 256 * 1024          # 单次请求读取的字节数
 TIMEOUT = 20                # 单次请求超时（秒）
@@ -109,6 +111,25 @@ def threads_for_level(level):
         level = DEFAULT_LEVEL
         divisor = THREAD_LEVEL_DIVISOR[level]
     return int(max(1, min(n // divisor, MAX_THREADS)))
+
+
+def auto_threads():
+    """**自动档**：本机逻辑处理器（硬件线程）数，封顶 MAX_THREADS。
+
+    v1.1.5 起下载页不再让用户选档位，直接用这个值。理由：那三个档位本来就是
+    按本机核心数换算出来的，用户选来选去只是在"1/4 / 1/2 / 全部"之间猜，
+    而下载是 IO 密集型，开满通常就是最优——多一个选项只是多一次误操作的机会。
+    """
+    return int(max(1, min(cpu_threads(), MAX_THREADS)))
+
+
+def describe_auto_threads():
+    """给 UI 用的一句话：本机 CPU 口径 + 实际会用多少线程。
+
+    核心数与线程数**都要写**：只写"12 核"会让用户以为程序认错了 CPU
+    （实际是 8 核 12 线程）。口径与首页 CPU 面板同源（sysinfo）。
+    """
+    return f"本机 {describe_cpu()} · 自动 {auto_threads()} 线程"
 
 
 def describe_level(level):
@@ -493,9 +514,10 @@ class DownloadTask:
                  proxy=None):
         self.url = (url or "").strip()
         self.save_path = save_path
-        # threads=None 时按本机核心数自动取"中档"，这样换一台电脑不用改代码
+        # threads=None 时按本机核心数**自动取满**（v1.1.5 起没有档位了），
+        # 这样换一台电脑不用改代码，也不用用户操心
         if threads is None:
-            threads = threads_for_level(DEFAULT_LEVEL)
+            threads = auto_threads()
         self.threads = max(1, min(int(threads or 1), MAX_THREADS))
         self._probe = probe_result
         # None = 系统代理；"direct" = 绕过代理直连（见 _open 注释）

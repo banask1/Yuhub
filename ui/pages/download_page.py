@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 
 import downloader as dl
 from .. import theme
-from ..widgets import SegmentedControl, ghost_button, info_card, primary_button
+from ..widgets import ghost_button, info_card, primary_button
 from .base_page import BasePage
 
 TICK_MS = 200                      # 进度轮询间隔
@@ -206,8 +206,8 @@ class DownloadPage(BasePage):
             info_card(
                 "关于多线程下载",
                 "文件会被切成若干分块并行抓取，速度取决于服务器与你的带宽。"
-                "线程数按本机的逻辑处理器（硬件线程）数换算：低档 1/4、中档 1/2、"
-                "高档全部，所以换一台电脑不用改设置，程序会自动适配。"
+                "线程数自动取本机的逻辑处理器（硬件线程）数，所以换一台电脑"
+                "不用改设置，程序会自动适配。"
                 "若服务器不支持分块（未返回 Content-Range），会自动降级为单线程，"
                 "此时无法显示百分比。下载中的文件以 .part 结尾，全部完成后再改名为正式文件；"
                 "取消或失败时会自动清理半成品，不会留下垃圾。",
@@ -267,24 +267,18 @@ class DownloadPage(BasePage):
         row3.addWidget(self.btn_open_dir)
         v.addLayout(row3)
 
-        # --- 线程档位 ---
-        # 不写死 1/2/4/8/16：同一份程序要在不同电脑上跑。
-        # 改成按本机核心数换算的低/中/高，具体线程数在右侧提示里显出来。
+        # --- 线程数（v1.1.5 起改成自动，删掉低/中/高档位选择）---
+        # 档位本来就是按本机核心数换算的，让用户选等于让他在 1/4、1/2、全部
+        # 之间猜；下载是 IO 密集型，开满通常就是最优。这里只**如实显示**
+        # 用了多少线程（口径与首页 CPU 面板同源，见 sysinfo）。
         row4 = QHBoxLayout()
         row4.setSpacing(10)
         row4.addWidget(self._field_label("下载线程"))
-        self.threads = SegmentedControl(
-            [(lv, dl.THREAD_LEVEL_LABELS[lv]) for lv in dl.THREAD_LEVELS],
-            current=dl.DEFAULT_LEVEL,
-        )
-        row4.addWidget(self.threads)
-        self.thread_hint = QLabel("")
+        self.thread_hint = QLabel(dl.describe_auto_threads())
         self.thread_hint.setObjectName("DlSub")
         row4.addWidget(self.thread_hint)
         row4.addStretch(1)
         v.addLayout(row4)
-        self.threads.changed.connect(lambda _: self._update_thread_hint())
-        self._update_thread_hint()
 
         # --- 按钮 ---
         row5 = QHBoxLayout()
@@ -374,10 +368,6 @@ class DownloadPage(BasePage):
             if os.path.isdir(p):
                 return p
         return home
-
-    def _update_thread_hint(self):
-        level = self.threads.current() or dl.DEFAULT_LEVEL
-        self.thread_hint.setText(dl.describe_level(level))
 
     def _on_paste(self):
         text = QApplication.clipboard().text().strip()
@@ -491,9 +481,9 @@ class DownloadPage(BasePage):
         self.btn_open_dir.setEnabled(False)
 
         try:
-            threads = dl.threads_for_level(self.threads.current())
+            threads = dl.auto_threads()
         except Exception:  # noqa: BLE001
-            threads = dl.threads_for_level(dl.DEFAULT_LEVEL)
+            threads = dl.MAX_THREADS
 
         self._task = dl.DownloadTask(self.url.text().strip(), path,
                                      threads=threads, probe_result=result)
