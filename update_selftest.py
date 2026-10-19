@@ -883,6 +883,228 @@ def _test_elevation_decision():
         _add("替换器日志检查未崩溃", False, repr(e))
 
 
+def _test_ack_handshake():
+    """回归：主进程必须拿到替换器的启动暗号，才允许自己退出。
+
+    2026-10-19 修复的核心。`launch_updater` 返回 True 只代表
+    ShellExecuteW 接受了启动请求 —— UAC 被点否、替换器被安全软件
+    拦截、进程秒退时它照样返回成功，而主进程过去不等任何确认就
+    退出自己，用户看到的就是「下载完了、窗口关了、版本没变」。
+    （2026-10-15 物证：%TEMP% 留下 Yuhub_upd_5588 而替换器从未收尾。）
+
+    契约：
+      * stage_updater 把暗号路径填进 payload["ack_file"]；
+      * apply_update_main 解码成功后**第一件事**就是写暗号
+        （早于任何文件操作，也早于坏包体检——替换器确实起来了）；
+      * 载荷坏到解不开（rc=2）时不会有暗号；
+      * wait_for_updater_ack：见到暗号 → True；等不到 → False。
+    """
+    d = tempfile.mkdtemp(prefix="Yuhub_ack_")
+    try:
+        # ---- ① 载荷带暗号字段，stage_updater 自动填 ----
+        payload = updater.build_request(r"C:\x\new.exe", r"C:\x\Yuhub.exe", 1)
+        _add("build_request 带 ack_file 字段（默认空）",
+             "ack_file" in payload and payload["ack_file"] == "",
+             "ack_file=%r" % (payload.get("ack_file"),))
+
+        staged = updater.stage_updater(payload)
+        ack = payload.get("ack_file") or ""
+        _add("stage_updater 把暗号路径写进载荷",
+             bool(ack) and os.path.isfile(staged),
+             "staged=%s ack=%s" % (os.path.basename(staged), ack))
+        _add("暗号与替换器副本同目录（同生共死）",
+             bool(ack) and os.path.dirname(ack) == os.path.dirname(staged),
+             "%s vs %s" % (os.path.dirname(ack), os.path.dirname(staged)))
+
+        # ---- ② 陈旧暗号必须被清掉（否则主进程会被旧文件骗到）----
+        if ack:
+            with open(ack, "w", encoding="utf-8") as f:
+                f.write("stale\n")
+            payload2 = updater.build_request(r"C:\x\new.exe",
+                                             r"C:\x\Yuhub.exe", 1)
+            updater.stage_updater(payload2)
+            _add("stage_updater 清掉上一次残留的暗号",
+                 payload2.get("ack_file") == ack
+                 and not os.path.exists(ack),
+                 "ack 仍存在=%s" % os.path.exists(ack))
+
+        # ---- ③ 坏包路径：暗号也要写（替换器确实起来了），rc=9 ----
+        work = os.path.join(d, "apply")
+        os.makedirs(work, exist_ok=True)
+        target = os.path.join(work, "Target.exe")
+        shutil.copy2(updater.current_exe(), target)
+        original = open(target, "rb").read()
+        new_exe = os.path.join(work, "incoming.exe")
+        with open(new_exe, "wb") as f:
+            f.write(b"NOT-A-PE" * 64)
+        ack3 = os.path.join(work, "ack3")
+        pl = updater.build_request(new_exe, target, 0,
+                                   new_version="vtest", ack_file=ack3)
+        rc = updater.apply_update_main(updater.encode_payload(pl))
+        _add("坏包被拦下（rc=9）且暗号已写（替换器确实运行过）",
+             rc == 9 and os.path.isfile(ack3),
+             "rc=%r ack=%s" % (rc, os.path.isfile(ack3)))
+        _add("暗号里记的是替换器自己的 PID",
+             os.path.isfile(ack3)
+             and open(ack3, encoding="utf-8").read().strip().isdigit(),
+             open(ack3, encoding="utf-8").read().strip()
+             if os.path.isfile(ack3) else "(无)")
+        _add("坏包路径目标文件原封不动",
+             open(target, "rb").read() == original,
+             "%d 字节" % len(original))
+
+        # ---- ④ 载荷解不开 → 没有暗号（主进程会等待超时）----
+        rc2 = updater.apply_update_main("bm90LWpzb24=")
+        _add("坏载荷 rc=2（旧行为保持）", rc2 == 2, "rc=%r" % (rc2,))
+
+        # ---- ⑤ wait_for_updater_ack 两种结局 ----
+        _add("暗号已出现 → 立即可退出",
+             updater.wait_for_updater_ack(ack3, timeout=1.0) is True)
+        missing = os.path.join(work, "never.ack")
+        t0 = time.monotonic()
+        got = updater.wait_for_updater_ack(missing, timeout=0.4,
+                                           interval=0.05)
+        _add("暗号始终不出现 → 超时返回 False（主进程不许退出）",
+             got is False and time.monotonic() - t0 < 2.0,
+             "got=%r 耗时=%.2fs" % (got, time.monotonic() - t0))
+        _add("旧载荷没有暗号路径 → 不等待（向后兼容）",
+             updater.wait_for_updater_ack("", timeout=0.1) is True)
+
+        # ---- ⑥ 暗号路径能原样穿过命令行往返（base64 载荷完整性）----
+        b64 = updater.encode_payload(pl)
+        back = updater.decode_payload(b64)
+        _add("暗号路径经 base64 往返后一字不差",
+             back.get("ack_file") == ack3,
+             "%r vs %r" % (back.get("ack_file"), ack3))
+    except Exception as e:
+        _add("暗号握手自检未崩溃", False, repr(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        # 本测试真的 stage 过一份替换器副本（源码态是 python.exe），
+        # 顺手把自己那个清掉，别给 %TEMP% 留垃圾
+        try:
+            shutil.rmtree(os.path.join(
+                tempfile.gettempdir(), "Yuhub_upd_%d" % os.getpid()),
+                ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _test_replace_fallbacks():
+    """回归：③b 就位失败不能放弃治疗 + 回滚要带重试。
+
+    两个真实场景：
+      * **跨盘**：exe 装在 D:\、更新包在 C:\\LOCALAPPDATA，改名就位
+        可能直接失败。过去这里只能回滚 —— 装在非系统盘的用户
+        每次更新都静默失败。现在先试「拷贝 + 大小校验 + 删源」。
+      * **回滚被短暂占用**：新版秒退后文件句柄可能还被杀软占着，
+        一次 os.replace 失败就放弃会把用户留在「没有 exe」的状态。
+        现在回滚带 5 次重试。
+    """
+    d = tempfile.mkdtemp(prefix="Yuhub_fb_")
+    try:
+        # ---- ① _copy_into_place 单测：正常路径 ----
+        src = os.path.join(d, "src.bin")
+        dst = os.path.join(d, "dst.bin")
+        data = os.urandom(4096)
+        with open(src, "wb") as f:
+            f.write(data)
+        ok_copy = updater._copy_into_place(src, dst)
+        _add("拷贝兜底：正常路径成功", ok_copy and os.path.isfile(dst)
+             and not os.path.exists(src)
+             and open(dst, "rb").read() == data,
+             "ok=%s dst=%s" % (ok_copy, os.path.isfile(dst)))
+
+        # 源不存在 → 明确失败，不半吊子
+        ok_missing = updater._copy_into_place(os.path.join(d, "nope.bin"),
+                                              os.path.join(d, "dst2.bin"))
+        _add("拷贝兜底：源不存在时返回 False", ok_missing is False,
+             "返回 %r" % (ok_missing,))
+
+        # ---- ② 集成：os.replace 就位失败时必须走拷贝兜底 ----
+        work = os.path.join(d, "apply")
+        os.makedirs(work, exist_ok=True)
+        target = os.path.join(work, "Target.exe")
+        shutil.copy2(updater.current_exe(), target)
+        original = open(target, "rb").read()
+        new_exe = os.path.join(work, "incoming.exe")
+        with open(new_exe, "wb") as f:
+            f.write(_fake_pe_payload())
+        pl = updater.build_request(new_exe, target, 0, new_version="vtest")
+
+        real_replace = os.replace
+        state = {"n": 0}
+
+        def flaky_replace(a, b):
+            # 只针对「新包 → 目标」这一次失败（模拟跨盘 MoveFileEx 报错），
+            # 其余（含回滚的 .bak → target）原样放行
+            if a == new_exe and b == target:
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise OSError(17, "系统无法将文件移到不同的磁盘驱动器。",
+                                  None, 17)
+            return real_replace(a, b)
+
+        spy = {"called": False}
+        real_copy = updater._copy_into_place
+
+        def spy_copy(a, b):
+            spy["called"] = True
+            return real_copy(a, b)
+
+        updater._copy_into_place = spy_copy
+        os.replace = flaky_replace
+        try:
+            rc = updater.apply_update_main(updater.encode_payload(pl))
+        finally:
+            os.replace = real_replace
+            updater._copy_into_place = real_copy
+
+        _add("③b 改名失败时走了拷贝兜底", spy["called"] is True,
+             "替换尝试=%d" % state["n"])
+        # 兜底成功 → 流程继续走到「启动新版」；假 PE 起不来 → rc=7 + 回滚。
+        # 若没有兜底，这里会是 rc=6（直接回滚）。用 rc 区分两条路。
+        _add("兜底后流程继续（启动失败 rc=7 而非就位失败 rc=6）",
+             rc == 7, "rc=%r" % (rc,))
+        _add("回滚后目标恢复原样（用户至少还能用旧版）",
+             os.path.isfile(target)
+             and open(target, "rb").read() == original,
+             "target 存在=%s" % os.path.isfile(target))
+        _add("回滚后不遗留 .bak",
+             not os.path.exists(target + ".bak"),
+             "bak=%s" % os.path.exists(target + ".bak"))
+
+        # ---- ③ 回滚重试：第一次 os.replace 失败不应放弃 ----
+        target2 = os.path.join(work, "Target2.exe")
+        bak2 = target2 + ".bak"
+        with open(target2, "wb") as f:
+            f.write(b"OLD")
+        with open(bak2, "wb") as f:
+            f.write(b"NEWBACKUP")
+        tries = {"n": 0}
+
+        def flaky_rollback(a, b):
+            if a == bak2 and b == target2:
+                tries["n"] += 1
+                if tries["n"] < 3:
+                    raise OSError(32, "另一个程序正在使用此文件。", None, 32)
+            return real_replace(a, b)
+
+        os.replace = flaky_rollback
+        try:
+            rolled = updater._rollback(bak2, target2, True)
+        finally:
+            os.replace = real_replace
+        _add("回滚带重试：前两次失败后第三次成功",
+             rolled is True and tries["n"] == 3
+             and open(target2, "rb").read() == b"NEWBACKUP",
+             "rolled=%s 尝试=%d" % (rolled, tries["n"]))
+    except Exception as e:
+        _add("替换兜底自检未崩溃", False, repr(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _test_checker_signals_connectable():
     """回归：UpdateChecker 的 Qt 信号必须能 connect。
 
@@ -938,6 +1160,34 @@ def _test_checker_signals_connectable():
         _add("三个信号实际 connect 不报错", True, "已连接空槽")
     except Exception as e:
         _add("三个信号实际 connect 不报错", False, repr(e))
+
+    # ---- 启动暗号的 UI 接线必须存在（2026-10-19 修复的核心 glue）----
+    # 纯函数 wait_for_updater_ack 由 _test_ack_handshake 覆盖；这里钉住
+    # 主窗口那一层：_apply_update 之后必须走暗号等待，而不是直接退出。
+    # ⚠️ 源码引用检查只在**源码态**做：冻结态只有 .pyc，inspect.getsource
+    # 必然失败（那不是产品问题，是断言自己的局限）。
+    try:
+        import inspect
+
+        from ui.main_window import MainWindow
+        has_wait = callable(getattr(MainWindow,
+                                    "_await_updater_ack_then_quit", None))
+        _add("主窗口有暗号等待方法（_await_updater_ack_then_quit）",
+             has_wait, "存在=%s" % has_wait)
+        if getattr(sys, "frozen", False):
+            _add("_apply_update 接线到暗号等待（冻结态验方法存在）",
+                 has_wait, "冻结态无源码可查，方法存在=%s" % has_wait)
+        else:
+            try:
+                src = inspect.getsource(MainWindow._apply_update)
+            except Exception:  # noqa: BLE001
+                src = ""
+            wired = ("_await_updater_ack_then_quit" in (src or "")
+                     and "ack_file" in (src or ""))
+            _add("_apply_update 接线到暗号等待（拿到确认才退出）", wired,
+                 "源码引用=%s" % wired)
+    except Exception as e:
+        _add("主窗口暗号接线检查未崩溃", False, repr(e))
 
 
 
@@ -1003,6 +1253,8 @@ def run(out_path):
         _test_selftest_mode_guarded()
         _test_package_guard()
         _test_elevation_decision()
+        _test_ack_handshake()
+        _test_replace_fallbacks()
         _test_checker_signals_connectable()
 
     except Exception as e:

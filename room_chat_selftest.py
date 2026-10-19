@@ -222,11 +222,15 @@ def run(out_file, timeout_sec=90):
             chk("★ 分享文件 → 聊天室出现带下载按钮的消息",
                 len(file_keys) == 1, list(share_b._chat_rows))
             refs = share_b._chat_rows.get(file_keys[0]) if file_keys else {}
+            # 新版文件卡把"文件名"和"体积"拆成两个标签（文件名加粗、体积淡色），
+            # 断言跟着拆开：名字在 name_lbl、体积在 size_lbl。
             chk("文件名与大小都显示",
                 refs.get("name_lbl") is not None
                 and "整合包.zip" in refs["name_lbl"].text()
-                and "256.0 KB" in refs["name_lbl"].text(),
-                refs.get("name_lbl").text() if refs.get("name_lbl") else "")
+                and refs.get("size_lbl") is not None
+                and "256.0 KB" in refs["size_lbl"].text(),
+                (refs.get("name_lbl").text() if refs.get("name_lbl") else "",
+                 refs.get("size_lbl").text() if refs.get("size_lbl") else ""))
 
             # 守门：引擎没起时发送被拦（这里引擎起着，改测空文案）
             ok_send, err = lan_b.send_chat_text("   ")

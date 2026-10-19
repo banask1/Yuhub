@@ -45,6 +45,13 @@ NEW_EXE_GRACE = 5.0
 # 等旧进程退出的上限，超时就强杀
 WAIT_OLD_PID_TIMEOUT = 30.0
 
+# 主进程等替换器「启动暗号」的上限。ShellExecuteW(runas) 返回成功只代表
+# 「已发起启动」——UAC 被用户点否 / 替换器被安全软件拦截 / 进程秒退时，
+# 替换器其实从未运行。主进程过去不等任何确认就退出自己，用户看到的就是
+# 「下载完了、窗口关了、版本没变」（2026-10-15 物证：%TEMP% 留下
+# Yuhub_upd_5588 而替换器从未收尾）。现在必须拿到暗号才准退出。
+ACK_TIMEOUT = 45.0
+
 _CREATE_NO_WINDOW = 0x08000000
 
 
@@ -876,8 +883,13 @@ def sys_executable():
 # ================================================================ 替换请求
 
 def build_request(new_exe, target_exe, old_pid, new_version="",
-                  launch_args=None, backup=True):
-    """构造传给替换器的载荷（会被 base64 编码）。"""
+                  launch_args=None, backup=True, ack_file=""):
+    """构造传给替换器的载荷（会被 base64 编码）。
+
+    ack_file：替换器启动后必须**第一件事**写入的「暗号文件」路径。
+    主进程凭它确认替换器真的起来了，才允许自己退出（见 ACK_TIMEOUT）。
+    通常由 stage_updater 自动填，这里留参数位供自检/调用方显式指定。
+    """
     return {
         "new_exe": os.path.abspath(new_exe),
         "target_exe": os.path.abspath(target_exe),
@@ -885,6 +897,7 @@ def build_request(new_exe, target_exe, old_pid, new_version="",
         "new_version": new_version,
         "launch_args": list(launch_args or []),
         "backup": bool(backup),
+        "ack_file": os.path.abspath(ack_file) if ack_file else "",
     }
 
 
@@ -912,20 +925,55 @@ def stage_updater(payload):
     一遍，把「本进程之外的、看起来没在跑的」旧目录清掉。
     只删名字符合 `Yuhub_upd_<数字>` 的目录，且**跳过自己那个**，
     不碰任何其他临时文件。
+
+    ⚠️ 启动暗号（2026-10-19）：本函数会把 `ack_file` 写进 payload ——
+    替换器启动后第一件事就是创建这个文件，主进程见到它才肯退出自己。
+    若沿用上一次同 PID 残留的旧暗号，主进程会在替换器起来之前就「确认
+    成功」直接退出，暗号形同虚设，所以这里必须先删掉陈旧暗号。
     """
     me = current_exe()
     _sweep_stale_updater_dirs(keep_pid=os.getpid())
 
     d = os.path.join(tempfile.gettempdir(), "Yuhub_upd_%d" % os.getpid())
     os.makedirs(d, exist_ok=True)
-    upd = os.path.join(d, "Yuhub_updater.exe")
+    ack = os.path.join(d, "ack")
     try:
+        if os.path.exists(ack):
+            os.remove(ack)              # 陈旧暗号必须先删，否则主进程会被骗
+    except OSError:
+        pass
+    try:
+        upd = os.path.join(d, "Yuhub_updater.exe")
         shutil.copy2(me, upd)
     except Exception:
         # 同盘拷贝一般没问题；失败时退回一个更短的名字再试
         upd = os.path.join(tempfile.gettempdir(), "Yuhub_upd_%d.exe" % os.getpid())
         shutil.copy2(me, upd)
+        ack = upd + ".ack"
+        try:
+            if os.path.exists(ack):
+                os.remove(ack)
+        except OSError:
+            pass
+    if isinstance(payload, dict):
+        payload["ack_file"] = os.path.abspath(ack)
     return upd
+
+
+def wait_for_updater_ack(ack_file, timeout=ACK_TIMEOUT, interval=0.25):
+    """等替换器的启动暗号。返回 True = 替换器已确认运行。
+
+    纯轮询实现（不依赖 Qt），供主界面与自检共用。ack_file 为空
+    （旧载荷没有暗号）时直接返回 True —— 保持向后兼容。
+    """
+    if not ack_file:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(ack_file):
+            return True
+        time.sleep(interval)
+    return False
 
 
 def _sweep_stale_updater_dirs(keep_pid=None, max_age=1800.0):
@@ -980,6 +1028,12 @@ def launch_updater(updater_path, payload, elevated=False):
     ⚠️ elevated=False 但启动仍被 Windows 拒绝（WinError 740）时，
     自动回退到提权重试一次。以前这里是直接抛异常 → 消息弹一下 →
     用户看到「窗口关了、版本没变」，自动更新等于静默失效。
+
+    ⚠️ 返回 True **不等于**替换器已经在跑：ShellExecuteW 只是接受了
+    启动请求，UAC 被点否 / 进程被拦截 / 秒退时它照样返回成功。
+    调用方必须继续等 `payload["ack_file"]` 暗号出现
+    （updater.wait_for_updater_ack）才能认定替换器已就绪；
+    等不到就不要退出自己，把选择权还给用户。
     """
     args = ["--apply-update", encode_payload(payload)]
 
@@ -1104,6 +1158,29 @@ def _quote_win_arg(a):
     return "".join(out)
 
 
+# ShellExecuteW 的正确原型。直接用 ctypes.windll.shell32.ShellExecuteW 时
+# restype 默认是 c_int（32 位），而它实际返回 64 位 HINSTANCE —— 高位被
+# 截断后，返回值恰好 ≤32 或为负时会被误判成「启动失败」（SE_ERR 判定区间），
+# 一次莫名其妙的更新失败。这里一次性把原型钉死。
+# ⚠️ 别用 WINFUNCTYPE(...)(("shell32", "ShellExecuteW")) 的元组形式 ——
+# 元组第一元素必须是 CDLL 实例而不是字符串（会抛
+# AttributeError: 'str' object has no attribute '_handle'）。
+try:
+    _shell32 = ctypes.windll.shell32
+    _shell32.ShellExecuteW.restype = ctypes.c_void_p      # HINSTANCE，勿截断
+    _shell32.ShellExecuteW.argtypes = [
+        ctypes.c_void_p,          # hwnd
+        ctypes.c_wchar_p,         # lpOperation
+        ctypes.c_wchar_p,         # lpFile
+        ctypes.c_wchar_p,         # lpParameters
+        ctypes.c_wchar_p,         # lpDirectory
+        ctypes.c_int,             # nShowCmd
+    ]
+    _ShellExecuteW = _shell32.ShellExecuteW
+except Exception:                                     # noqa: BLE001
+    _ShellExecuteW = None
+
+
 def _runas_launch(exe_path, args):
     """用 ShellExecuteW(runas) 提权启动 exe。返回 (ok, message)。
 
@@ -1111,13 +1188,22 @@ def _runas_launch(exe_path, args):
     base64 载荷（含 `+` `/` `=`）与带空格的路径都会被拆词，
     替换器收到残缺载荷直接 return 2。现在逐个参数加引号（见
     _quote_win_arg），这是 lpParameters 唯一可行的传参方式。
+
+    ⚠️ 返回值 >32 只代表「ShellExecute 接受了启动请求」，**不代表进程
+    已经跑起来**（UAC 可能被点否、可能被安全软件拦截）。调用方必须再等
+    替换器的启动暗号（wait_for_updater_ack）才能认定成功，见
+    ACK_TIMEOUT 的说明。
     """
     SW_SHOWNORMAL = 1
     params = " ".join(_quote_win_arg(a) for a in args)
     try:
-        r = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", exe_path, params, None, SW_SHOWNORMAL)
-        if int(r) > 32:
+        if _ShellExecuteW is not None:
+            r = _ShellExecuteW(None, "runas", exe_path, params, None,
+                               SW_SHOWNORMAL)
+        else:                       # 原型取不到时的退化路径
+            r = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", exe_path, params, None, SW_SHOWNORMAL)
+        if r and int(r) > 32:
             return True, "已请求管理员权限启动更新"
         # 5 = ERROR_ACCESS_DENIED，最常见的是用户在 UAC 上点了「否」
         return False, "提权启动被拒绝（请在弹出的 UAC 窗口点「是」）"
@@ -1193,6 +1279,21 @@ def apply_update_main(b64_payload):
         _ulog("载荷解码失败：%r -> rc=2" % (exc,))
         return 2
 
+    # ---- ⓪ 启动暗号：告诉主进程「我起来了、载荷也解开了」----
+    # 必须赶在一切文件操作之前。主进程靠它决定自己能不能退出：
+    # 拿不到暗号就说明替换器没真正运行（UAC 被否 / 被拦截 / 秒退），
+    # 主进程会留住窗口并告知用户，而不是自己先蒸发掉。
+    ack_file = p.get("ack_file") or ""
+    if ack_file:
+        try:
+            os.makedirs(os.path.dirname(ack_file), exist_ok=True)
+            with open(ack_file, "w", encoding="utf-8") as f:
+                f.write("%d\n" % os.getpid())
+            _ulog("启动暗号已写入：%s" % ack_file)
+        except OSError as e:
+            # 暗号写不出去不影响替换本身（回退到旧行为），但要留痕
+            _ulog("启动暗号写入失败（主进程将等待超时）：%r" % (e,))
+
     new_exe = p.get("new_exe") or ""
     target = p.get("target_exe") or ""
     old_pid = int(p.get("old_pid") or 0)
@@ -1262,15 +1363,22 @@ def apply_update_main(b64_payload):
         os.replace(new_exe, target)       # 新 → 原路径
         _ulog("③b 新包就位：成功")
     except OSError as e:
-        # 新文件就位失败 → 回滚旧版，保证用户至少还能用
-        _ulog("③b 失败 winerror=%s %s -> 回滚 -> rc=6" % (e.winerror, e))
-        try:
-            if do_backup and os.path.exists(bak):
-                os.replace(bak, target)
-                _ulog("回滚成功")
-        except OSError:
-            pass
-        return 6
+        # 改名就位失败 ≠ 没救。最常见的是**跨盘**：exe 装在 D:\ 而更新
+        # 目录在 C:\LOCALAPPDATA，MoveFileEx 在部分文件系统/网络盘组合下
+        # 会直接失败。先试「拷贝 + 大小校验 + 删源」兜底，仍失败才回滚。
+        _ulog("③b 改名就位失败 winerror=%s %s -> 尝试拷贝兜底"
+              % (getattr(e, "winerror", None), e))
+        if _copy_into_place(new_exe, target):
+            _ulog("③b 拷贝兜底就位：成功")
+        else:
+            _ulog("③b 拷贝兜底也失败 -> 回滚 -> rc=6")
+            try:
+                if do_backup and os.path.exists(bak):
+                    os.replace(bak, target)
+                    _ulog("回滚成功")
+            except OSError:
+                pass
+            return 6
 
     # ---- ④ 启动新版 ----
     try:
@@ -1324,15 +1432,39 @@ def apply_update_main(b64_payload):
     return 0
 
 
-def _rollback(bak, target, do_backup):
-    """把 .bak 还原成 target。返回是否成功。"""
-    if not do_backup or not os.path.exists(bak):
-        return False
+def _copy_into_place(src, dst):
+    """os.replace 失败时的兜底就位：拷贝 + 大小校验 + 删源。
+
+    跨盘（exe 在 D:、更新包在 C:）时改名会失败，这条路径保证
+    「装在非系统盘的用户」也能正常更新，而不是每次静默回滚。
+    返回是否成功；任何一步不对都不留半成品（dst 保持原样，
+    由调用方决定回滚）。
+    """
     try:
-        os.replace(bak, target)
+        shutil.copy2(src, dst)
+        if os.path.getsize(src) != os.path.getsize(dst):
+            return False
+        os.remove(src)
         return True
     except OSError:
         return False
+
+
+def _rollback(bak, target, do_backup):
+    """把 .bak 还原成 target。返回是否成功。
+
+    带重试：新版刚退出时文件句柄可能还被杀软/系统短暂占着，
+    一次 os.replace 失败就放弃会把用户留在「没有 exe」的状态里。
+    """
+    if not do_backup or not os.path.exists(bak):
+        return False
+    for _ in range(5):
+        try:
+            os.replace(bak, target)
+            return True
+        except OSError:
+            time.sleep(0.3)
+    return False
 
 
 def _cleanup_self():

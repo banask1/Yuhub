@@ -24,8 +24,10 @@
 换来的是画面完全不经过任何第三方服务器（局域网直连 / EasyTier 打洞与中继）。
 """
 
+import os
 import threading
 import time
+import zlib
 
 from PySide6.QtCore import (
     QBuffer,
@@ -45,6 +47,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QVBoxLayout,
@@ -79,6 +82,59 @@ SCREEN_RESOLVE_TTL = 1.0
 #: 聊天气泡的最大宽度（像素）。聊天卡大约是底部行的一半宽，360 是
 #: "长句能换行、短行不占满"的折中。
 CHAT_BUBBLE_MAX_W = 360
+
+#: 头像底色板：按昵称哈希**稳定**取色（同一个人永远同一个色，换设备也一样），
+#: 每项是 (浅色主题, 深色主题)。水墨主题本身是单色的，身份色靠这一小组
+#: 低饱和色区分——既不会破坏纸墨观感，又让"谁在说话"一眼可辨。
+_AVATAR_COLORS = (
+    ("#3f6ea8", "#7db2e6"),   # 靛蓝
+    ("#2f7d6b", "#6fc7b2"),   # 青绿
+    ("#9a6b2f", "#e0b06a"),   # 琥珀
+    ("#8a4a6b", "#d99ec0"),   # 玫红
+    ("#5a6b3a", "#a8c47a"),   # 橄榄
+    ("#5b5aa8", "#a3a2e8"),   # 紫
+)
+
+#: 文件卡色块：按扩展名分类取色（浅色, 深色）。压缩包/程序/媒体/文档
+#: 各一组，其余归"其他"。色块上写扩展名，扫一眼就知道是什么文件。
+_FILE_COLORS = {
+    "archive": ("#9a6b2f", "#e0b06a"),
+    "app":     ("#3f6ea8", "#7db2e6"),
+    "media":   ("#8a4a6b", "#d99ec0"),
+    "doc":     ("#2f7d6b", "#6fc7b2"),
+    "other":   ("#6b6b66", "#9a9a94"),
+}
+_FILE_EXTS = {
+    "archive": {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"},
+    "app": {"exe", "msi", "bat", "cmd", "ps1", "apk", "dmg", "appimage"},
+    "media": {"mp4", "mkv", "avi", "mov", "mp3", "flac", "wav",
+              "png", "jpg", "jpeg", "gif", "webp", "bmp"},
+    "doc": {"txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+            "md", "log", "json", "csv"},
+}
+
+
+def _avatar_color(name):
+    """按昵称稳定取一个头像底色（同昵称同色）。"""
+    idx = zlib.crc32((name or "?").encode("utf-8")) % len(_AVATAR_COLORS)
+    return _AVATAR_COLORS[idx][1 if theme.get_theme() == "dark" else 0]
+
+
+def _file_kind(name):
+    """按扩展名判断文件类别（用于色块配色）。"""
+    ext = os.path.splitext(str(name or ""))[1].lstrip(".").lower()
+    for kind, exts in _FILE_EXTS.items():
+        if ext in exts:
+            return kind, ext
+    return "other", ext
+
+
+def _chat_time(ts):
+    """记录里的时间戳 → 'HH:MM'（没有就空串）。"""
+    try:
+        return time.strftime("%H:%M", time.localtime(float(ts or 0)))
+    except (TypeError, ValueError, OSError):
+        return ""
 
 
 def room_chat_text_max():
@@ -809,7 +865,7 @@ class SharePage(BasePage):
         inner = QWidget()
         self._chat_list = QVBoxLayout(inner)
         self._chat_list.setContentsMargins(0, 0, 0, 0)
-        self._chat_list.setSpacing(4)
+        self._chat_list.setSpacing(6)
         # 空态提示放在最上面，stretch 垫底——消息插到 stretch 之前即可
         self._chat_empty = QLabel()
         self._chat_empty.setObjectName("Faint")
@@ -826,8 +882,9 @@ class SharePage(BasePage):
         self._chat_input.setPlaceholderText("进入异地联机的房间后，这里就能聊天…")
         self._chat_input.setMaxLength(room_chat_text_max())
         self._chat_input.returnPressed.connect(self._send_chat)
-        self._chat_send = ghost_button("发送")
+        self._chat_send = primary_button("发送")
         self._chat_send.setCursor(Qt.PointingHandCursor)
+        self._chat_send.setFixedHeight(30)
         self._chat_send.clicked.connect(self._send_chat)
         row.addWidget(self._chat_input, 1)
         row.addWidget(self._chat_send)
@@ -980,27 +1037,51 @@ class SharePage(BasePage):
         self._chat_empty.setStyleSheet("font-size: 11px; color: %s;"
                                        % p["text_faint"])
         for refs in list(self._chat_rows.values()):
+            me = bool(refs.get("me"))
             bubble = refs.get("bubble")
             nick = refs.get("nick_lbl")
+            av = refs.get("avatar")
+            tile = refs.get("tile")
             if bubble is not None:
                 bubble.setStyleSheet(
                     "QFrame#ChatBubble { background: %s;"
-                    " border: 1px solid %s; border-radius: 8px; }"
-                    % (p["surface_hover"], p["border"]))
-            if nick is not None and not refs.get("me"):
-                nick.setStyleSheet("font-size: 11px; font-weight: 700;"
-                                   " color: %s;" % p["text_dim"])
-            elif nick is not None:
-                nick.setStyleSheet("font-size: 11px; font-weight: 700;"
-                                   " color: %s;" % p["accent"])
+                    " border: 1px solid %s; border-radius: 10px; }"
+                    % (p["accent_soft"] if me else p["surface_sunken"],
+                       p["accent"] if me else p["border"]))
+            if nick is not None:
+                nick.setStyleSheet("font-size: 12px; font-weight: 700;"
+                                   " color: %s;" % p["text"])
+            if av is not None:
+                av.setStyleSheet(
+                    "background: %s; color: %s; border: none;"
+                    " border-radius: 6px; font-size: 12px; font-weight: 700;"
+                    % (p["accent"] if me else _avatar_color(av.text()),
+                       p["accent_text"] if me else "#ffffff"))
+            if tile is not None and not refs.get("withdrawn"):
+                kind = refs.get("tile_kind") or "other"
+                tile.setStyleSheet(
+                    "background: %s; color: #ffffff; border: none;"
+                    " border-radius: 6px; font-size: 9px; font-weight: 700;"
+                    % _FILE_COLORS[kind][
+                        1 if theme.get_theme() == "dark" else 0])
         # 已撤回的行：灰色斜体（_mark_chat_withdrawn 写的内联样式会被
         # 主题切换覆盖掉，所以撤回态在这里按标记重刷一遍）
         for refs in list(self._chat_rows.values()):
             if refs.get("withdrawn"):
                 lbl = refs.get("name_lbl")
+                size_lbl = refs.get("size_lbl")
+                tile = refs.get("tile")
                 if lbl is not None:
                     lbl.setStyleSheet("color: %s; font-style: italic;"
                                       % p["text_faint"])
+                if size_lbl is not None:
+                    size_lbl.setStyleSheet("font-size: 11px; color: %s;"
+                                           % p["text_faint"])
+                if tile is not None:
+                    tile.setStyleSheet(
+                        "background: %s; color: #ffffff; border: none;"
+                        " border-radius: 6px; font-size: 9px;"
+                        " font-weight: 700;" % p["text_faint"])
 
     def _hint_off(self):
         return ("在「本机地址」里选哪块网卡，就决定了走哪条链路 ——\n"
@@ -1076,7 +1157,7 @@ class SharePage(BasePage):
             self._chat_empty.setVisible(True)
             self._chat_empty.setText(
                 "还没人说话。\n\n进入「异地联机」的房间后就能和成员聊天；"
-                "临时云盘里分享的文件也会出现在这里，点旁边的图标即可下载。"
+                "临时云盘里分享的文件也会出现在这里，点「下载」即可。"
                 if on else
                 "进入「异地联机」的房间后，这里就能和房间成员聊天。\n"
                 "临时云盘里分享的文件也会出现在这里，可直接下载。")
@@ -1150,55 +1231,123 @@ class SharePage(BasePage):
     def _add_chat_row(self, rec):
         """往聊天列表里加一行，返回该行的控件引用（撤回时原地改它）。
 
-        自己的消息靠右、别人的靠左；文件消息带一个下载图标按钮。
+        布局：**头像（昵称首字 + 稳定色）｜气泡（昵称 + 时间 + 内容）**。
+        自己的消息靠右、头像在气泡右侧；别人的靠左、头像在左侧 ——
+        "谁发的"不再只靠气泡里一行小字，头像 + 颜色 + 左右位置三重编码。
+
+        文件消息在气泡里是一张**文件卡**：扩展名色块 + 文件名 + 体积 +
+        下载按钮。色块按扩展名分类取色（压缩包/程序/媒体/文档），
+        扫一眼就知道点下去会拿到什么。
         """
         p = theme.current()
         me = bool(rec.get("me"))
         kind = str(rec.get("kind") or "text")
         who = "我" if me else (str(rec.get("nick") or "").strip()
                                or str(rec.get("from_ip") or "队友"))
+        stamp = _chat_time(rec.get("ts"))
         row = QWidget()
         h = QHBoxLayout(row)
-        h.setContentsMargins(2, 2, 2, 2)
-        h.setSpacing(6)
+        h.setContentsMargins(2, 3, 2, 3)
+        h.setSpacing(8)
         if me:
             h.addStretch(1)                      # 自己的消息靠右
+
+        # ---- 头像：昵称首字 + 按昵称稳定取色 ----
+        # 位置按微信/QQ 的逻辑：**别人的头像在气泡左边，自己的在右边**。
+        # （`me` 由引擎按"是不是本机发的"打标：本机记录 me=True、收到的
+        #   数据报 me=False —— 所以在任何一台电脑上跑，左右逻辑都一致。）
+        av = QLabel(who[:1] or "?")
+        av.setFixedSize(28, 28)
+        av.setAlignment(Qt.AlignCenter)
+        av.setStyleSheet(
+            "background: %s; color: %s; border: none; border-radius: 6px;"
+            " font-size: 12px; font-weight: 700;"
+            % (p["accent"] if me else _avatar_color(who),
+               p["accent_text"] if me else "#ffffff"))
+        if not me:
+            h.addWidget(av, 0, Qt.AlignTop)
+
         bubble = QFrame()
         bubble.setObjectName("ChatBubble")
         bubble.setMaximumWidth(CHAT_BUBBLE_MAX_W)
+        # 自己的气泡用主色淡底 + 主色描边，别人的用中性下沉色：
+        # 左右分栏之外再加一层底色区分，扫过去就能分清"我说的/别人说的"。
         bubble.setStyleSheet(
             "QFrame#ChatBubble { background: %s; border: 1px solid %s;"
-            " border-radius: 8px; }" % (p["surface_hover"], p["border"]))
+            " border-radius: 10px; }"
+            % (p["accent_soft"] if me else p["surface_sunken"],
+               p["accent"] if me else p["border"]))
         bv = QVBoxLayout(bubble)
-        bv.setContentsMargins(9, 5, 9, 6)
-        bv.setSpacing(3)
+        bv.setContentsMargins(10, 7, 10, 8)
+        bv.setSpacing(4)
+
+        # ---- 头部：昵称（粗）+ 时间（淡）----
+        head = QHBoxLayout()
+        head.setSpacing(6)
         nick_lbl = QLabel(who)
         nick_lbl.setStyleSheet(
-            "font-size: 11px; font-weight: 700; color: %s;"
-            % (p["accent"] if me else p["text_dim"]))
-        bv.addWidget(nick_lbl)
+            "font-size: 12px; font-weight: 700; color: %s;"
+            % (p["text"] if me else p["text"]))
+        head.addWidget(nick_lbl)
+        if stamp:
+            time_lbl = QLabel(stamp)
+            time_lbl.setStyleSheet("font-size: 10px; color: %s;"
+                                   % p["text_faint"])
+            head.addWidget(time_lbl)
+        head.addStretch(1)
+        bv.addLayout(head)
+
         refs = {"row": row, "bubble": bubble, "nick_lbl": nick_lbl,
-                "me": me, "withdrawn": False}
+                "avatar": av, "me": me, "withdrawn": False}
         if kind == "file":
             line = QHBoxLayout()
-            line.setSpacing(8)
-            size = lan_share.human_size(int(rec.get("size") or 0))
-            name_lbl = QLabel("%s（%s）" % (str(rec.get("name") or "文件"),
-                                           size))
+            line.setSpacing(9)
+            # 扩展名色块：分类取色 + 写扩展名（最多 3 个字符）
+            fname = str(rec.get("name") or "文件")
+            fkind, ext = _file_kind(fname)
+            tile = QLabel((ext[:3] or "?").upper())
+            tile.setFixedSize(30, 30)
+            tile.setAlignment(Qt.AlignCenter)
+            tile.setStyleSheet(
+                "background: %s; color: #ffffff; border: none;"
+                " border-radius: 6px; font-size: 9px; font-weight: 700;"
+                % _FILE_COLORS[fkind][1 if theme.get_theme() == "dark" else 0])
+            line.addWidget(tile, 0, Qt.AlignVCenter)
+
+            info = QVBoxLayout()
+            info.setSpacing(1)
+            name_lbl = QLabel(fname)
             name_lbl.setWordWrap(True)
             name_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            name_lbl.setStyleSheet("font-size: 12px; color: %s;" % p["text"])
-            line.addWidget(name_lbl, 1)
-            btn = ghost_button("⬇")
-            btn.setFixedWidth(34)
-            btn.setToolTip("下载：%s" % str(rec.get("name") or "文件"))
+            name_lbl.setStyleSheet(
+                "font-size: 12px; font-weight: 600; color: %s;" % p["text"])
+            info.addWidget(name_lbl)
+            size_lbl = QLabel(lan_share.human_size(int(rec.get("size") or 0)))
+            size_lbl.setStyleSheet("font-size: 11px; color: %s;"
+                                   % p["text_faint"])
+            info.addWidget(size_lbl)
+            line.addLayout(info, 1)
+
+            # 「下载」用 MiniButton（内边距 2px 12px）而不是 ghost_button
+            # （9px 18px）：气泡最大 360px，长文件名换行后行内剩余宽度不够，
+            # ghost 的 36px 左右内边距会把"下载"两个字挤成显示不全。
+            # 再给一个最小宽度兜底，任何文件名下都不会被压。
+            btn = QPushButton("下载")
+            btn.setObjectName("MiniButton")
+            btn.setFixedHeight(26)
+            btn.setMinimumWidth(56)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip("下载：%s" % fname)
             # lambda 里抓 rec 的副本：行建好后记录不会再变，但闭包抓可变
             # 字典的话，将来若记录被改写（撤回）按钮行为会跟着漂。
             btn.clicked.connect(
                 lambda _=False, r=dict(rec): self._download_chat_file(r))
-            line.addWidget(btn)
+            line.addWidget(btn, 0, Qt.AlignVCenter)
             bv.addLayout(line)
             refs["name_lbl"] = name_lbl
+            refs["size_lbl"] = size_lbl
+            refs["tile"] = tile
+            refs["tile_kind"] = fkind
             refs["btn"] = btn
         else:
             body = QLabel(str(rec.get("text") or ""))
@@ -1207,7 +1356,9 @@ class SharePage(BasePage):
             body.setStyleSheet("font-size: 12px; color: %s;" % p["text"])
             bv.addWidget(body)
         h.addWidget(bubble)
-        if not me:
+        if me:
+            h.addWidget(av, 0, Qt.AlignTop)      # 自己的头像在气泡右侧
+        else:
             h.addStretch(1)
         # 插到 stretch 之前：消息自上而下堆积
         self._chat_list.insertWidget(self._chat_list.count() - 1, row)
@@ -1220,10 +1371,21 @@ class SharePage(BasePage):
         p = theme.current()
         lbl = refs.get("name_lbl")
         btn = refs.get("btn")
+        size_lbl = refs.get("size_lbl")
+        tile = refs.get("tile")
         if lbl is not None:
             lbl.setText("已撤回")
             lbl.setStyleSheet("color: %s; font-style: italic;"
                               % p["text_faint"])
+        if size_lbl is not None:
+            size_lbl.setText("对方撤回了这个文件")
+            size_lbl.setStyleSheet("font-size: 11px; color: %s;"
+                                   % p["text_faint"])
+        if tile is not None:
+            tile.setStyleSheet(
+                "background: %s; color: #ffffff; border: none;"
+                " border-radius: 6px; font-size: 9px; font-weight: 700;"
+                % p["text_faint"])
         if btn is not None:
             btn.setEnabled(False)
             btn.setToolTip("对方已撤回这个文件")

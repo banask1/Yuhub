@@ -1034,8 +1034,27 @@ class MainWindow(QWidget):
             self._apply_update(info, r[2])
 
     def _apply_update(self, info, package):
-        """把更新交给替换器：拷一份自己做替换器 → 拉起 → 自己退出。"""
+        """把更新交给替换器：拷一份自己做替换器 → 拉起 → 确认它真的
+        起来了 → 自己退出。
+
+        ⚠️ 最后一步「确认」是 2026-10-19 补的，且是本次自动更新修复的
+        核心：ShellExecuteW 返回成功只代表「已发起启动」，UAC 被点否 /
+        替换器被安全软件拦截 / 进程秒退时它照样返回 True。过去这里
+        不等任何确认就退出自己，用户看到的就是「下载完了、窗口关了、
+        版本没变」—— 与 v1.0 时代WinError 740 事故同款的静默失效
+        （10-15 物证：%TEMP% 留下 Yuhub_upd_5588，替换器从未收尾）。
+        现在必须拿到替换器的启动暗号才准退出；拿不到就留住窗口、
+        明确告知用户，把「重试」的选择权还给用户。
+        """
         import updater
+
+        # 源码运行态没有"可替换的 exe"这回事（stage 出来的是解释器），
+        # 走替换链路只会拉起一个 python.exe --apply-update <乱码> 然后
+        # 莫名其妙地退出。这里直接拦下并说清楚。
+        if not getattr(sys, "frozen", False):
+            show_toast(self, "源码运行模式不支持自动替换，请用打包后的 "
+                             "Yuhub.exe 测试")
+            return
 
         # 体检更新包：不合格就**不要**进入替换流程。
         # 因为一旦把替换器拉起来，本进程马上就退出了；替换器再发现包是坏的，
@@ -1051,6 +1070,7 @@ class MainWindow(QWidget):
                 package, updater.sys_executable(), os.getpid(),
                 new_version=info.tag,
             )
+            # stage_updater 会把启动暗号路径填进 payload["ack_file"]
             staged = updater.stage_updater(payload)
             # ⚠️ 必须把 staged（替换器副本）传进去判提权：副本带
             # requireAdministrator 清单，跟目标目录可不可写无关。
@@ -1067,9 +1087,45 @@ class MainWindow(QWidget):
             show_toast(self, msg)
             return
 
-        # 更新程序已接手，本进程必须退出，否则它等不到旧 PID 结束
-        show_toast(self, "正在更新，程序即将重启…")
-        QTimer.singleShot(600, self.request_quit)
+        # 启动请求已被接受，但替换器是否真的跑起来还没确认 ——
+        # 进入暗号等待，见 _await_updater_ack_then_quit。
+        show_toast(self, "正在启动更新程序（如弹出 UAC 请点「是」）…")
+        self._await_updater_ack_then_quit(payload.get("ack_file") or "")
+
+    def _await_updater_ack_then_quit(self, ack_file,
+                                     timeout=None):
+        """等替换器的启动暗号，拿到了才退出自己。
+
+        轮询用 QTimer 链而不是 time.sleep —— 主线程必须继续转，
+        否则 toast 动画、UAC 相关消息都泵不动。超时（默认
+        updater.ACK_TIMEOUT）拿不到暗号 ⇒ 替换器没真正运行，
+        此时**绝不退出**：用户会看到明确失败提示，可以重试；
+        旧行为是直接退出，用户只看到窗口消失、什么也没发生。
+        """
+        import time as _time
+
+        import updater
+        limit = (updater.ACK_TIMEOUT if timeout is None else float(timeout))
+        deadline = _time.time() + limit
+
+        def tick():
+            if (not ack_file) or os.path.exists(ack_file):
+                # 暗号已到 → 替换器接管，本进程必须退出，否则它等不到
+                # 旧 PID 结束。（没有暗号路径属于异常兜底：与
+                # updater.wait_for_updater_ack("") 的口径一致 ——
+                # 不等，直接放行。）
+                show_toast(self, "正在更新，程序即将重启…")
+                QTimer.singleShot(600, self.request_quit)
+                return
+            if _time.time() >= deadline:
+                show_toast(
+                    self,
+                    "更新程序未能启动，程序不会关闭。请重试；"
+                    "详情见 %LOCALAPPDATA%\\Yuhub\\update\\replace.log")
+                return
+            QTimer.singleShot(250, tick)
+
+        QTimer.singleShot(250, tick)
 
     def apply_repair_package(self, info, package):
         """一键修复软件的替换入口（设置中心调用）。

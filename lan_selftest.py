@@ -172,10 +172,14 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
         # 才严格校验。
         try:
             import subprocess as _sp
+            # 规则名以 etier 里的**当前定义**为准（曾经叫「Yuhub 联机昵称信标」，
+            # 0.9beta 起改叫「Yuhub 联机信标与聊天」——自检若继续按旧名查，
+            # 规则明明存在也会判红，这种"自检自己过期"的红最误导人）。
+            # 用 name=all 拉全量再搜，比按名精确查更能扛住以后的改名。
             r = _sp.run(
                 ["netsh", "advfirewall", "firewall", "show", "rule",
-                 "name=Yuhub 联机昵称信标"],
-                capture_output=True, timeout=8,
+                 "name=all"],
+                capture_output=True, timeout=15,
                 creationflags=etier._CREATE_NO_WINDOW,
             )
             out_u8 = r.stdout.decode("utf-8", errors="replace")
@@ -183,12 +187,19 @@ def run(out_file, code="yuhub-selftest", password="test1234", keep=False,
             frozen = bool(getattr(sys, "frozen", False))
             # netsh 输出编码随系统代码页变化（本机是 UTF-8，别机可能是
             # GBK），两个解码都查一遍最稳。
-            has_name = ("联机昵称信标" in out_u8) or ("联机昵称信标" in out_gbk)
-            has_port = "41234" in out_u8
+            rule_name = "联机信标与聊天"
+            has_name = ((rule_name in out_u8) or (rule_name in out_gbk)
+                        or ("联机昵称信标" in out_u8)
+                        or ("联机昵称信标" in out_gbk))
+            # 端口也按常量查，别再把 41234 写死（NICK_PORT/CHAT_PORT 一改
+            # 这条就会莫名其妙地红）。
+            has_port = (str(etier.NICK_PORT) in out_u8
+                        and str(etier.CHAT_PORT) in out_u8)
             has_rule = has_name and has_port
             if frozen:
                 mark("昵称信标防火墙规则已配置", has_rule,
-                     "规则存在=%s 含端口=%s" % (has_name, has_port))
+                     "规则存在=%s 含端口=%s（NICK=%d CHAT=%d）"
+                     % (has_name, has_port, etier.NICK_PORT, etier.CHAT_PORT))
             else:
                 mark("昵称信标防火墙规则已配置", True,
                      "源码态宽松校验（watchdog 可能是旧版 exe），规则存在=%s"
@@ -309,6 +320,67 @@ def _check_link_args(etier, mark):
         etier.log_dir = saved
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- 中继连接状态自检（relay_status）：合成日志验，不依赖真实房间 ----
+    # 上半段是**上一次**会话的记录（必须被忽略，否则数字虚高、误导判断），
+    # 下半段是当前会话：2 个中继握手成功、1 个失败、1 条旁路连接、2 个同网络 peer。
+    try:
+        import tempfile as _tf
+        st_dir = _tf.mkdtemp(prefix="yuhub_relayst_")
+        try:
+            lg = os.path.join(st_dir, "easytier.log")
+            with open(lg, "w", encoding="utf-8") as f:
+                f.write(
+                    "2026-10-18T10:00:00 INFO CORE: Starting easytier from cli with config:\n"
+                    "2026-10-18T10:00:01 INFO reconnect: tcp://old.example:11010 done, ret: Ok(\n"
+                    "2026-10-18T10:00:02 INFO CORE: new peer added peer_id=999\n"
+                    "2026-10-18T18:00:00 INFO CORE: Starting easytier from cli with config:\n"
+                    "2026-10-18T18:00:01 INFO reconnect: tcp://easytier.weiai.org.cn:11010 done, ret: Ok(\n"
+                    "2026-10-18T18:00:02 INFO reconnect: tcp://47.108.52.1:11012 done, ret: Ok(\n"
+                    '2026-10-18T18:00:03 INFO CORE::INSTANCE::CONNECTION: connect to peer error dst="tcp://et-hk.clickor.click:11010"\n'
+                    "2026-10-18T18:00:04 INFO WARN foreign_network_client: add new peer conn\n"
+                    "2026-10-18T18:00:05 INFO CORE: new peer added peer_id=111\n"
+                    "2026-10-18T18:00:06 INFO CORE: new peer added peer_id=222\n"
+                )
+            st = etier.relay_status(log_path=lg)
+            mark("★ 中继自检只统计当前会话（旧会话的连接被忽略）",
+                 st["relays_ok"] == ["tcp://easytier.weiai.org.cn:11010",
+                                     "tcp://47.108.52.1:11012"],
+                 st["relays_ok"])
+            mark("★ 中继自检统计握手失败的节点数",
+                 st["relays_failed"] == 1, st["relays_failed"])
+            mark("★ 同网络成员数 = peer 总数 − 旁路(foreign)连接",
+                 st["same_net_peers"] == 1 and st["foreign_peers"] == 1,
+                 (st["same_net_peers"], st["foreign_peers"]))
+            mark("中继自检读不到日志时如实返回空",
+                 etier.relay_status(
+                     log_path=os.path.join(st_dir, "nope.log"))["relays_ok"] == [])
+        finally:
+            import shutil
+            shutil.rmtree(st_dir, ignore_errors=True)
+    except Exception as exc:                                    # noqa: BLE001
+        mark("中继连接状态自检", False, repr(exc))
+
+
+    # ---- 链路日志去重键（2026-10-19 "进房间满屏 ❌" 的根因）----
+    # EasyTier 每 10 秒重试一次连不上的节点，日志行**只有时间戳不同**；
+    # 按整行去重永远命中不了 → 同一条错误刷不完。归一化后必须同键。
+    try:
+        from ui.pages.lan_page import _normalize_diag as nz
+        a = ('2026-10-19T10:36:21.1522099+08:00  INFO CORE::INSTANCE: '
+             'connect to peer error dst="wss://sh.vomiku.com:7912/"')
+        b = ('2026-10-19T10:36:31.9999999+08:00  INFO CORE::INSTANCE: '
+             'connect to peer error dst="wss://sh.vomiku.com:7912/"')
+        mark("★ 同一错误仅时间戳不同 → 去重键相同（不再每 10 秒刷屏）",
+             bool(nz(a)) and nz(a) == nz(b), (nz(a)[:60], nz(b)[:60]))
+        mark("不同节点的错误不会被误合并",
+             nz(a) != nz(a.replace("sh.vomiku.com", "et-hk.clickor.click")),
+             "应不同")
+        mark("多行错误的续行残片被丢弃（不当成独立错误）",
+             nz('"connect timeout after 1.9998095s",') == "",
+             nz('"connect timeout after 1.9998095s",'))
+    except Exception as exc:                                    # noqa: BLE001
+        mark("链路日志去重键", False, repr(exc))
 
 
 def _check_nick_beacon(etier_mod, ip, mark):
@@ -1217,7 +1289,16 @@ def _check_core_feed(page, mark):
     # ---- ② 缺 cli：静默降级，不抛、不拦联机 ----
     feed = etier_mod.CorePeerFeed(rpc_port=etier_mod.RPC_PORT)
     feed._stop.set()          # 不真起线程，直接手工调一次
-    ok = feed._poll_once()
+    # 🔴 必须把 cli_path 打成"不存在"再调：否则在装了 easytier-cli 的机器上
+    # `_poll_once` 会真的去跑 cli，走的是"cli 在、但连不上"分支，
+    # `_cli_missing` 永远是 False —— 这条检查就只在没装 cli 的机器上是绿的，
+    # 换个环境就莫名其妙地红（今天 2026-10-18 实测踩到）。
+    real_cli = etier_mod.cli_path
+    etier_mod.cli_path = lambda: "__yuhub_missing_easytier_cli__.exe"
+    try:
+        ok = feed._poll_once()
+    finally:
+        etier_mod.cli_path = real_cli
     mark("★ 没有 easytier-cli 时不抛异常、available() 为假",
          ok is False and feed.available() is False and feed.cli_missing(),
          (ok, feed.available(), feed.cli_missing()))
@@ -1455,9 +1536,18 @@ def _check_member_rows(page, mark):
     page._render_members(entries)
     page._members_row = entries
 
+    # 布局末尾有一个 addStretch（成员行要贴顶，不被卡片 stretch 拉高），
+    # 所以 itemAt 会取到"非控件项"（spacer）——过滤掉，只留行控件。
     rows = [page.members_layout.itemAt(i).widget()
             for i in range(page.members_layout.count())]
+    rows = [r for r in rows if r is not None]      # 跳过末尾的 stretch 项
     mark("成员行按人数渲染", len(rows) == 2, "行数=%d" % len(rows))
+
+    # 行必须是**固定高度**：卡片吃 2/3 高度的 stretch，行若可拉伸就会被
+    # 拉成一个大长条（用户截图的 bug）。这里直接钉住这一条。
+    mark("成员行高度固定为 36px（不被卡片 stretch 拉高）",
+         all(r.height() == 36 for r in rows),
+         "行高=%s" % [r.height() for r in rows])
 
     # 每行必须恰好一个「复制」按钮（这是"每个人 IP 都能复制"的直接回归）
     per_row_ok = all(
@@ -1528,6 +1618,7 @@ def _check_member_rows(page, mark):
     ])
     rows = [page.members_layout.itemAt(i).widget()
             for i in range(page.members_layout.count())]
+    rows = [r for r in rows if r is not None]      # 跳过末尾的 stretch 项
     copied.clear()
     if len(rows) == 2:
         [b for b in rows[1].findChildren(QPushButton)
@@ -1549,6 +1640,7 @@ def _check_member_rows(page, mark):
     ])
     rows = [page.members_layout.itemAt(i).widget()
             for i in range(page.members_layout.count())]
+    rows = [r for r in rows if r is not None]      # 跳过末尾的 stretch 项
     copied.clear()
     if len(rows) == 2:
         [b for b in rows[1].findChildren(QPushButton)

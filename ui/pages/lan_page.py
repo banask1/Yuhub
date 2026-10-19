@@ -13,6 +13,7 @@
 """
 
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -42,6 +43,32 @@ import screenshare
 from .. import theme
 from ..widgets import ghost_button, primary_button
 from .base_page import BasePage
+
+
+# ---------------------------------------------------------------------------
+# 链路日志的归一化（去重键）
+# ---------------------------------------------------------------------------
+_DIAG_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+(?:[+-]\d{2}:\d{2}|Z)\s+")
+
+
+def _normalize_diag(line):
+    """把一条 EasyTier 日志行归一化成"去重键"。
+
+    🔴 为什么必须有：EasyTier 对连不上的节点会**每 10 秒重试一次**，每次的
+    日志行**只有时间戳不同**。界面原来按"整行"去重（`_link_seen`），于是
+    永远命中不了 → 同一条错误被反复打印。用户实测（2026-10-19）进房间后
+    满屏 ❌，而当时其实已经连上 10 个中继、链路完全正常——纯属噪音。
+    这里剥掉时间戳、把所有数字折叠成 `#`，让"同一件事"归成同一个键。
+
+    纯残片（多行 Rust 错误的续行，如 `connect timeout after 1.99s",`）不带
+    时间戳 → 返回空串，调用方直接丢弃，不再当成独立错误刷屏。
+    """
+    s = (line or "").strip()
+    if not s.startswith("20"):          # 只认带时间戳的完整记录
+        return ""
+    s = _DIAG_TS.sub("", s, count=1)
+    s = re.sub(r"\d+", "#", s)
+    return s[:200]
 
 
 # 生成房间码用的字母表：去掉 0/O、1/I/L 这类肉眼易混的字符
@@ -293,6 +320,11 @@ class LanPage(BasePage):
         # 链路诊断：已写进日志面板的行（去重）、上次扫描时间
         self._link_seen = set()
         self._link_check_at = 0.0
+        # 中继连接状态自检（见 _on_relay_status）：最近一次结果 + 两类提示的
+        # "只提示一次" 标记（复位后下次孤身一人会重新给出判断）
+        self._relay_st = {}
+        self._relay_zero_hinted = False
+        self._relay_empty_hinted = False
         self._members_row = []        # 当前渲染出来的成员 IP 顺序（用于增删行）
         self._host_nick = ""          # 本次启动用的昵称（成员列表第一行显示）
         self._started_wall = 0.0      # 本次进房的时间戳（time.time，给温和提示用）
@@ -607,10 +639,10 @@ class LanPage(BasePage):
     def _build_members_card(self):
         card = QFrame()
         card.setObjectName("Card")
-        card.setMinimumHeight(170)
+        card.setMinimumHeight(150)
         v = QVBoxLayout(card)
-        v.setContentsMargins(18, 16, 18, 16)
-        v.setSpacing(8)
+        v.setContentsMargins(18, 14, 18, 14)
+        v.setSpacing(6)
 
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -627,7 +659,7 @@ class LanPage(BasePage):
         self.btn_members_refresh = QPushButton("刷新")
         self.btn_members_refresh.setObjectName("MiniButton")
         self.btn_members_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_members_refresh.setFixedHeight(26)
+        self.btn_members_refresh.setFixedHeight(24)
         self.btn_members_refresh.setToolTip(
             "立刻重读本机虚拟 IP、重新扫描房间成员。\n"
             "中途卡死重进房间后 IP 变了、或列表看着不对时点这里。")
@@ -648,8 +680,15 @@ class LanPage(BasePage):
         self.members_box = QWidget()
         self.members_layout = QVBoxLayout(self.members_box)
         self.members_layout.setContentsMargins(0, 0, 0, 0)
-        self.members_layout.setSpacing(4)
-        v.addWidget(self.members_box)
+        self.members_layout.setSpacing(5)
+        v.addWidget(self.members_box, 1)
+
+        # 卡片吃的是 2/3 高度的 stretch：不在末尾兜一个 stretch，多余空间
+        # 会被平均分配到**标题/说明/成员行**之间 —— 标题与说明之间空出
+        # 一大块（用户说的"大额头"），成员行也会被纵向拉成一个大长条。
+        # 兜底 stretch 之后：所有内容贴顶，空余落在列表下方，成员行保持
+        # 固定高度的细长条。
+        v.addStretch(1)
         return card
 
     def _make_member_row(self, name, ip, is_self=False, game="", port=0, ss=0,
@@ -675,12 +714,24 @@ class LanPage(BasePage):
         p = theme.current()
         row = QFrame()
         row.setObjectName("MemberRow")
+        # 固定高度：成员行是"一行一条"的细长条，绝不能被布局纵向拉伸
+        # （之前卡片吃 stretch，单条成员被拉成 130px 的大长条）。
+        row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row.setFixedHeight(36)
+        # 自己的行用主色淡底 + 主色描边，扫一眼就知道哪个地址是自己的；
+        # 别人的行用下沉底色，鼠标悬停时描边变主色（样式里出现 :hover 时
+        # Qt 会自动给控件打开 WA_Hover）。
+        bg = p.get("accent_soft", p["surface_sunken"]) if is_self \
+            else p["surface_sunken"]
+        bd = p["accent"] if is_self else p["border"]
         row.setStyleSheet(
             "QFrame#MemberRow { background: %s; border: 1px solid %s;"
-            " border-radius: 5px; }" % (p["surface_sunken"], p["border"])
+            " border-radius: 6px; }"
+            "QFrame#MemberRow:hover { border-color: %s; }"
+            % (bg, bd, p["accent"])
         )
         h = QHBoxLayout(row)
-        h.setContentsMargins(8, 5, 6, 5)
+        h.setContentsMargins(10, 0, 8, 0)
         h.setSpacing(8)
 
         # 纯色小方块做视觉标识（极简色块风格），自己的用主色、别人的用灰
@@ -831,6 +882,11 @@ class LanPage(BasePage):
                                       ss=int(e.get("ss") or 0),
                                       core=e.get("core") or {})
             )
+        # 行全部贴顶：成员少的时候多出来的高度落在列表下方，而不是把
+        # 每一条行都撑高（重渲染时这个 spacer 会被 takeAt 一起清掉）。
+        # 空列表时不加：清空后布局要真的"空"（占位态判断依赖这个）。
+        if entries:
+            self.members_layout.addStretch(1)
         self.members_box.setVisible(bool(entries))
 
     def _share_page(self):
@@ -934,12 +990,17 @@ class LanPage(BasePage):
         p = theme.current()
         row = QFrame()
         row.setObjectName("MemberRow")
+        # 与成员行一致：固定高度的细长条，不被卡片 stretch 拉伸
+        row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row.setFixedHeight(36)
         row.setStyleSheet(
             "QFrame#MemberRow { background: %s; border: 1px solid %s;"
-            " border-radius: 5px; }" % (p["surface_sunken"], p["border"])
+            " border-radius: 6px; }"
+            "QFrame#MemberRow:hover { border-color: %s; }"
+            % (p["surface_sunken"], p["border"], p["accent"])
         )
         h = QHBoxLayout(row)
-        h.setContentsMargins(8, 5, 6, 5)
+        h.setContentsMargins(10, 0, 8, 0)
         h.setSpacing(8)
 
         dot = QFrame()
@@ -1076,6 +1137,9 @@ class LanPage(BasePage):
         self._share_widgets = {}
         for e in entries:
             self.share_layout.addWidget(self._make_share_row(e))
+        # 与在线成员一致：文件少时多出来的高度落在列表下方（空列表不加）
+        if entries:
+            self.share_layout.addStretch(1)
         self.share_box.setVisible(bool(entries))
 
     # ------------------------------------------------------------ 云盘：交互
@@ -2007,6 +2071,37 @@ class LanPage(BasePage):
                          args=(code, password, nick, node_addr),
                          daemon=True).start()
 
+    def _servers_for_auto(self):
+        """auto 模式的中继列表：用**本次测速结果**剔除实测不可用的节点。
+
+        为什么值得做：14 个节点里常有几个是死的（2026-10 实测 3 个连不上），
+        EasyTier 会对它们每 10 秒重试一次 —— 既拖慢收敛，又把日志刷满
+        "connect to peer error"。测速（node_probe）本来就判出了"端口不通 /
+        能 ping 不能握手"（记录里的 `ok` 字段），没理由再把它们交给 EasyTier。
+
+        两条保守规则：
+          * **没测过的节点照给** —— 信息不足就不替它下结论；
+          * 筛完一个不剩就退回全量 —— 宁可多试，也不让房间起不来。
+        """
+        try:
+            recs = self._probe.results(now=time.time(), keep_stale=True)
+        except Exception:
+            return list(etier.PUBLIC_SERVERS)
+        if not recs:
+            return list(etier.PUBLIC_SERVERS)
+        bad = {r.get("addr") for r in recs.values()
+               if r.get("ok") is False and r.get("error")}
+        if not bad:
+            return list(etier.PUBLIC_SERVERS)
+        kept = [s for s in etier.PUBLIC_SERVERS if s not in bad]
+        if not kept:
+            return list(etier.PUBLIC_SERVERS)
+        # 本方法在后台线程里被调用，不能直接碰控件 —— 走信号转发
+        self._event.emit("_etier_log",
+                         "已按测速剔除 %d 个不可用中继节点，本轮连 %d 个"
+                         % (len(bad), len(kept)))
+        return kept
+
     def _do_start(self, code, password, nick, node_addr=""):
         tier = etier.EasyTier(on_log=lambda m: self._event.emit("_etier_log", m))
         # 虚拟 IP 交给 EasyTier 的 DHCP 动态分配（不传 ipv4，走 -d true）：
@@ -2020,6 +2115,8 @@ class LanPage(BasePage):
             ok, msg = tier.start(
                 "yuhub-" + etier.room_key(code), etier.room_secret(password),
                 timeout=20.0, hostname=nick, node=node_addr,
+                # auto 模式：只把测速判定可用的节点交给 EasyTier
+                servers=None if node_addr else self._servers_for_auto(),
             )
         except Exception as exc:
             ok, msg = False, str(exc)
@@ -2054,6 +2151,12 @@ class LanPage(BasePage):
             self._start_room_threads(self._my_ip)
             self._append_log("已进入房间（虚拟 IP %s）" % self._my_ip)
             self.toast("已进入房间")
+            # 重新开始本轮的"连不上"诊断（新会话：EasyTier 日志从新的
+            # Starting easytier 起算，提示也要重新给一遍）
+            self._relay_zero_hinted = False
+            self._relay_empty_hinted = False
+            self._relay_st = {}
+            self._link_seen = set()
         else:
             self._running = False
             self._my_ip = ""
@@ -2416,10 +2519,18 @@ class LanPage(BasePage):
                 )
                 self._set_status_note(normal_note)
             else:
+                st = self._relay_st or {}
+                n_ok = len(st.get("relays_ok") or [])
+                if n_ok:
+                    extra = "（本机已连上 %d 个中继节点，链路正常）" % n_ok
+                elif st.get("session"):
+                    extra = ("（⚠ 一个中继节点都没连上，请在中继节点下拉里"
+                             "换一个，或关掉代理/VPN 再试）")
+                else:
+                    extra = ""
                 self.members_hint.setText(
                     "目前只有你自己。把房间码和密码发给队友，"
-                    "他们加入后就会出现在这里。"
-                )
+                    "他们加入后就会出现在这里。" + extra)
                 if (self._running and not self._alone_hinted
                         and time.time() - self._started_wall > 30.0):
                     self._alone_hinted = True
@@ -2483,8 +2594,59 @@ class LanPage(BasePage):
                 self._on_node_speed(payload or {})
             elif kind == "link_diag":
                 self._on_link_diag(payload or {})
+            elif kind == "relay_status":
+                self._on_relay_status(payload or {})
         except Exception as exc:                     # 界面出错不该拖垮转发
             self._append_log("界面更新出错：%s" % exc)
+
+    # -------------------------------------------------- 中继连接状态自检
+    def _on_relay_status(self, st):
+        """把「中继到底连上没、房间里到底有几个人」变成可执行的判断。
+
+        这两句话以前只能靠猜，现在有事实：
+          * relays_ok == 0  → 一个中继都没握手成功，房间不可能有人，
+            "连不上"的原因在本机网络/节点选择上（换节点、看防火墙/代理）。
+          * relays_ok > 0  但 same_net_peers == 0 → 本机链路是通的，
+            问题在**对方没进来**（房间码/密码不一致、对端网络不通、
+            对端 Yuhub 没能启动虚拟网卡）。
+        每种只提示一次，避免每 10 秒刷屏。
+        """
+        self._relay_st = st
+        n_ok = len(st.get("relays_ok") or [])
+        n_peer = int(st.get("same_net_peers") or 0)
+        others = (self._tracker.snapshot() if self._tracker else [])
+        alone = not others and n_peer <= 0
+
+        if alone and n_ok == 0 and not self._relay_zero_hinted:
+            self._relay_zero_hinted = True
+            self._append_log(
+                "❌ 诊断：一个中继节点都没连上（%d 个失败）。虚拟局域网"
+                "没有它就无法发现彼此——这就是「连不上」的原因。" % st.get("relays_failed", 0))
+            self._append_log(
+                "  自检：① 在「中继节点」下拉里换一个节点或选「自动」；"
+                "② 若用了代理/VPN，试着关掉再进；③ 公司/校园网可能只放行 443，"
+                "可选「上海中继（WSS）」或「香港中继（WS）」")
+            self._set_status_note(
+                "⚠ 没能连上任何中继节点，房间无法发现成员。请在中继节点下拉"
+                "里换一个（或选「自动」），代理/VPN 请先关闭。")
+        elif alone and n_ok > 0 and not self._relay_empty_hinted:
+            self._relay_empty_hinted = True
+            self._append_log(
+                "诊断：已连上 %d 个中继节点（%s），本机链路正常；"
+                "但同网络里还没有其他人。" % (n_ok, "、".join(st["relays_ok"][:4])))
+            self._append_log(
+                "  这通常是对端没进来，请让对侧确认：① 房间码和密码与"
+                "当前房间完全一致（大小写/空格都会被忽略，但字符必须相同）；"
+                "② 对端 Yuhub 是否以管理员身份启动并在 UAC 点了「是」；"
+                "③ 对端能否打开 https://easytier.weiai.org.cn:11010 这类"
+                "中继地址（网络受限时换 WSS/WS 节点）；④ 双方都是较新版本。")
+            self._set_status_note(
+                "已连上 %d 个中继节点，但房间里只有你自己。请让对端核对"
+                "房间码/密码、以管理员启动，并确认它的网络能连上中继。" % n_ok)
+        elif not alone:
+            # 有人进来了：复位提示，下次再孤身一人时要重新给出判断
+            self._relay_zero_hinted = False
+            self._relay_empty_hinted = False
 
 
     def _refresh_status_style(self, *_args):
@@ -2541,31 +2703,56 @@ class LanPage(BasePage):
 
     # ------------------------------------------------------------ 链路诊断
     def _do_link_check(self):
-        """后台读一次 EasyTier 日志（文件 IO，不占 GUI 线程）。"""
+        """后台读一次中继状态 + EasyTier 日志（文件 IO，不占 GUI 线程）。
+
+        **先算中继状态、先发出去**：日志面板要不要把"连不上某节点"当红叉，
+        取决于"这会儿到底连上几个中继"，顺序反了就会先按 0 个渲染成 ❌。
+        """
+        try:
+            st = etier.relay_status()
+        except Exception:
+            st = None
+        if st and st.get("session"):
+            self._event.emit("relay_status", st)
         try:
             info = etier.link_diagnostics()
         except Exception:
-            return
-        self._event.emit("link_diag", info)
+            info = None
+        if info:
+            self._event.emit("link_diag", info)
 
     def _on_link_diag(self, info):
-        """把链路线索写进日志面板（**只写新行**，否则每 10 秒刷一遍同样的内容）。
+        """把链路线索写进日志面板（**同一件事只写一次**）。
 
-        为什么需要它：异地分屏帧率低的时候，"是不是走了中继"是第一个要排的
-        问题（公共中继被社区共享、常被限速）。以前日志面板里只有我们自己的
-        提示，看不到 EasyTier 侧的打洞/连接情况。
+        噪音治理（2026-10-19 用户实测"进房间满屏 ❌"，而当时已连上 10 个
+        中继、链路完全正常）：
+          ① 去重键改用 `_normalize_diag(line)` —— 剥掉时间戳再比。原来按
+             整行去重，而 EasyTier 每 10 秒重试一次、每次只有时间戳不同，
+             于是永远命中不了、同一条错误刷不完；
+          ② **已经连上中继时**，单个节点连不上只是"冗余节点在重试"，不是
+             故障 —— 降级成 ℹ 提示，不再打红叉吓人；
+          ③ 多行 Rust 错误的续行残片（不带时间戳）直接丢弃。
         """
         if not isinstance(info, dict):
             return
+        n_ok = len((self._relay_st or {}).get("relays_ok") or [])
         labels = (("error", "❌ 连接问题"),
                   ("relay", "🔁 中继相关"),
                   ("punch", "🎯 打洞"))
         for key, label in labels:
             for line in (info.get(key) or []):
-                if line in self._link_seen:
+                raw = (line or "").strip()
+                norm = _normalize_diag(raw)
+                if not norm or norm in self._link_seen:
                     continue
-                self._link_seen.add(line)
-                self._append_log("%s：%s" % (label, line))
+                self._link_seen.add(norm)
+                display = _DIAG_TS.sub("", raw, count=1)[:160]
+                if key == "error" and n_ok > 0:
+                    self._append_log(
+                        "ℹ 有中继节点连不上（已连上 %d 个，不影响使用）：%s"
+                        % (n_ok, display))
+                else:
+                    self._append_log("%s：%s" % (label, display))
 
     def on_shown(self):
         """页面被切到前台。

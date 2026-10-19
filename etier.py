@@ -60,6 +60,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -97,6 +98,17 @@ _CREATE_NO_WINDOW = 0x08000000
 #   c.oee.icu / weior.top / xhrj.324406.xyz / 47.96.28.190 等一批社区列表里的
 #   节点也都已失效——网上流传的节点表普遍过期，必须现测现用。
 #
+# 2026-10-18 又测了一批（这次是为了排查"异地联机连不上"）：
+#   * 官方 `public.easytier.cn / .top / public2.easytier.cn` **DNS 全部 NXDomain**
+#     —— README 里那套"连官方公共节点"的新手教程在当前已经走不通了，
+#     上面首批实测的结论「官方节点 2026 年起已从 DNS 摘除」依然成立。
+#   * 当前表 14 个里 **9 个通、3 个不通**（et-hk.clickor.click 的 tcp/ws 超时、
+#     sh.vomiku.com 的 wss 拒绝连接）；固件随时间失效，界面下拉会实时测延迟。
+#   * 社区新表里另外筛出 2 个能用的，已加进 PUBLIC_SERVERS：
+#     183.230.36.171:11010（42ms）、96.9.229.212:11010（313ms）。
+#   * 官方 README 的另一个要点仍然有效：**多节点互为冗余**——只要任一节点
+#     把双方都拉进来，peer 信息就会在网络内扩散，不必每台机器都连同一个。
+#
 # 节点会失效，连接失败会自动换下一个。
 PUBLIC_SERVERS = (
     "tcp://easytier.weiai.org.cn:11010",   # 唯爱厦门（十堰），国内最快
@@ -111,6 +123,9 @@ PUBLIC_SERVERS = (
     "tcp://dreamlife.indevs.in:11010",     # 海外备用
     "tcp://us01.225284.xyz:11010",         # 海波美国（走 TCP；UDP 口已失效）
     "tcp://38.147.105.178:11010",          # 美国备用（与海波美国同机房）
+    # --- 2026-10-18 补测新增（同批筛掉一批已失效的，见下）---
+    "tcp://183.230.36.171:11010",          # 国内备线（实测 42ms）
+    "tcp://96.9.229.212:11010",            # 海外备线（实测 313ms）
 )
 
 # 「中继节点」下拉框的选项（key, 显示名, 地址）。
@@ -127,6 +142,7 @@ NODE_CHOICES = (
     ("auto", "自动（尝试全部节点）", ""),
     ("weiai", "唯爱厦门", "tcp://easytier.weiai.org.cn:11010"),
     ("cn_ip", "国内中继（IP 直连）", "tcp://47.108.52.1:11012"),
+    ("cn_bak", "国内备线", "tcp://183.230.36.171:11010"),
     ("haibo_cn", "海波中国大陆", "tcp://225284.xyz:11010"),
     ("hz", "杭州中继", "tcp://ros.scpsl.com.cn:11010"),
     ("txy", "腾讯云中继", "tcp://47.92.208.217:11010"),
@@ -307,6 +323,76 @@ def link_diagnostics(max_lines=4, tail_bytes=262144):
                 out[key].append(short)
     return out
 
+
+
+def relay_status(tail_bytes=786432, log_path=None):
+    """从 EasyTier 日志统计**当前会话**的中继连接与同伴情况。
+
+    解决的问题：用户反馈"异地联机连不上 / 房间里只有自己"，以前只能靠
+    猜。这里直接给出可判定的事实：
+
+        relays_ok      —— 当前会话里**真正握手成功**的中继节点（去重、按
+                          `reconnect: <uri> ok, ret: Ok(` 计数）
+        relays_failed  —— 超时/被拒的中继节点数
+        same_net_peers —— 同网络成员数（new peer added 总数 − foreign_network）
+        nat_type       —— 日志里探到的 NAT 类型（若有）
+
+    只看**当前会话**：日志文件是跨会话追加的，上一次房间的连接记录留着会让
+    数字虚高，所以从最后一行 "Starting easytier from cli with config" 起算。
+    读不到一律返回空（调用方据此显示"暂无日志"，而不是当成"一切正常"）。
+    """
+    out = {"log": "", "relays_ok": [], "relays_failed": 0,
+           "same_net_peers": 0, "foreign_peers": 0, "nat_type": "",
+           "session": False}
+    try:
+        d = log_dir()
+        if log_path is None:
+            if not os.path.isdir(d):
+                return out
+            cands = [os.path.join(d, fn) for fn in os.listdir(d)
+                     if fn.lower().endswith(".log")]
+            if not cands:
+                return out
+            newest = max(cands, key=lambda p: os.path.getmtime(p))
+        else:
+            if not os.path.isfile(log_path):
+                return out
+            newest = log_path
+        out["log"] = newest
+        with open(newest, "rb") as f:
+            try:
+                f.seek(-tail_bytes, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return out
+
+    # 只保留当前会话（最后一次启动 core 之后的部分）
+    marker = "Starting easytier from cli with config"
+    pos = text.rfind(marker)
+    if pos >= 0:
+        text = text[pos:]
+        out["session"] = True
+
+    # 成功握手的中继：reconnect: <uri> ok, ret: Ok(...)
+    for m in re.finditer(r"reconnect: (\S+) done, ret: Ok\(", text):
+        uri = m.group(1).strip().rstrip("/")
+        if uri and uri not in out["relays_ok"]:
+            out["relays_ok"].append(uri)
+    # 失败的中继：connect to peer error
+    out["relays_failed"] = len(set(re.findall(
+        r'connect to peer error dst="([^"]+)"', text)))
+    # 成员：new peer added 总数 vs foreign_network_client（跨网络的旁路连接）
+    total_peers = len(re.findall(r"new peer added peer_id=\d+", text))
+    out["foreign_peers"] = len(re.findall(
+        r"foreign_network_client: add new peer conn", text))
+    out["same_net_peers"] = max(0, total_peers - out["foreign_peers"])
+    # NAT 类型（EasyTier 启动时会探测，日志里形如 nat_type=...）
+    m = re.search(r"nat_type[=:]\s*([A-Za-z0-9_]+)", text)
+    if m:
+        out["nat_type"] = m.group(1)
+    return out
 
 
 def core_path():
@@ -2287,7 +2373,7 @@ class EasyTier:
         return not core_running()
 
     def start(self, name, secret, timeout=20.0, ipv4="", hostname="",
-              node=""):
+              node="", servers=None):
         """创建/加入跨网网络。阻塞直到虚拟网卡就绪或超时。
 
         name/secret 即 EasyTier 的 network-name / network-secret。
@@ -2302,6 +2388,9 @@ class EasyTier:
               把 PUBLIC_SERVERS 全部传给 EasyTier；非空 = **只连这一个**，
               不叠加其它节点——否则"用户选的节点有问题"和"房间不通"
               会混在一起没法排查。
+        servers：**auto 模式下**由调用方给定的候选节点（可传按测速筛过的
+              子集，见 lan_page._servers_for_auto）。None/空则退回全部
+              PUBLIC_SERVERS。`node` 非空时忽略本参数。
         返回 (成功, 说明)。成功后 virtual_adapter_ip() 可查虚拟 IP。
         """
         with self._lock:
@@ -2340,7 +2429,7 @@ class EasyTier:
             # `--no-listener` 是"异地分屏只有 4 帧"的根因（没有监听端口，
             # P2P 打洞没有落点，流量全走限速的公共中继）。谁要是"清理"时
             # 留错那一份， bug 就回来了。组装只认 core_args。
-            servers = (node,) if node else tuple(PUBLIC_SERVERS)
+            servers = (node,) if node else tuple(servers or PUBLIC_SERVERS)
             if node:
                 # 确定性节点选择（MCTier 实践）：用户选了哪个就只连哪个
                 self._on_log("中继节点（手动指定）：%s" % node)
