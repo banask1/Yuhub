@@ -4,11 +4,13 @@ import threading
 
 from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
-    QFrame, QVBoxLayout, QHBoxLayout, QLabel, QComboBox)
+    QFrame, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QMessageBox)
 
 import autostart
 import etier
+import sac
 import updater
+import winadmin
 from .. import theme, VERSION, VERSION_LABEL
 from ..widgets import (
     ToggleSwitch, setting_row, info_card, SegmentedControl, ghost_button)
@@ -19,6 +21,10 @@ def small_note(text="", warn=False):
     """卡片内的小号说明文字。"""
     lbl = QLabel(text)
     lbl.setWordWrap(True)
+    # 登记身份：颜色是内联写死的（不走 QSS），主题切换时要靠这两个属性
+    # 把它们认出来重刷（见 SettingsPage._on_theme_changed_restyle）。
+    lbl.setProperty("smallNote", True)
+    lbl.setProperty("noteWarn", bool(warn))
     _style_note(lbl, warn)
     return lbl
 
@@ -27,6 +33,63 @@ def _style_note(lbl, warn=False):
     p = theme.current()
     color = p["amber"] if warn else p["text_faint"]
     lbl.setStyleSheet(f"font-size: 11px; color: {color}; background: transparent;")
+
+
+def _messagebox_qss():
+    """给 QMessageBox 算一份**按当前色板**的样式表（弹窗主题的唯一出口）。
+
+    为什么不直接甩 `theme.build_qss()`：那份里有
+    `QDialog { background: transparent; }` —— 它是配 `QFrame#DialogFrame`
+    用的（真正的底由内层那层 QFrame 画）。QMessageBox 没有这层内框，
+    透明背景会把主窗口 / 桌面直接透出来，比不修还难看。所以这里单独按
+    色板算一份**全不透明**的样式。
+
+    ⚠️ 教训（v1.2.2 修）：全局 QSS 只在 `MainWindow._apply_theme()` 里
+    `setStyleSheet` 在**主窗口自己**身上，**不会**流进任何独立顶层窗口。
+    项目里每个自建对话框（update_ui / cleaner / uninstall / monitor）
+    都各自带了一份，唯独 SAC 这个确认框漏了 —— 于是它走系统原生渲染，
+    浅色应用里弹出一个深色弹窗（用户截图 2026-10-21）。按钮语言与主界面
+    的 GhostButton / DangerButton 保持一致：取消=中性描边，确定=红色描边。
+    """
+    c = theme.current()
+    red = c.get("red", "#e5484d")
+    vals = dict(c)
+    vals["red_pressed"] = theme._pressed_shade(red, theme.get_theme())
+    return (
+        "QMessageBox { background: %(window_top)s; color: %(text)s; }"
+        "QMessageBox QLabel { color: %(text)s; background: transparent; }"
+        # 取消：中性描边（= GhostButton）
+        "QMessageBox QPushButton {"
+        " background: transparent; color: %(text_dim)s;"
+        " border: 1px solid %(border_strong)s; border-radius: 6px;"
+        " padding: 7px 18px; min-width: 84px; font-weight: 700;"
+        "}"
+        "QMessageBox QPushButton:hover {"
+        " background: %(accent_soft)s; border-color: %(accent)s;"
+        " color: %(accent)s;"
+        "}"
+        "QMessageBox QPushButton:pressed {"
+        " background: %(accent)s; border-color: %(accent)s;"
+        " color: %(accent_text)s;"
+        "}"
+        "QMessageBox QPushButton:disabled {"
+        " color: %(text_faint)s; border-color: %(border)s;"
+        "}"
+        # 确定（高危动作）：红色描边（= DangerButton）
+        "QMessageBox QPushButton#DangerButton {"
+        " background: transparent; color: %(red)s;"
+        " border: 1px solid %(red)s;"
+        "}"
+        "QMessageBox QPushButton#DangerButton:hover {"
+        " background: %(red)s; color: #ffffff; border-color: %(red)s;"
+        "}"
+        "QMessageBox QPushButton#DangerButton:pressed {"
+        " background: %(red_pressed)s; border-color: %(red_pressed)s;"
+        " color: #ffffff;"
+        "}"
+        # QMessageBox 在某些样式下会挂一个可缩放手柄，别让它裸着
+        "QSizeGrip { background: transparent; }"
+    ) % vals
 
 
 class SettingsPage(BasePage):
@@ -62,6 +125,10 @@ class SettingsPage(BasePage):
         self._tray_available = tray_available
         # 挡住"写入失败→把开关拨回去"时二次触发的信号，避免递归
         self._autostart_guard = False
+        # SAC 开关同理：程序性改 checked 时挡信号
+        self._sac_guard = False
+        # SAC 读取结果的失败分类（KIND_*），_render_sac_state 按它分流提示
+        self._sac_kind = sac.KIND_OK
         # 自动检查更新的偏好（读不到时默认开启）
         self._settings = QSettings("Yuhub", "Yuhub")
         raw = self._settings.value("auto_check_update", None)
@@ -76,6 +143,7 @@ class SettingsPage(BasePage):
         # "repair_done"（结束）。
         self._build_appearance(theme_setting)
         self._build_startup_card(close_to_tray)
+        self._build_sac_card()
         self._build_repair_card()
         self._build_accel_card()
         self._build_etier_card()
@@ -182,6 +250,192 @@ class SettingsPage(BasePage):
 
         # 主题切换后小号说明文字的颜色要跟着换（内联色值不会自动更新）
         theme.bus.changed.connect(self._on_theme_changed_restyle)
+
+    # ------------------------------------------------------ Windows 安全 / SAC
+    def _build_sac_card(self):
+        """智能应用控制（SAC）开关。
+
+        背景：部分用户在 Windows 11 上运行**未签名**的 Yuhub.exe 时，会被
+        SAC 直接拦下（"智能应用控制已阻止可能不安全的应用"），而且这个机制
+        **没有"仍要运行"、也没有按应用例外** —— 要么关掉 SAC，要么给程序
+        做代码签名。这里提供一个开关，省得用户去翻 Windows 安全中心。
+
+        实现见 sac.py：改
+        HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\\
+        VerifiedAndReputablePolicyState（0关/1开/2评估），再跑
+        `CiTool.exe -r` 刷新。**关闭前二次确认**，并明确告知老版 Win11
+        关掉后不可逆。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(10)
+
+        title = QLabel("Windows 安全")
+        title.setObjectName("CardTitle")
+        v.addWidget(title)
+
+        self._sac_elevated = bool(winadmin.is_elevated())
+        state, err, kind = sac.read_state_ex()
+        self._sac_state = state
+        self._sac_error = err or ""
+        self._sac_kind = kind
+
+        self.sw_sac = ToggleSwitch(state == sac.STATE_ON)
+        self.sw_sac.toggled.connect(self._on_sac_toggled)
+        v.addLayout(setting_row("智能应用控制 (SAC)", self.sw_sac))
+
+        self.sac_status = small_note()
+        v.addWidget(self.sac_status)
+
+        v.addWidget(small_note(
+            "开关「开启」= SAC 保护中（只允许可信 / 已签名程序运行）；"
+            "「关闭」= 允许未签名程序运行（Yuhub 就属于未签名）。"
+            "关闭会降低整机防护；老版本 Windows 11 关闭后无法直接重新打开"
+            "（需重装或重置系统）。Microsoft Defender 与 SmartScreen 仍然有效。",
+            warn=True))
+
+        self._render_sac_state(state, err, kind, self._sac_elevated)
+        self.add(card)
+
+    def _render_sac_state(self, state, err="", kind=sac.KIND_OK, elevated=True):
+        """按读到的状态刷新开关与说明（程序性改开关时用 _sac_guard 挡信号）。
+
+        ⚠️ state 为 None 时有**三种**完全不同的情况，必须按 kind 分流：
+        没有 SAC / 需要管理员 / 读取失败。v1.2.1 之前这里只分"含管理员"
+        和"其它"两类，读取失败（含写入后回读失败）会被说成"本机没有
+        SAC"—— 对着一台刚写成功、明明有 SAC 的机器撒谎，还把开关永久
+        置灰。err 是会改的文案，分类不会，所以判据用 kind 不用文本。
+        """
+        self._sac_guard = True
+        try:
+            if state is None:
+                self.sw_sac.setChecked(False)
+                self.sw_sac.setEnabled(False)
+                msg = str(err or "")
+                if kind == sac.KIND_ABSENT:
+                    self.sac_status.setText(
+                        "本机没有智能应用控制（SAC）—— 它只存在于 Windows 11 "
+                        "新装系统，Windows 10 没有这个功能。")
+                elif kind == sac.KIND_DENIED:
+                    self.sac_status.setText(
+                        "无法读取 SAC 状态：需要管理员权限。"
+                        "请以管理员身份运行 Yuhub 后再试。")
+                else:
+                    # 读取失败 ≠ 没有 SAC：如实摆出错误，别编一个"没有"出来
+                    self.sac_status.setText(
+                        "读取 SAC 状态失败：%s" % (msg or "未知错误"))
+            else:
+                self.sw_sac.setChecked(state == sac.STATE_ON)
+                self.sw_sac.setEnabled(bool(elevated))
+                text = "当前状态：%s" % sac.state_text(state)
+                if not elevated:
+                    text += "（需要管理员权限才能修改）"
+                self.sac_status.setText(text)
+        finally:
+            self._sac_guard = False
+
+    def _on_sac_toggled(self, checked):
+        """拨动开关 → 写入注册表并刷新策略（关闭前二次确认）。"""
+        if self._sac_guard:
+            return
+        if not self._sac_elevated:
+            # 没权限：把开关拨回真实状态并说明
+            self._render_sac_state(self._sac_state, self._sac_error,
+                                   self._sac_kind, False)
+            self.toast("需要管理员权限才能修改 SAC")
+            return
+        if not checked and not self._confirm_disable_sac():
+            self._sac_guard = True
+            self.sw_sac.setChecked(True)      # 用户取消 → 拨回去
+            self._sac_guard = False
+            return
+        self.sw_sac.setEnabled(False)
+        self.sac_status.setText(
+            "正在应用…（%s）"
+            % ("关闭时可能需要几秒刷新策略" if not checked else "开启后通常立即生效"))
+        threading.Thread(
+            target=self._do_apply_sac, args=(bool(checked),),
+            name="SacToggle", daemon=True).start()
+
+    def _build_sac_confirm_box(self):
+        """关闭 SAC 是"降防护 + 老版本不可逆"的高危动作，二次确认框。
+
+        ⚠️ **必须自己带样式表**：全局 QSS 只挂主窗口，流不到这个独立顶层
+        窗口（见 `_messagebox_qss` 的教训说明）。按钮按主界面的命名注册
+        对象名，样式语言才能对上（DangerButton=红色描边 / 其余=中性描边）。
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("关闭智能应用控制")
+        box.setText("确定要关闭智能应用控制（SAC）吗？")
+        box.setInformativeText(
+            "关闭后将允许运行未签名的程序（包括 Yuhub）。\n\n"
+            "· 整机安全防护会降低；\n"
+            "· 老版本 Windows 11 关闭后无法直接重新打开，只能重装或重置系统；\n"
+            "· Microsoft Defender 实时防护与 SmartScreen 仍然有效。\n\n"
+            "确定继续？")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)
+        yes = box.button(QMessageBox.Yes)
+        if yes is not None:
+            yes.setObjectName("DangerButton")     # 高危动作 → 红色描边
+        box.setStyleSheet(_messagebox_qss())
+        return box
+
+    def _confirm_disable_sac(self):
+        """弹出二次确认框；返回 True 表示用户选了「是」。"""
+        return self._build_sac_confirm_box().exec() == QMessageBox.Yes
+
+    def _do_apply_sac(self, enable):
+        """后台线程：写注册表 + 刷新策略，再回读真实状态。"""
+        target = sac.STATE_ON if enable else sac.STATE_OFF
+        ok, msg = sac.set_state(target)
+        state, err, kind = sac.read_state_ex()
+        self._etier_event.emit("sac_done", {
+            "ok": ok, "msg": msg, "state": state, "err": err,
+            "kind": kind, "target": target})
+
+    def _on_sac_applied(self, payload):
+        """主线程：落地 SAC 写入结果，并按真实状态刷新开关。"""
+        ok = bool(payload.get("ok"))
+        msg = str(payload.get("msg") or "")
+        state = payload.get("state")
+        err = str(payload.get("err") or "")
+        kind = str(payload.get("kind") or sac.KIND_ERROR)
+        target = payload.get("target")
+        self._sac_state = state
+        self._sac_error = err
+        self._sac_kind = kind
+        if ok and state is None:
+            # 写入成功但回读失败：按「目标态」显示，并如实说明读取失败。
+            # ⚠️ 绝不能走 _render_sac_state(None, ...) —— 那会把提示栏写成
+            # "本机没有 SAC"（本机明明有、而且刚写成功过），还会把开关永久
+            # 置灰，用户再也没法拨。v1.2.1 修的就是这条路径。
+            self._sac_guard = True
+            try:
+                self.sw_sac.setChecked(target == sac.STATE_ON)
+                self.sw_sac.setEnabled(bool(self._sac_elevated))
+                self.sac_status.setText(
+                    "已%s，但读取状态失败：%s（可重启或重新进入本页刷新）"
+                    % ("开启" if target == sac.STATE_ON else "关闭",
+                       err or "未知错误"))
+            finally:
+                self._sac_guard = False
+            self.toast("已写入设置，但读取状态失败（%s）" % (err or "未知错误"))
+            return
+        self._render_sac_state(state, err, kind, self._sac_elevated)
+        if not ok:
+            self.toast("SAC 设置失败：%s" % msg)
+            return
+        if state == target:
+            self.toast("已%s智能应用控制"
+                       % ("开启" if target == sac.STATE_ON else "关闭"))
+        else:
+            # 写入成功但策略还没切过来 → 多半要重启
+            self.toast("已写入设置，重启后生效（当前仍为%s）"
+                       % sac.state_text(state))
 
     def _build_about(self):
         self.add(
@@ -533,6 +787,8 @@ class SettingsPage(BasePage):
             else:
                 self.accel_status.setText("修复失败：%s" % msg)
                 self.toast("修复失败：%s" % msg)
+        elif kind == "sac_done":
+            self._on_sac_applied(payload)
         else:
             return
 
@@ -607,8 +863,17 @@ class SettingsPage(BasePage):
 
     # ------------------------------------------------------------------ 主题
     def _on_theme_changed_restyle(self, *_args):
+        # 小号说明文字的颜色是**内联**写死的，不会随 QSS 自动更新，主题
+        # 切换后必须逐条重刷。先按 small_note 登记的 noteWarn 属性刷一遍，
+        # 再单独处理 autostart_hint —— 它的警示态是运行时变的（注册表指向
+        # 别处时变琥珀色），属性停留在创建时的值，必须放最后按最新态刷。
+        # ⚠️ v1.2.1 之前这里只刷了 autostart_hint / tray_hint 两条，SAC 卡
+        #    （以及后面各卡）的提示栏切主题后一直留在旧色板上 —— 浅色模式下
+        #    还留着深色的 text_faint，淡得几乎看不见。
+        for lbl in self.findChildren(QLabel):
+            if lbl.property("smallNote"):
+                _style_note(lbl, bool(lbl.property("noteWarn")))
         _style_note(self.autostart_hint, self._autostart_is_warn)
-        _style_note(self.tray_hint, not self._tray_available)
 
     # set_theme_setting / set_pack_setting 的兼容空操作见 _build_content 上方
     # （外观切换 UI 已随水墨重做移除）。

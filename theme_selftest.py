@@ -1517,6 +1517,114 @@ def run(out_file, timeout_sec=60):
     chk("对照组：水墨主题的 card_top 确实不透明（卡片是实心纸面，菜单需要专用底色键）",
         _ct_alpha is not None and _ct_alpha == 255, _ct_alpha)
 
+    # ---------------- ⑲ 弹窗（QMessageBox）必须跟随主题（v1.2.2） ----------------
+    # 用户截图（2026-10-21）：**浅色**应用里，SAC 的关闭确认弹窗是**深色原生**
+    # 样式。根因：全局 QSS 在 MainWindow._apply_theme() 里只 setStyleSheet 在
+    # **主窗口自己**身上 —— 它不会流进任何独立顶层窗口。项目里每个自建对话框
+    # （update_ui / cleaner / uninstall / monitor）都各自带了一份样式表，
+    # 唯独 SAC 这个确认框漏了，于是 QMessageBox 走系统原生渲染，与主题脱节。
+    # 修法见 ui/pages/settings_page._messagebox_qss()：**不能**直接甩
+    # build_qss()（那份的 `QDialog { background: transparent; }` 是配
+    # QFrame#DialogFrame 的，QMessageBox 没有内层框，透明背景会透出桌面），
+    # 而是按当前色板现算一份全不透明样式，挂到弹窗自己身上。
+    #
+    # 这组检查守三层，层层都能独立抓住回归：
+    #   ① 字符串层：样式表按色板生成、根规则不透明；
+    #   ② 像素层：**真建一个弹窗并渲染**，背景像素必须正好是色板的 window_top
+    #      （浅色/深色各一遍 —— 只测一种模式会漏掉"另一种模式没接上"）；
+    #   ③ 高危按钮必须挂 DangerButton 对象名（红色描边规则的挂点），并且
+    #      渲染图里真的能找到那档红色（证明②不是"整块没画"的假通过）。
+    try:
+        from ui.pages.settings_page import SettingsPage, _messagebox_qss
+
+        _pk19, _md19 = theme.get_pack().name, theme.get_theme()
+        _qss_bad, _px_bad, _obj_bad, _red_bad = {}, {}, {}, {}
+        _qss_by_mode = {}
+
+        def _rgb_of(hexs):
+            h = (hexs or "").lstrip("#")
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+        try:
+            for _m in ("light", "dark"):
+                theme.set_theme(_m)
+                _pal = theme.current()
+                _qss = _messagebox_qss()
+                _qss_by_mode[_m] = _qss
+                # ① 字符串层
+                if "QMessageBox {" not in _qss:
+                    _qss_bad[_m] = "没有 QMessageBox 根规则"
+                elif "background: %s" % _pal.get("window_top", "") not in _qss:
+                    _qss_bad[_m] = "根规则背景不是当前色板的 window_top"
+                elif "QMessageBox { background: transparent" in _qss:
+                    _qss_bad[_m] = "根规则透明（会把桌面透出来）"
+                # ② 像素层 + ③ 按钮挂点
+                _sp = SettingsPage()
+                _box = _sp._build_sac_confirm_box()
+                _yes = _box.button(__import__(
+                    "PySide6.QtWidgets", fromlist=["QMessageBox"]).QMessageBox.Yes)
+                if _yes is None or _yes.objectName() != "DangerButton":
+                    _obj_bad[_m] = "「是」按钮没挂 DangerButton 对象名：%r" % (
+                        None if _yes is None else _yes.objectName(),)
+                _box.setModal(False)
+                _box.show()
+                pump(450)
+                _img = _box.grab().toImage()
+                _got = _img.pixelColor(_img.width() // 2, 6).getRgb()[:3]
+                _want = _rgb_of(_pal.get("window_top"))
+                if _got != _want:
+                    _px_bad[_m] = "背景像素 %s != 色板 %s" % (_got, _want)
+                # ③b 红色描边真的画出来了（扫全图，不依赖按钮几何 ——
+                #    QMessageBox 的按钮几何在 grab 之前读可能是陈旧的）
+                _wr = _rgb_of(_pal.get("red", "#e5484d"))
+                _hits = 0
+                for _y in range(0, _img.height(), 2):
+                    for _x in range(0, _img.width(), 2):
+                        _c = _img.pixelColor(_x, _y).getRgb()[:3]
+                        if all(abs(_c[i] - _wr[i]) <= 24 for i in range(3)):
+                            _hits += 1
+                if _hits < 20:
+                    _red_bad[_m] = "红色像素只有 %d 个（DangerButton 描边/文字没渲染）" % _hits
+                _box.close()
+                _box.deleteLater()
+                _sp.deleteLater()
+                pump(150)
+        finally:
+            theme.set_pack(_pk19)
+            theme.set_theme(_md19)
+
+        chk("弹窗样式表按当前色板生成且根规则不透明（浅/深两模式）",
+            not _qss_bad, _qss_bad)
+        chk("QMessageBox 真实渲染的背景 = 当前色板 window_top（浅/深两模式）",
+            not _px_bad, _px_bad)
+        chk("「是」按钮挂了 DangerButton 对象名（红色描边的挂点）",
+            not _obj_bad, _obj_bad)
+        chk("弹窗里真的画出了红色高危按钮（对照：不是整块没画）",
+            not _red_bad, _red_bad)
+        # 对照组（确定性，不依赖原生渲染长什么样）：**不挂样式表**时
+        # QMessageBox 的 stylesheet 是空的 —— 证明上面②③测的是"挂样式"
+        # 这条路径；再断言浅/深两套样式表**内容不同**（防止有人把颜色写死
+        # 成一份，那样浅色模式下②会红、深色模式下①会红，两头必踩一个）。
+        # ⚠️ 不要用"原生弹窗渲染出来是什么颜色"当对照组：它随 Qt 版本 /
+        # 系统主题而变（本机探针实测过 #000000 与 (239,239,239) 两种），
+        # 是一条会随环境翻的假警报。
+        _qss_l = _qss_by_mode.get("light", "")
+        _qss_d = _qss_by_mode.get("dark", "")
+        _sp_c = SettingsPage()
+        _raw_box = _sp_c._build_sac_confirm_box()
+        _raw_box.setStyleSheet("")            # 模拟"漏挂样式表"的回归
+        chk("对照组：不挂样式表时弹窗 stylesheet 为空（证明测的是挂样式这条路径）",
+            _raw_box.styleSheet() == "")
+        _raw_box.close()
+        _raw_box.deleteLater()
+        _sp_c.deleteLater()
+        pump(120)
+        chk("对照组：浅色与深色两份弹窗样式表内容不同（颜色跟着色板走）",
+            bool(_qss_l) and bool(_qss_d) and _qss_l != _qss_d,
+            "相同=%s" % (_qss_l == _qss_d))
+    except Exception as _ex:                                   # noqa: BLE001
+        chk("弹窗主题回归检查能跑起来", False, repr(_ex))
+
     result["ok"] = all(c["pass"] for c in checks)
     # 先 dumps 再落盘 + default=str：detail 里混进 bytes / 自定义对象时，
     # json.dump 会抛 TypeError，而它是**边序列化边写**的——文件已被写了

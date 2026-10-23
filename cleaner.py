@@ -40,19 +40,31 @@ Excluded + Applicable FileExist/RegExist）移植为声明式 Target，由下方
   Intel / D3DSCache 的着色器缓存是并列规则，本机没有哪个厂商的目录就
   展开为空、条目自动置灰；DISM / vssadmin / wevtutil 的输出解析对系统
   语言做了降级处理（utf-8 → gbk → latin-1，数字与单位恒为 ASCII）。
+
+2026-10-19 大修（1.1.7）：
+  * query 语义修正：多个 query 是**并联**候选路径，单条里的 \\ 表示层级。
+    旧实现把多个 query 当"逐级串联"、又把带 \\ 的整串与单个文件名比较，
+    导致 driver_temp / windows_temp_install / qq_temp(TXSSO) / 全部
+    AppData 日志 / thumbnail_cache 等规则一个条目都匹配不到（扫描恒 0）。
+  * contents 模式补上 excluded（旧实现整段忽略，ClickToRun 会连
+    MachineData/UserData 一起删掉 → Office 无法修复/卸载）。
+  * 扫描/清理共用 `_contents_plan` + 跨 target 去重，保证"扫得出来 =
+    清得掉"，且重叠 root 不再重复计数（实测 temp_files 5.26 GB → 2.63 GB，
+    原来整整算了两遍）。
+  * 删除链路：超长路径加 \\\\?\\ 前缀、失败后 takeown+icacls 重试、链接/联接
+    只删链接本身；事件日志占用归入 skipped。
+  * 还原点只统计「已用空间」，释放量用删前/删后实测差值。
 """
 
 from __future__ import annotations
 
-import base64
 import ctypes
 import fnmatch
-import json
 import os
 import re
 import shutil
+import stat
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -63,10 +75,47 @@ IS_WIN = os.name == "nt"
 # Win32 CREATE_NO_WINDOW：禁止给控制台子进程创建 conhost 窗口（防白窗闪烁）
 _CREATE_NO_WINDOW = 0x08000000
 
+# FILE_ATTRIBUTE_REPARSE_POINT：符号链接 / 目录联接（junction）都带这个位。
+# 只看 os.path.islink 会漏掉 junction，而 junction 一旦被递归进去就会跨盘、
+# 甚至兜回自身 —— 统计会虚高，删除可能删到别处。
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+# 长路径前缀阈值。Windows.old / WinSxS 里的路径经常超过 MAX_PATH(260)，
+# 不加 \\?\ 前缀时 os.scandir / rmtree 会直接 ENOENT，表现为"删了但还在"。
+_LONG_PATH_LIMIT = 240
+
 
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
+def _long_path(path: str) -> str:
+    """给超长路径加 \\\\?\\ 前缀（Windows API 绕过 MAX_PATH 260 的限制）。
+
+    普通长度原样返回 —— 加前缀会改变 API 的路径解析规则（不再做 . / ..
+    归一化），能用普通路径时不要加。
+    """
+    if not IS_WIN:
+        return path
+    p = os.path.abspath(path)
+    if p.startswith("\\\\?\\") or len(p) < _LONG_PATH_LIMIT:
+        return p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def _is_reparse(path: str) -> bool:
+    """是否符号链接 / 目录联接（不跟随，用于避免递归进别处）。"""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def human_bytes(n, digits=2):
     """字节数 → 易读字符串。"""
     try:
@@ -130,15 +179,27 @@ def drive_space(drive="C:") -> dict:
                 "total_bytes": 0, "used_bytes": 0, "percent": 0.0}
 
 
+_ADMIN_CACHE = None
+
+
 def is_admin():
-    """当前进程**是否已提权**（TokenElevation，不能用 IsUserAnAdmin 判组）。"""
+    """当前进程**是否已提权**（TokenElevation，不能用 IsUserAnAdmin 判组）。
+
+    Yuhub 由 exe 清单 requireAdministrator 启动，正常情况下恒为 True。
+    这里只用于"权限不足时给一句人话"，引擎**不会**再弹 UAC 二次提权。
+    """
+    global _ADMIN_CACHE
+    if _ADMIN_CACHE is not None:
+        return _ADMIN_CACHE
     if not IS_WIN:
+        _ADMIN_CACHE = False
         return False
     try:
         import winadmin
-        return bool(winadmin.is_elevated())
+        _ADMIN_CACHE = bool(winadmin.is_elevated())
     except Exception:
-        return False
+        _ADMIN_CACHE = False
+    return _ADMIN_CACHE
 
 
 def fixed_drives() -> list[str]:
@@ -154,37 +215,60 @@ def fixed_drives() -> list[str]:
     return out
 
 
-def measure(path, max_seconds=None, cancel: Callable[[], bool] | None = None) -> int:
+def measure(path, max_seconds=None, cancel: Callable[[], bool] | None = None,
+            deadline: float | None = None) -> int:
     """递归统计目录/文件体积（字节）。
 
     旧版带 2.5s 超时，实测大目录（几 GB 的缓存）经常被超时截断，扫描值
     严重虚低。现在**不再人为限时**（扫描跑在后台线程，取消走 cancel）；
     max_seconds 参数仅为兼容保留、不再生效。统计失败（无权限/不存在）按 0。
+
+    deadline（time.monotonic 绝对时刻）是给"整条规则"用的预算：超时就返回
+    已统计的部分，由调用方标记 partial —— 宁可显示 "≥ 12 GB（统计中被截断）"，
+    也不能让一条规则把整轮扫描挂住（这就是"扫描卡死"的一大来源）。
+    cancel 每 256 个条目检查一次，取消能在一秒内生效。
     """
     total = 0
+    n = 0
     try:
-        if os.path.isfile(path) or os.path.islink(path):
+        lp = _long_path(path)
+        if _is_reparse(lp):
+            # 链接本身按 0 计 —— 不计入它指向别处的内容（否则会虚高/串目录）
+            return 0
+        if os.path.isfile(lp):
             try:
-                return os.path.getsize(path)
+                return os.path.getsize(lp)
             except OSError:
                 return 0
-        if not os.path.isdir(path):
+        if not os.path.isdir(lp):
             return 0
-        stack = [path]
+        stack = [lp]
         while stack:
             if cancel and cancel():
+                break
+            if deadline and time.monotonic() > deadline:
                 break
             cur = stack.pop()
             try:
                 with os.scandir(cur) as it:
                     for entry in it:
+                        n += 1
+                        if (n & 0xFF) == 0:
+                            if cancel and cancel():
+                                return total
+                            if deadline and time.monotonic() > deadline:
+                                return total
                         try:
-                            if entry.is_symlink():
+                            st = entry.stat(follow_symlinks=False)
+                            if getattr(st, "st_file_attributes", 0) \
+                                    & _FILE_ATTRIBUTE_REPARSE_POINT:
                                 continue
-                            if entry.is_dir(follow_symlinks=False):
+                            # 硬链接按真实占用统计即可（Windows 上不做去重，
+                            # 与资源管理器口径一致，也避免为统计建全局索引）
+                            if stat.S_ISDIR(st.st_mode):
                                 stack.append(entry.path)
                             else:
-                                total += entry.stat(follow_symlinks=False).st_size
+                                total += st.st_size
                         except OSError:
                             continue
             except OSError:
@@ -366,6 +450,11 @@ class Target:
                   无 Query 的写法，如 %Temp%）；
       entries  —— 按 query 相对模式匹配 root 下的条目并**整条删除**
                   （Data.xml 带 Query 的写法；Flags=Directory 同此）。
+    query —— **并联**的多条相对路径模式，每条内部用 \\ 表示层级：
+               ("AMD", "Intel", "NVIDIA")            → root\\AMD|root\\Intel|root\\NVIDIA
+               ("Local\\Microsoft\\Windows\\*.log",)  → 逐级下钻
+    excluded —— 要保留的子项名/通配符，或 ?函数 形式的动态版本号；
+                两种 mode 都必须遵守（contents 曾经整段忽略它）。
     file_only —— 只匹配文件（Data.xml Flags=File，如 Windows 日志 *.log）。
     """
 
@@ -440,41 +529,70 @@ def _excluded_match(name: str, excluded: tuple, values: list[str]) -> bool:
     return False
 
 
-def _iter_matches(root_dir: str, tgt: Target, dyn_excl: list[str]):
-    """按 query 相对模式逐级匹配 root_dir 下的条目（支持 a\\b\\*.log）。"""
-    pats = list(tgt.query)
-    if not pats:
+def _match_chain(base: str, segs: list[str], tgt: Target, dyn_excl: list[str]):
+    """按"一级一个模式"递归匹配一条相对路径。segs 已按反斜杠拆好。"""
+    pat, rest = segs[0], segs[1:]
+    try:
+        it = os.scandir(base)
+    except OSError:
         return
-
-    def rec(dirpath, pats_left):
-        pat, rest = pats_left[0], pats_left[1:]
-        try:
-            entries = os.listdir(dirpath)
-        except OSError:
-            return
-        for name in entries:
-            if not fnmatch.fnmatch(name, pat):
+    with it:
+        for entry in it:
+            # 用 fnmatchcase + 预先 lower：Windows 大小写不敏感，但 fnmatch
+            # 的 normcase 会把 / 也改掉，这里只做小写比较，行为可预期。
+            if not fnmatch.fnmatchcase(entry.name.lower(), pat.lower()):
                 continue
-            child = os.path.join(dirpath, name)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
             if rest:
-                if os.path.isdir(child):
-                    yield from rec(child, rest)
-            else:
-                if tgt.file_only and os.path.isdir(child):
-                    continue
-                if _excluded_match(name, tgt.excluded, dyn_excl):
-                    continue
-                yield child
+                if is_dir:
+                    yield from _match_chain(entry.path, rest, tgt, dyn_excl)
+                continue
+            if tgt.file_only and is_dir:
+                continue
+            if _excluded_match(entry.name, tgt.excluded, dyn_excl):
+                continue
+            yield entry.path
 
-    yield from rec(root_dir, pats)
+
+def _iter_matches(root_dir: str, tgt: Target, dyn_excl: list[str]):
+    """把 query 里每条模式当作**一条相对路径**去匹配 root_dir（结果去重）。
+
+    关键语义（旧实现错在这里）：
+      * query 的多个元素是**并联**（候选路径），不是"逐级串联"。旧代码把
+        ("AMD","Intel","NVIDIA") 当成 root\\AMD\\Intel\\NVIDIA 一条链，
+        于是这类规则一条都匹配不到 —— 扫描恒 0、点了也删不掉。
+      * 单条模式里的 `\\` 表示层级，如 `Local\\Microsoft\\Windows\\*.log`
+        要从 root 逐级走下去（旧代码拿整串和单个文件名比较，永远不相等）。
+    """
+    seen = set()
+    for pat in tgt.query:
+        segs = [s for s in str(pat).replace("/", "\\").split("\\") if s]
+        if not segs:
+            continue
+        for p in _match_chain(root_dir, segs, tgt, dyn_excl):
+            key = os.path.normcase(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield p
 
 
 # contents 模式的安全护栏：这些目录绝不允许被"清空内容"
+_CRITICAL_CACHE = None
+
+
 def _critical_roots() -> set:
+    """关键目录集合（进程生命周期内不变，缓存一次）。"""
+    global _CRITICAL_CACHE
+    if _CRITICAL_CACHE is not None:
+        return _CRITICAL_CACHE
     win = os.environ.get("SystemRoot", r"C:\Windows")
     sysdrive = os.environ.get("SystemDrive", "C:") + "\\"
     prof = os.environ.get("USERPROFILE", "")
-    return {
+    _CRITICAL_CACHE = {
         os.path.normpath(x).lower() for x in (
             sysdrive, win, os.path.join(win, "System32"),
             os.path.join(win, "SysWOW64"),
@@ -488,6 +606,12 @@ def _critical_roots() -> set:
             os.path.join(prof, "AppData", "Roaming") if prof else "",
         ) if x
     }
+    return _CRITICAL_CACHE
+
+
+def _root_blocked(root_dir: str) -> bool:
+    """contents 模式下该根是否被安全护栏拒绝。"""
+    return os.path.normpath(root_dir).lower() in _critical_roots()
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +638,7 @@ class CleanRule:
     file_count: int = 0
     scanned: bool = False
     available: bool = False
+    partial: bool = False    # True = 扫描被预算截断，size 只是下限
 
     @property
     def risky(self):
@@ -585,13 +710,15 @@ def build_rules() -> list[CleanRule]:
             T(r"%SystemRoot%\System32\WDI\LogFiles\*"),
             T(r"%SystemRoot%\System32\LogFiles\*"),
             T(r"%SystemRoot%\debug"),
-            T(U + r"\AppData\Local\Packages\*\AC\Microsoft\CLR_*\*.log",
+            # UWP 容器里的 CLR 日志。这四条原来把 *.log 写在 RootPath 里、又
+            # 声明 mode="entries" 却不给 query —— 模式为空 ⇒ 一个都匹配不到；
+            # 且 RootPath 的通配只在"目录"上展开，以 *.log 结尾的 root 本就
+            # 不会存在。现在把容器根当 root、日志路径放 query（并联两种层级）。
+            T(U + r"\AppData\Local\Packages\*\AC",
+              r"Microsoft\CLR_*\*.log", r"#!*\Microsoft\CLR_*\*.log",
               file_only=True, mode="entries"),
-            T(U + r"\AppData\Local\Packages\*\AC\#!*\Microsoft\CLR_*\*.log",
-              file_only=True, mode="entries"),
-            T(U + r"\AppData\Local\Packages\*\AC\Microsoft\CLR_*\*\*.log",
-              file_only=True, mode="entries"),
-            T(U + r"\AppData\Local\Packages\*\AC\#!*\Microsoft\CLR_*\*\*.log",
+            T(U + r"\AppData\Local\Packages\*\AC",
+              r"Microsoft\CLR_*\*\*.log", r"#!*\Microsoft\CLR_*\*\*.log",
               file_only=True, mode="entries"),
         ], admin=True)
 
@@ -775,14 +902,28 @@ def build_rules() -> list[CleanRule]:
         ], admin=True)
 
     # Data.xml「缩略图缓存」(L2)
+    # 旧写法 `Explorer\*` + `IconCache.db` 串成一条链，意思是
+    # Explorer\<版本>\IconCache.db —— 但真实的图标/缩略图缓存是
+    # Explorer\iconcache_*.db 与 thumbcache_*.db（平铺在该目录下），
+    # 于是整条规则永远匹配不到、永远显示 0 B。这里按真实文件名列。
     add("thumbnail_cache", "缩略图缓存",
         "资源管理器的缩略图与图标缓存。个别文件被占用时会自动重启资源"
         "管理器释放（任务栏会短暂消失一下）。",
         GROUP_CACHE, 2, [
-            T(r"%LocalAppData%", r"Microsoft\Windows\Explorer\*", "IconCache.db",
-              mode="entries"),
-            T(U + r"\AppData\Local", r"Microsoft\Windows\Explorer\*",
-              "IconCache.db", mode="entries"),
+            T(r"%LocalAppData%\Microsoft\Windows\Explorer",
+              "iconcache_*.db", "thumbcache_*.db", "IconCache.db",
+              file_only=True, mode="entries"),
+            T(r"%LocalAppData%", "IconCache.db",
+              file_only=True, mode="entries"),
+            T(U + r"\AppData\Local\Microsoft\Windows\Explorer",
+              "iconcache_*.db", "thumbcache_*.db", "IconCache.db",
+              file_only=True, mode="entries"),
+            T(U + r"\AppData\Local", "IconCache.db",
+              file_only=True, mode="entries"),
+            T(r"%SystemRoot%\System32\config\systemprofile\AppData\Local"
+              r"\Microsoft\Windows\Explorer",
+              "iconcache_*.db", "thumbcache_*.db", "IconCache.db",
+              file_only=True, mode="entries"),
         ], admin=True)
 
     # Data.xml「Terminal Server Client缓存」(L3)
@@ -894,32 +1035,29 @@ def build_rules() -> list[CleanRule]:
         ], admin=True, warning="删除此条目可能导致 Adobe Acrobat 无法正常卸载！")
 
     # Yuhub 保留项（Data.xml 没有但安全实用，全部可自动重建）
-    LA = os.environ.get("LOCALAPPDATA", "")
-    if True:
-        add("gpu_nvidia_shader", "NVIDIA 着色器缓存",
-            "NVIDIA 显卡的 DX/GL/Compute 着色器缓存，删除后游戏首次加载会"
-            "重新编译（自动重建）。",
-            GROUP_GPU, 3, [
-                T(r"%LocalAppData%\NVIDIA\DXCache"),
-                T(r"%LocalAppData%\NVIDIA\GLCache"),
-                T(r"%LocalAppData%\NVIDIA\ComputeCache"),
-                T(r"%LocalAppData%\NVIDIA Corporation\NV_Cache"),
-            ])
-        add("gpu_amd_shader", "AMD 着色器缓存",
-            "AMD 显卡的 DX/GL/Vulkan 着色器缓存（自动重建）。",
-            GROUP_GPU, 3, [
-                T(r"%LocalAppData%\AMD\DxCache"),
-                T(r"%LocalAppData%\AMD\DxcCache"),
-                T(r"%LocalAppData%\AMD\GLCache"),
-                T(r"%LocalAppData%\AMD\VkCache"),
-            ])
-        add("gpu_intel_shader", "Intel 着色器缓存",
-            "Intel 核显的着色器缓存（自动重建）。",
-            GROUP_GPU, 3, [
-                T(r"%LocalAppData%\Intel\ShaderCache"),
-                T(r"%LocalAppData%\D3DSCache"),
-            ])
-        del LA
+    add("gpu_nvidia_shader", "NVIDIA 着色器缓存",
+        "NVIDIA 显卡的 DX/GL/Compute 着色器缓存，删除后游戏首次加载会"
+        "重新编译（自动重建）。",
+        GROUP_GPU, 3, [
+            T(r"%LocalAppData%\NVIDIA\DXCache"),
+            T(r"%LocalAppData%\NVIDIA\GLCache"),
+            T(r"%LocalAppData%\NVIDIA\ComputeCache"),
+            T(r"%LocalAppData%\NVIDIA Corporation\NV_Cache"),
+        ])
+    add("gpu_amd_shader", "AMD 着色器缓存",
+        "AMD 显卡的 DX/GL/Vulkan 着色器缓存（自动重建）。",
+        GROUP_GPU, 3, [
+            T(r"%LocalAppData%\AMD\DxCache"),
+            T(r"%LocalAppData%\AMD\DxcCache"),
+            T(r"%LocalAppData%\AMD\GLCache"),
+            T(r"%LocalAppData%\AMD\VkCache"),
+        ])
+    add("gpu_intel_shader", "Intel 着色器缓存",
+        "Intel 核显的着色器缓存（自动重建）。",
+        GROUP_GPU, 3, [
+            T(r"%LocalAppData%\Intel\ShaderCache"),
+            T(r"%LocalAppData%\D3DSCache"),
+        ])
 
     # ================= 系统相关 =================
     # Data.xml「Windows报告」(L3)
@@ -943,7 +1081,7 @@ def build_rules() -> list[CleanRule]:
         "Windows 下载更新与商店应用时产生的临时安装包，可安全删除。",
         GROUP_SYSTEM, 2, [
             T(r"%SystemRoot%\SoftwareDistribution\Download"),
-        ], admin=True)
+        ], admin=True, special="wu_download")
 
     # Data.xml「Windows更新安装记录」(L2)
     add("wu_records", "Windows 更新安装记录",
@@ -1171,8 +1309,8 @@ def build_rules() -> list[CleanRule]:
 
 
 # 需要在删除时特殊处理（走系统 API 而非直接删目录）的条目
-_SPECIALS = {"recycle", "dism_component", "wu_records", "do_cache",
-             "win_events", "sr_points"}
+_SPECIALS = {"recycle", "dism_component", "wu_records", "wu_download",
+             "do_cache", "win_events", "sr_points"}
 
 # 这些规则的文件可能被 explorer.exe 持有：只有确实删不掉时才重启
 # 资源管理器重试（与 Dism++ 缩略图条目的 ExplorerNotify 行为一致但更保守）
@@ -1291,6 +1429,7 @@ def restart_explorer(wait=3.0, restore_timeout=8.0) -> bool:
             subprocess.run(
                 ["taskkill", "/f", "/im", "explorer.exe"],
                 capture_output=True, timeout=15, creationflags=flags,
+                stdin=subprocess.DEVNULL,
             )
         except Exception:
             pass
@@ -1352,35 +1491,125 @@ def _resolve_entries(tgt: Target) -> list[str]:
     return out
 
 
-def _scan_target(tgt: Target, cancel=None) -> tuple[int, int]:
-    """统计一个 Target 的体积。返回 (字节, 条目数)。"""
-    if tgt.mode == "contents":
-        total = 0
-        n = 0
-        for root_dir in _expand_root(tgt.root):
-            try:
-                entries = os.listdir(root_dir)
-            except OSError:
+def _contents_plan(tgt: Target, cancel=None, notes=None) -> list:
+    """contents 模式**实际会被删除**的条目清单：[(root_dir, [child, ...])]。
+
+    扫描与清理都走这一个函数，保证"扫得出来 = 清得掉"，同时把
+    excluded（以前 contents 分支完全忽略，ClickToRun 会连 MachineData /
+    UserData 一起清掉）和安全护栏都落在同一个地方。
+    """
+    plan = []
+    for root_dir in _expand_root(tgt.root):
+        if cancel and cancel():
+            break
+        if _root_blocked(root_dir):
+            if notes is not None:
+                notes.append("已跳过关键目录（安全护栏）：" + root_dir)
+            continue
+        dyn = []
+        skip_root = False
+        for ex in tgt.excluded:
+            if not str(ex).startswith("?"):
                 continue
-            for name in entries:
-                if cancel and cancel():
-                    break
-                total += measure(os.path.join(root_dir, name), cancel=cancel)
-                n += 1
-        return total, n
-    # entries
+            v = _eval_expr(ex, root_ctx=root_dir + "\\")
+            if not v:
+                skip_root = True
+                break
+            dyn.append(v)
+        if skip_root:
+            if notes is not None:
+                notes.append("无法确定当前版本，已整根跳过：" + root_dir)
+            continue
+        try:
+            names = os.listdir(_long_path(root_dir))
+        except OSError as exc:
+            if notes is not None:
+                notes.append("无法列出 %s（%s）" % (root_dir, exc))
+            continue
+        children = [os.path.join(root_dir, n) for n in names
+                    if not _excluded_match(n, tgt.excluded, dyn)]
+        plan.append((root_dir, children))
+    return plan
+
+
+def _scan_target(tgt: Target, cancel=None, seen: set | None = None,
+                 deadline: float | None = None, note=None
+                 ) -> tuple[int, int, bool]:
+    """统计一个 Target 的体积。返回 (字节, 条目数, 是否被预算截断)。
+
+    seen：跨 target 的已统计路径集合。规则之间/之内的 root 会重叠
+    （%Temp% 与 Users\\*\\AppData\\Local\\Temp 在"当前用户"身上是同一个目录），
+    不去重就会把同一份文件算两遍 —— 扫描值虚高、清理后对不上。
+    note：逐条目回调（给界面显示"正在扫描 XXX"，避免长目录看起来像卡死）。
+    """
     total = 0
     n = 0
+    truncated = False
+
+    def _tick(text):
+        if note is not None:
+            try:
+                note(text)
+            except Exception:
+                pass
+
+    def _expired():
+        return bool(deadline) and time.monotonic() > deadline
+
+    if tgt.mode == "contents":
+        for root, children in _contents_plan(tgt, cancel=cancel):
+            if cancel and cancel():
+                break
+            if seen is not None:
+                k = os.path.normcase(os.path.abspath(root))
+                if k in seen:
+                    continue
+                seen.add(k)
+            _tick(root)
+            for child in children:
+                if cancel and cancel():
+                    break
+                if _expired():
+                    truncated = True
+                    break
+                total += measure(child, cancel=cancel, deadline=deadline)
+                n += 1
+            if truncated:
+                break
+        return total, n, truncated
+    # entries
     for p in _resolve_entries(tgt):
         if cancel and cancel():
             break
-        total += measure(p, cancel=cancel)
+        if seen is not None:
+            k = os.path.normcase(os.path.abspath(p))
+            if k in seen:
+                continue
+            seen.add(k)
+        if _expired():
+            truncated = True
+            break
+        _tick(p)
+        total += measure(p, cancel=cancel, deadline=deadline)
         n += 1
-    return total, n
+    return total, n, truncated
 
 
-def scan_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None) -> int:
-    """统计某条规则的体积。返回字节数。只读，不做任何删除。"""
+#: 单条规则的扫描预算（秒）。超过就返回已统计的部分并标记 partial。
+#: 这是一根"防挂死"的保险丝：正常条目（几十万文件）也只要几秒到几十秒，
+#: 真跑满说明碰到了畸形目录/极慢磁盘 —— 那种情况宁可显示"≥ N GB"，
+#: 也不能让整轮扫描永远停在那里（用户看到的就是"卡死"）。
+SCAN_BUDGET_FAST = 90.0
+
+
+def scan_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
+              note: Callable[[str], None] | None = None,
+              budget: float | None = SCAN_BUDGET_FAST) -> int:
+    """统计某条规则的体积。返回字节数。只读，不做任何删除。
+
+    note：逐条目回调（界面用来显示"正在扫描 XXX"，长目录不再像卡死）。
+    budget：整条规则的时间预算；None = 不限（特殊条目自己带超时）。
+    """
     if cancel and cancel():
         return 0
     if rule.special == "recycle":
@@ -1388,31 +1617,42 @@ def scan_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None) -> int:
         rule.size = total
         rule.available = total > 0
         rule.file_count = 0
+        rule.partial = False
         rule.scanned = True
         return total
     if rule.special == "dism_component":
-        total = _dism_component_scan()
+        total = _dism_component_scan(cancel=cancel)
         rule.size = total
         rule.available = total > 0
+        rule.partial = False
         rule.scanned = True
         return total
     if rule.special == "sr_points":
         total = _sr_points_scan()
         rule.size = total
         rule.available = total > 0
+        rule.partial = False
         rule.scanned = True
         return total
+    deadline = (time.monotonic() + budget) if budget is not None else None
     total = 0
     count = 0
+    truncated = False
+    seen: set = set()
     for tgt in rule.targets:
         if cancel and cancel():
             break
-        t, n = _scan_target(tgt, cancel=cancel)
+        t, n, to = _scan_target(tgt, cancel=cancel, seen=seen,
+                                deadline=deadline, note=note)
         total += t
         count += n
+        truncated = truncated or to
+        if truncated:
+            break
     rule.size = total
     rule.file_count = count
     rule.available = total > 0 or count > 0
+    rule.partial = truncated
     rule.scanned = True
     return total
 
@@ -1435,100 +1675,279 @@ class CleanResult:
     messages: list = field(default_factory=list)
 
 
-def _rm_path(path: str) -> bool:
-    """彻底删除一个文件/目录。删完复查存在性（防静默拦截）。"""
+# 删除结果分类。比"成功/失败"细一档 —— 被进程占用 ≠ 权限不足，
+# 混在一起报就会变成用户看到的"47 项被占用或者权限不足"（其中大半是
+# 浏览器/输入法/杀软正开着的临时文件，关掉程序自己就没了）。
+RM_OK = 0
+RM_IN_USE = 1     # WinError 32/33：被占用，可重试
+RM_DENIED = 2     # WinError 5：真没权限，需要夺权
+RM_FAILED = 3     # 其它（145 非空、路径异常…）
+
+
+def _classify_rm(exc: OSError) -> int:
+    code = getattr(exc, "winerror", None) or getattr(exc, "errno", 0) or 0
+    if code in (32, 33):
+        return RM_IN_USE
+    if code in (5, 13):
+        return RM_DENIED
+    return RM_FAILED
+
+
+def _clear_attrs(lp: str):
+    """摘掉只读 / 隐藏 / 系统属性。
+
+    os.chmod 只改得动只读位，对带 FILE_ATTRIBUTE_SYSTEM 的老系统文件
+    （$Windows.~BT、Windows.old 里的标记文件）无效；直接
+    SetFileAttributesW 置 NORMAL 才删得掉。
+    """
+    if not IS_WIN:
+        try:
+            os.chmod(lp, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        return
     try:
-        if os.path.islink(path) or os.path.isfile(path):
-            try:
-                os.chmod(path, 0o700)
-            except OSError:
-                pass
-            try:
-                os.remove(path)
-            except OSError:
-                return False
-            return not os.path.exists(path)
-        if os.path.isdir(path):
-            def _onerr(func, p, exc):
-                try:
-                    os.chmod(p, 0o700)
-                    func(p)
-                except Exception:
-                    pass
-            shutil.rmtree(path, onerror=_onerr)
-            return not os.path.exists(path)
+        ctypes.windll.kernel32.SetFileAttributesW(ctypes.c_wchar_p(lp), 0x80)
+    except Exception:
+        pass
+
+
+def _take_ownership(path: str) -> bool:
+    """夺回所有权并重置 ACL（takeown + icacls）。
+
+    只在普通删除失败后调用：Windows.old、CBS 临时目录、某些程序目录的
+    ACL 会把 Administrators 都挡在外面，光靠管理员令牌删不掉。
+    """
+    if not IS_WIN or not is_admin():
+        return False
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW)
+    lp = _long_path(path)
+    try:
+        subprocess.run(["takeown", "/F", lp, "/R", "/D", "Y"],
+                       capture_output=True, timeout=240, creationflags=flags,
+                       stdin=subprocess.DEVNULL)
+        subprocess.run(["icacls", lp, "/reset", "/T", "/C", "/Q"],
+                       capture_output=True, timeout=240, creationflags=flags,
+                       stdin=subprocess.DEVNULL)
+        return True
     except Exception:
         return False
-    return False
 
 
-def _rm_entry(path: str) -> tuple[bool, int]:
-    """删除一个条目，返回 (是否成功, 被删对象的字节体积)。
+def _remove_node(lp: str) -> int:
+    """删除一个文件/目录（lp 已是长路径形式），返回 RM_* 分类。
 
-    体积必须在**删除前**测量——删完就问不出大小了。这是「已清理 N MB」
-    能给出真实数字（而不是靠扫描预估或磁盘读数）的关键。
+    这里**自己递归**而不用 shutil.rmtree。原因：rmtree 碰到一个被占用的
+    子文件时父目录必然留下，而我们拿不到"到底是被占用还是没权限"——
+    那正是界面上"47 项被占用或权限不足"里假警报的来源。自己走可以：
+      ① 能删的先删干净，不因为一个锁住的文件就整棵放弃；
+      ② 被占用的子项只让**它自己**失败，父目录按"被占用"上报；
+      ③ 只有真拿到 WinError 5 才归入"权限不足"。
+    每个节点只用**一次 lstat** 判类型（不加 \\\\?\\ 前缀时也要走这一趟），
+    几十万文件的 Windows.old 才不至于被多条 syscall 拖慢。
     """
     try:
-        if os.path.isfile(path) and not os.path.islink(path):
-            size = os.path.getsize(path)
-        elif os.path.isdir(path):
-            size = measure(path)
-        else:
-            size = 0
-    except OSError:
-        size = 0
-    return _rm_path(path), size
+        st = os.lstat(lp)
+    except OSError as exc:
+        code = getattr(exc, "winerror", 0) or getattr(exc, "errno", 0)
+        return RM_OK if code in (2, 3) else _classify_rm(exc)
+    except Exception:
+        return RM_FAILED
 
+    is_link = stat.S_ISLNK(st.st_mode) or bool(
+        getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+    if is_link:
+        # 符号链接 / 目录联接：只删链接本身，绝不跟进去删目标
+        try:
+            os.unlink(lp)
+            return RM_OK
+        except OSError as exc:
+            first = _classify_rm(exc)
+        try:
+            os.rmdir(lp)
+            return RM_OK
+        except OSError:
+            return first
 
-def _empty_dir_stats(path: str, cancel=None) -> tuple[int, int, int]:
-    """清空目录内容（保留目录本身），返回 (成功数, 失败数, 被删字节)。"""
-    ok = fail = 0
-    total = 0
+    if stat.S_ISDIR(st.st_mode):
+        try:
+            with os.scandir(lp) as it:
+                names = [e.name for e in it]
+        except OSError as exc:
+            return _classify_rm(exc)
+        worst = RM_OK
+        for name in names:
+            k = _remove_node(os.path.join(lp, name))
+            # 优先级：没权限 > 其它失败 > 被占用（最"正常"的一种）
+            if k == RM_DENIED:
+                worst = RM_DENIED
+            elif k == RM_FAILED and worst != RM_DENIED:
+                worst = RM_FAILED
+            elif k == RM_IN_USE and worst == RM_OK:
+                worst = RM_IN_USE
+        try:
+            os.rmdir(lp)
+            return RM_OK
+        except OSError as exc:
+            kind = _classify_rm(exc)
+            if not os.path.lexists(lp):
+                return RM_OK
+            if kind == RM_FAILED and worst != RM_OK:
+                return worst          # 非空只是因为里面有删不掉的
+            return kind
+
+    # 其余按文件处理
     try:
-        entries = os.listdir(path)
+        os.remove(lp)
+        return RM_OK
+    except OSError as exc:
+        kind = _classify_rm(exc)
+    if not os.path.lexists(lp):
+        return RM_OK
+    if kind == RM_DENIED:
+        _clear_attrs(lp)
+        try:
+            os.remove(lp)
+            return RM_OK
+        except OSError as exc:
+            return _classify_rm(exc)
+    return kind
+
+
+def _rm_path_kind(path: str, retry=True) -> int:
+    """彻底删除并返回分类。带"占用重试"与"夺权重试"。"""
+    lp = _long_path(path)
+    kind = _remove_node(lp)
+    if kind == RM_OK or not os.path.lexists(lp):
+        return RM_OK
+    if kind == RM_IN_USE and retry:
+        # 杀软扫描 / 索引器常造成瞬时占用，隔一下再试一次往往就过了
+        time.sleep(0.12)
+        kind = _remove_node(lp)
+        if kind == RM_OK or not os.path.lexists(lp):
+            return RM_OK
+    if kind == RM_DENIED and retry:
+        _clear_attrs(lp)
+        kind = _remove_node(lp)
+        if kind == RM_OK or not os.path.lexists(lp):
+            return RM_OK
+        if is_admin() and _take_ownership(lp):
+            kind = _remove_node(lp)
+            if not os.path.lexists(lp):
+                return RM_OK
+    return kind
+
+
+def _rm_path(path: str, retry_acl=True) -> bool:
+    return _rm_path_kind(path, retry=retry_acl) == RM_OK
+
+
+def _rm_entry(path: str) -> tuple[int, int]:
+    """删除一个条目，返回 (RM_* 分类, **实际释放**的字节数)。
+
+    体积在**删除前**测量（删完就问不出大小了）；如果只删掉一部分
+    （目录里有个文件被占用），再测一次残留、用差值作为真实释放量 ——
+    这样「已清理 N MB」既不虚高，也不会把已经删掉的那部分丢掉。
+    """
+    try:
+        lp = _long_path(path)
+        if _is_reparse(lp):
+            before = 0                   # 链接本身不占多少，也不统计目标
+        elif os.path.isdir(lp):
+            before = measure(lp)
+        elif os.path.isfile(lp):
+            before = os.path.getsize(lp)
+        else:
+            before = 0
     except OSError:
-        return 0, 1, 0
-    for name in entries:
+        before = 0
+    kind = _rm_path_kind(path)
+    if kind == RM_OK:
+        return RM_OK, before
+    try:
+        after = measure(_long_path(path))
+    except OSError:
+        after = 0
+    return kind, max(0, before - after)
+
+
+def _empty_dir_stats(path: str, cancel=None, exclude=(), children=None
+                     ) -> tuple[int, int, int, int]:
+    """清空目录内容（保留目录本身），返回 (成功, 跳过, 失败, 被删字节)。
+
+    exclude：本次不清的子项名（contents 模式必须遵守，否则 ClickToRun
+    会连 MachineData / UserData 一起删）；children：已算好的子项清单
+    （传给扫描与清理同一个 plan，避免两次 listdir 结果不一致）。
+    """
+    ok = skipped = fail = 0
+    total = 0
+    if children is None:
+        try:
+            names = os.listdir(_long_path(path))
+        except OSError:
+            return 0, 0, 1, 0
+        children = [os.path.join(path, n) for n in names
+                    if not (exclude and _excluded_match(n, exclude, []))]
+    for child in children:
         if cancel and cancel():
             break
-        child = os.path.join(path, name)
-        success, size = _rm_entry(child)
-        if success:
+        kind, size = _rm_entry(child)
+        total += size                     # 部分删除的也算真实释放量
+        if kind == RM_OK:
             ok += 1
-            total += size
+        elif kind == RM_IN_USE:
+            skipped += 1
         else:
             fail += 1
-    return ok, fail, total
+    return ok, skipped, fail, total
 
 
-def _clean_target(tgt: Target, cancel=None, progress=None) -> tuple[int, int, int]:
-    """执行一个 Target 的删除。返回 (成功数, 失败数, 被删字节)。"""
-    ok = fail = volume = 0
+def _clean_target(tgt: Target, cancel=None, progress=None, notes=None,
+                  seen: set | None = None) -> tuple[int, int, int, int]:
+    """执行一个 Target 的删除。返回 (成功, 失败, 被删字节, 被占用跳过)。
+
+    notes：可选的"发生了什么"输出（被安全护栏拦下、目录列不出来等），
+    由调用方汇总给用户 —— 旧实现是静默 continue，用户只看到 0 B。
+    seen：跨 target 去重，同一路径不会二次删除/二次计失败。
+    """
+    ok = fail = volume = skipped = 0
     if tgt.mode == "contents":
-        for root_dir in _expand_root(tgt.root):
+        for root_dir, children in _contents_plan(tgt, cancel=cancel, notes=notes):
             if cancel and cancel():
                 break
+            if seen is not None:
+                k = os.path.normcase(os.path.abspath(root_dir))
+                if k in seen:
+                    continue
+                seen.add(k)
             if progress:
                 progress(root_dir)
-            if os.path.normpath(root_dir).lower() in _critical_roots():
-                continue                      # 安全护栏：绝不清空关键目录
-            o, f, v = _empty_dir_stats(root_dir, cancel=cancel)
+            o, s, f, v = _empty_dir_stats(root_dir, cancel=cancel,
+                                          children=children)
             ok += o
+            skipped += s
             fail += f
             volume += v
     else:
         for p in _resolve_entries(tgt):
             if cancel and cancel():
                 break
+            if seen is not None:
+                k = os.path.normcase(os.path.abspath(p))
+                if k in seen:
+                    continue
+                seen.add(k)
             if progress:
                 progress(os.path.basename(p.rstrip("\\/")) or p)
-            success, size = _rm_entry(p)
-            if success:
+            kind, size = _rm_entry(p)
+            volume += size
+            if kind == RM_OK:
                 ok += 1
-                volume += size
+            elif kind == RM_IN_USE:
+                skipped += 1
             else:
                 fail += 1
-    return ok, fail, volume
+    return ok, fail, volume, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -1543,6 +1962,7 @@ def _run_ps(command: str, timeout=120):
         return subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
             capture_output=True, timeout=timeout, creationflags=flags,
+            stdin=subprocess.DEVNULL,
         )
     except Exception:
         return None
@@ -1558,24 +1978,29 @@ def _recycle_bin_size() -> int:
     return total
 
 
-def _clear_recycle_bin() -> tuple[int, int, int]:
-    """清空所有磁盘回收站。返回 (成功数, 失败数, 被删体积)。"""
+def _clear_recycle_bin() -> tuple[int, int, int, int]:
+    """清空所有磁盘回收站。返回 (成功数, 失败数, 被删体积, 占用跳过数)。"""
     before = _recycle_bin_size()
     _run_ps("Clear-RecycleBin -Force -ErrorAction SilentlyContinue", timeout=120)
-    ok = fail = moved = 0
+    ok = fail = skipped = moved = 0
     for root in fixed_drives():
         rb = os.path.join(root, "$Recycle.Bin")
         if os.path.isdir(rb):
-            for name in os.listdir(rb):
+            try:
+                names = os.listdir(rb)
+            except OSError:
+                continue
+            for name in names:
                 sid = os.path.join(rb, name)
                 if os.path.isdir(sid):
-                    o, f, v = _empty_dir_stats(sid)
+                    o, s, f, v = _empty_dir_stats(sid)
                     ok += o
+                    skipped += s
                     fail += f
                     moved += v
     after = _recycle_bin_size()
     volume = moved if moved > 0 else max(0, before - after)
-    return ok, fail, volume
+    return ok, fail, volume, skipped
 
 
 def _dism_output_text(raw: bytes) -> str:
@@ -1693,7 +2118,42 @@ _DISM_CACHE = {"t": 0.0, "bytes": 0, "key": ""}
 _DISM_CACHE_TTL = 600.0
 
 
-def _dism_component_scan(force=False) -> int:
+def _run_proc(args, timeout, cancel=None):
+    """跑外部命令，**支持取消**。返回 (returncode, stdout, stderr)。
+
+    subprocess.run(timeout=) 只能等它自己超时；DISM 分析动辄一两分钟，
+    用户点"停止扫描"却毫无反应 —— 看起来就像卡死。这里改成 Popen + 轮询，
+    取消时直接 kill，按钮才有意义。timeout 到点同样 kill 并返回 None。
+    """
+    try:
+        p = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        try:
+            out, err = p.communicate(timeout=0.25)
+            return p.returncode, out or b"", err or b""
+        except subprocess.TimeoutExpired:
+            if (cancel and cancel()) or time.monotonic() > deadline:
+                try:
+                    p.kill()
+                    p.communicate(timeout=5)
+                except Exception:
+                    pass
+                return None
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return None
+
+
+def _dism_component_scan(force=False, cancel=None) -> int:
     """「被取代的WinSxS组件」：用 DISM /AnalyzeComponentStore 估算。
 
     注意：DISM 不会给出"可回收多少"的精确值，这里取的是组件存储
@@ -1711,15 +2171,13 @@ def _dism_component_scan(force=False) -> int:
                         "System32", "Dism.exe")
     if not os.path.isfile(dism):
         return 0
-    try:
-        r = subprocess.run(
-            [dism, "/Online", "/Cleanup-Image", "/AnalyzeComponentStore"],
-            capture_output=True, timeout=420,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
-        )
-    except Exception:
+    # 120 秒上限：实测正常机器 10~60 秒；真卡住（更新服务互锁、组件存储
+    # 损坏）时不能再让整轮扫描陪它等 7 分钟，而且现在可以被"停止扫描"打断。
+    r = _run_proc([dism, "/Online", "/Cleanup-Image",
+                   "/AnalyzeComponentStore"], 120, cancel=cancel)
+    if r is None:
         return 0
-    val = _parse_dism_size(_dism_output_text(r.stdout or b""))
+    val = _parse_dism_size(_dism_output_text(r[1] or b""))
     if val > 0:
         _DISM_CACHE.update({"t": now, "bytes": val})
     return val
@@ -1800,7 +2258,7 @@ def _dism_component_clean_impl(res: CleanResult, cancel=None, progress=None):
         try:
             return subprocess.run(
                 [dism] + args, capture_output=True, timeout=timeout,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
+                creationflags=_CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
             ), None
         except subprocess.TimeoutExpired:
             return None, "timeout"
@@ -1877,27 +2335,35 @@ def _stop_service(names, start=False):
             subprocess.run(
                 ["net", "start" if start else "stop", n, "/y"],
                 capture_output=True, timeout=90,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
+                creationflags=_CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
             )
         except Exception:
             pass
 
 
-def _clean_wu_records(res: CleanResult, cancel=None, progress=None):
-    """「Windows更新安装记录」：停 wuauserv/bits → 清 DataStore → 再启动。"""
+def _clean_wu_dir(res: CleanResult, subdir: str, cancel=None, progress=None):
+    """停 wuauserv/bits → 清 SoftwareDistribution\\<subdir> → 起服务。
+
+    Download 与 DataStore 都被更新服务持有：不停服务直接删，会整片
+    记成"被占用"（历史上那串"47 项被占用或权限不足"里，这里占大头）。
+    """
     if progress:
         progress("停止 Windows 更新服务")
     _stop_service(["wuauserv", "bits"])
     try:
-        ok = fail = volume = 0
-        for root_dir in _expand_root(r"%SystemRoot%\SoftwareDistribution\DataStore"):
-            o, f, v = _empty_dir_stats(root_dir, cancel=cancel)
+        ok = fail = skipped = volume = 0
+        root = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                            "SoftwareDistribution", subdir)
+        for root_dir in _expand_root(root):
+            o, s, f, v = _empty_dir_stats(root_dir, cancel=cancel)
             ok += o
+            skipped += s
             fail += f
             volume += v
         res.removed_count = ok
         res.removed_bytes = volume
         res.failed = fail
+        res.skipped += skipped
     finally:
         if progress:
             progress("恢复 Windows 更新服务")
@@ -1906,21 +2372,33 @@ def _clean_wu_records(res: CleanResult, cancel=None, progress=None):
         res.messages.append(f"{res.failed} 项未能删除")
 
 
+def _clean_wu_records(res: CleanResult, cancel=None, progress=None):
+    """「Windows更新安装记录」：停服务后清 DataStore。"""
+    _clean_wu_dir(res, "DataStore", cancel=cancel, progress=progress)
+
+
+def _clean_wu_download(res: CleanResult, cancel=None, progress=None):
+    """「Windows下载缓存」：停服务后清 Download。"""
+    _clean_wu_dir(res, "Download", cancel=cancel, progress=progress)
+
+
 def _clean_do_cache(res: CleanResult, cancel=None, progress=None):
     """「传递优化缓存」：优先系统 API，失败回退直接删目录。"""
     if progress:
         progress("调用系统传递优化清理")
     _run_ps("Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue",
             timeout=180)
-    ok = fail = volume = 0
+    ok = fail = skipped = volume = 0
     for tgt in DO_CACHE_TARGETS:
-        o, f, v = _clean_target(tgt, cancel=cancel, progress=progress)
+        o, f, v, s = _clean_target(tgt, cancel=cancel, progress=progress)
         ok += o
         fail += f
         volume += v
+        skipped += s
     res.removed_count = ok
     res.removed_bytes = volume
     res.failed = fail
+    res.skipped += skipped
 
 
 # 传递优化缓存的目录（clean 复用；scan 走规则 targets，两处保持一致）
@@ -1933,24 +2411,64 @@ DO_CACHE_TARGETS = [
 
 
 def _clean_win_events(res: CleanResult, cancel=None, progress=None):
-    """「Windows事件」：wevtutil cl 清全部事件日志 + 清 winevt\\Logs 内容。"""
+    """「Windows事件」：wevtutil cl 清全部事件日志 + 清 winevt\\Logs 内容。
+
+    evtx 文件被 EventLog 服务持有，删文件必然失败 —— 那属于"服务占用"，
+    不是"清理失败"，计入 skipped 而不是 failed；实际释放量用前后体积差兜底，
+    因为 wevtutil cl 是把文件内容清空（文件还在，体积已归零）。
+    """
     if progress:
         progress("清空事件日志（wevtutil）")
+    roots = _expand_root(r"%SystemRoot%\System32\winevt\Logs")
+    before = sum(measure(d) for d in roots)
     r = _run_ps(
         "wevtutil el | ForEach-Object { wevtutil cl $_ 2>$null }",
         timeout=300,
     )
-    ok = fail = volume = 0
-    for root_dir in _expand_root(r"%SystemRoot%\System32\winevt\Logs"):
-        o, f, v = _empty_dir_stats(root_dir, cancel=cancel)
+    ok = skipped = fail = volume = 0
+    for root_dir in roots:
+        o, s, f, v = _empty_dir_stats(root_dir, cancel=cancel)
         ok += o
+        skipped += s
         fail += f
         volume += v
+    after = sum(measure(d) for d in roots)
     res.removed_count = ok
-    res.removed_bytes = volume
-    res.failed = fail
+    res.removed_bytes = max(volume, max(0, before - after))
+    res.skipped += skipped
+    if skipped:
+        res.messages.append(
+            "%d 个日志文件仍被服务占用（内容已由 wevtutil 清空）" % skipped)
     if r is None or (hasattr(r, "returncode") and r.returncode != 0):
-        res.messages.append("部分事件日志被服务占用，未能清空")
+        res.messages.append("部分事件日志无法清空，可能需要重启后生效")
+
+
+_SHADOW_BYTES_RE = re.compile(r"(\d[\d.,]*)\s*(字节|bytes)", re.IGNORECASE)
+# vssadmin 每个卷给三行：已用空间 / 分配的空间 / 最大空间。
+# 只认「已用空间」那一行 —— 旧实现把三行括号里的字节数全加起来，
+# 估算值约为真实值的 3 倍（"已清理"数字虚高）。
+_SHADOW_USED_RE = re.compile(
+    r"^\s*(?:已用空间|已用存储空间|已用卷影副本存储空间|Used(?:\s+Space)?)"
+    r"\s*[:：]", re.IGNORECASE)
+
+
+def _parse_shadowstorage_used(text: str) -> int:
+    """从 `vssadmin list shadowstorage` 输出里取所有卷的**已用空间**合计。"""
+    total = 0
+    for line in text.splitlines():
+        if not _SHADOW_USED_RE.match(line):
+            continue
+        if re.search(r"分配|Allocated|最大|Maximum", line, re.IGNORECASE):
+            continue
+        m = _SHADOW_BYTES_RE.search(line)
+        if not m:
+            continue
+        raw = m.group(1).replace(",", "").replace(".", "")
+        try:
+            total += int(raw)
+        except ValueError:
+            continue
+    return total
 
 
 def _sr_points_scan() -> int:
@@ -1961,36 +2479,42 @@ def _sr_points_scan() -> int:
         r = subprocess.run(
             ["vssadmin", "list", "shadowstorage"],
             capture_output=True, timeout=120,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
+            creationflags=_CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
         )
-        text = (r.stdout or b"").decode("gbk", "ignore")
     except Exception:
         return 0
-    total = 0
-    # 形如「已用空间: 1.23 GB (1,320,124,416 字节)」/「Used: 1.23 GB (1320124416 bytes)」
-    for m in re.finditer(r"(\d[\d,\.]*)\s*字节|(\d[\d,\.]*)\s*bytes", text, re.IGNORECASE):
-        raw = (m.group(1) or m.group(2)).replace(",", "")
-        try:
-            total += int(float(raw))
-        except ValueError:
-            continue
-    return total
+    return _parse_shadowstorage_used(_dism_output_text(r.stdout or b""))
 
 
 def _clean_sr_points(res: CleanResult, cancel=None, progress=None):
-    """删全部卷影副本，再尝试建一个新还原点（对应 NCSRPointOnlineCleanup）。"""
+    """删全部卷影副本，再尝试建一个新还原点（对应 NCSRPointOnlineCleanup）。
+
+    释放量用「删前 vssadmin 已用空间 − 删后已用空间」实测，不再把扫描值
+    直接当成果（那样数字会虚高，且与磁盘真实变化无关）。
+    """
     if progress:
         progress("删除全部还原点")
+    before = _sr_points_scan()
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["vssadmin", "delete", "shadows", "/all", "/quiet"],
             capture_output=True, timeout=600,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW),
+            creationflags=_CREATE_NO_WINDOW, stdin=subprocess.DEVNULL,
         )
+        after = _sr_points_scan()
         res.verified = False
-        res.freed = res.estimated
-        res.removed_bytes = res.estimated
-        res.messages.append("已删除全部还原点，释放量按扫描值估算")
+        if r is not None and r.returncode != 0:
+            res.failed = 1
+            res.messages.append(
+                "vssadmin 未能删除全部还原点（返回码 %s）" % r.returncode)
+        freed = max(0, before - after)
+        res.removed_bytes = freed
+        if freed > 0:
+            res.removed_count = 1
+            res.messages.append("已删除全部还原点，实测释放 %s"
+                                % human_bytes(freed))
+        else:
+            res.messages.append("没有可释放的还原点（或系统还原未启用）")
     except Exception as exc:
         res.failed = 1
         res.messages.append(f"删除还原点失败：{exc}")
@@ -2012,6 +2536,7 @@ _SPECIAL_CLEAN = {
     "recycle": None,           # 走专门分支（体积统计口径不同）
     "dism_component": _dism_component_clean,
     "wu_records": _clean_wu_records,
+    "wu_download": _clean_wu_download,
     "do_cache": _clean_do_cache,
     "win_events": _clean_win_events,
     "sr_points": _clean_sr_points,
@@ -2040,10 +2565,11 @@ def clean_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
         return res
 
     if rule.special == "recycle":
-        ok, fail, volume = _clear_recycle_bin()
+        ok, fail, volume, skipped = _clear_recycle_bin()
         res.removed_count = ok
         res.removed_bytes = volume
         res.failed = fail
+        res.skipped = skipped
         res.messages.append(f"清空 {ok} 项，失败 {fail} 项")
     elif rule.special in _SPECIAL_CLEAN and _SPECIAL_CLEAN[rule.special]:
         try:
@@ -2052,17 +2578,22 @@ def clean_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
             res.failed += 1
             res.messages.append(f"异常：{exc}")
     else:
-        count, fail, volume = _clean_targets(rule, cancel, progress)
+        notes: list[str] = []
+        count, fail, volume, skipped = _clean_targets(rule, cancel, progress,
+                                                      notes)
 
-        # 缩略图/图标缓存可能被 explorer.exe 持有：只有确实删不掉时才重启
+        # 缩略图/图标缓存可能被 explorer.exe 持有：只有**确实删不掉**时才重启。
+        # 注意判据是 fail>0（真失败），不是 skipped>0 —— 被占用重试两次仍然
+        # 删不掉才值得重启一次资源管理器。
         if fail > 0 and rule.key in _NEEDS_EXPLORER_RESTART:
             if progress:
                 progress("重启资源管理器")
             if restart_explorer():
                 res.messages.append("已重启资源管理器释放占用后重试")
-                c2, f2, v2 = _clean_targets(rule, cancel, progress)
+                c2, f2, v2, s2 = _clean_targets(rule, cancel, progress, notes)
                 count += c2
                 volume += v2
+                skipped += s2
                 fail = f2
             else:
                 res.messages.append("资源管理器未能重启，部分文件仍被占用")
@@ -2070,8 +2601,16 @@ def clean_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
         res.removed_count = count
         res.removed_bytes = volume
         res.failed = fail
+        res.skipped = skipped
+        # 把「安全护栏拦下 / 目录列不出来 / 无法确定当前版本」这类情况如实
+        # 告诉用户 —— 旧实现静默 continue，界面只会显示「0 B / 无可清理」。
+        for note in dict.fromkeys(notes):
+            res.messages.append(note)
+        if skipped:
+            res.messages.append(
+                f"{skipped} 项正被程序使用，已跳过（关闭相关程序后可再清）")
         if fail:
-            res.messages.append(f"{fail} 项被占用或权限不足，未能删除")
+            res.messages.append(f"{fail} 项权限不足或无法删除")
 
     after = drive_space(drive)["free_bytes"]
     res.disk_delta = after - before
@@ -2079,18 +2618,26 @@ def clean_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
     # 结论口径：以「真实被删对象体积」为准；特殊条目（DISM/还原点）无法逐项
     # 计数，改用「磁盘可用空间真实变化」回填——这比估计值诚实。
     res.freed = res.removed_bytes
-    if res.removed_bytes == 0 and res.disk_delta > 0:
+    if res.removed_bytes == 0 and res.disk_delta > 0 and (
+            rule.special in _SPECIALS
+            or (res.skipped == 0 and res.failed == 0)):
+        # 只有在"没有任何已知失败"时才敢把磁盘读数当成果：否则别的进程
+        # 写盘/删文件带来的噪声会被算成本次清理释放（实测某些场景下
+        # 只删了 1 KB 却报 4 KB —— 那是簇对齐的读数差，不是我们释放的）。
         res.freed = res.disk_delta
         res.verified = True
     if res.freed == 0 and res.estimated > 0 and res.removed_count == 0:
         # 真的一字节都没释放：如实说明，而不是把估计值当成果。
-        hit = any(re.search(r"失败|占用|无法|未完成|异常|超时", m)
+        hit = any(re.search(r"失败|占用|使用|无法|未完成|异常|超时", m)
                   for m in res.messages)
         if rule.special not in _SPECIALS and res.verified:
-            # 普通目录条目：扫描说有、却删不动 → 多半被占用/权限不足
+            # 普通目录条目：扫描说有、却删不动
             res.verified = False
             if not hit:
-                res.messages.append("未能删除任何对象（可能被占用或权限不足）")
+                if res.skipped:
+                    res.messages.append("对象正被程序使用，暂时无法删除")
+                else:
+                    res.messages.append("未能删除任何对象（可能被占用或权限不足）")
         else:
             # 特殊条目（DISM 等）：命令成功但磁盘没变化
             if not hit:
@@ -2110,17 +2657,20 @@ def clean_rule(rule: CleanRule, cancel: Callable[[], bool] | None = None,
     return res
 
 
-def _clean_targets(rule: CleanRule, cancel=None, progress=None):
-    """删除一条规则的所有 Target，返回 (成功数, 失败数, 被删字节)。"""
-    count = fail = volume = 0
+def _clean_targets(rule: CleanRule, cancel=None, progress=None, notes=None):
+    """删除一条规则的所有 Target，返回 (成功, 失败, 被删字节, 占用跳过)。"""
+    count = fail = volume = skipped = 0
+    seen: set = set()
     for tgt in rule.targets:
         if cancel and cancel():
             break
-        ok, f, v = _clean_target(tgt, cancel=cancel, progress=progress)
+        ok, f, v, s = _clean_target(tgt, cancel=cancel, progress=progress,
+                                    notes=notes, seen=seen)
         count += ok
         fail += f
         volume += v
-    return count, fail, volume
+        skipped += s
+    return count, fail, volume, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -2140,8 +2690,9 @@ class CleanerScanner:
          等 DISM 分析完。
     """
 
-    #: 并行度。取 4~6：SSD 上收益明显，机械盘上也不会把磁头抖成随机读。
-    WORKERS = 6
+    #: 并行度。4~8：SSD 上收益明显，机械盘上也不会把磁头抖成随机读。
+    #: 扫描是纯只读 + I/O 密集，超过核数意义不大，故按核数取档。
+    WORKERS = min(8, max(4, os.cpu_count() or 4))
 
     def __init__(self):
         self._thread = None
@@ -2153,10 +2704,35 @@ class CleanerScanner:
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
-    def start(self, rules, on_progress, on_done, on_fast_done=None):
+    def start(self, rules, on_progress, on_done, on_fast_done=None,
+              on_note=None):
+        """启动扫描。
+
+        on_note(rule, text)：逐条目进度（可选）。界面用它显示"正在扫描
+        C:\\Windows\\Temp"，长目录就不会看起来像卡死。
+        """
         if self.running:
             return False
         self._cancel.clear()
+
+        def _note(rule):
+            """把逐条目回调**限流**到约 6 次/秒。
+
+            一条规则可能匹配上万个条目，逐个发 Qt 信号会把事件队列灌爆
+            （界面反而卡）。这里在发射侧就掐掉，UI 只负责显示。
+            """
+            if on_note is None:
+                return None
+            state = {"t": 0.0}
+
+            def emit(text):
+                now = time.monotonic()
+                if now - state["t"] < 0.15:
+                    return
+                state["t"] = now
+                on_note(rule, text)
+
+            return emit
 
         def _run():
             total = 0
@@ -2168,7 +2744,8 @@ class CleanerScanner:
                     workers = max(1, min(self.WORKERS, len(fast)))
                     with ThreadPoolExecutor(max_workers=workers,
                                             thread_name_prefix="YuhubScan") as pool:
-                        futs = [pool.submit(scan_rule, r, self._cancel.is_set)
+                        futs = [pool.submit(scan_rule, r, self._cancel.is_set,
+                                            _note(r))
                                 for r in fast]
                         for fut, r in zip(futs, fast):
                             try:
@@ -2189,7 +2766,7 @@ class CleanerScanner:
                     if self._cancel.is_set():
                         break
                     try:
-                        scan_rule(r, cancel=self._cancel.is_set)
+                        scan_rule(r, cancel=self._cancel.is_set, note=_note(r))
                     except Exception:
                         pass
                     total += r.size

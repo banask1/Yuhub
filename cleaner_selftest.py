@@ -4,11 +4,16 @@
 返回码：0=全部通过，1=存在失败项。
 
 检查项：
-  A. 规则表完整性 —— 规则条数、key 唯一性、字段齐全、level 合法；
+  A. 规则表完整性 —— 规则条数、key 唯一性、字段齐全、level 合法，
+     entries 目标必须有 query；
   B. 路径表达式求值 —— %var% / ?GetRegSz / ?GetFileVersion / ?GetIniData；
+  B2. DISM 体积解析（中英文、逗号小数、可回收包数为 0）；
+  B3. 还原点解析 —— 只统计「已用空间」，不能把已用/分配/最大三行相加；
   C. 目标展开安全护栏 —— contents 模式绝不允许指向关键系统目录；
   D. 沙箱匹配/删除 —— 在临时目录里构造真实结构，验证 entries/contents
      两种模式与 Excluded（含动态版本排除）行为正确、体积统计准确；
+  D2. query 语义 —— 多段路径逐级下钻、多个 query 并联、contents 遵守
+     excluded、重叠 root 只统计一次（四类都是历史上真实踩过的静默失效）；
   E. 真机只读扫描 —— 抽取 3 条规则走 scan_rule，确认只统计不删除。
 """
 
@@ -17,6 +22,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 import cleaner as cl
 
@@ -43,6 +49,17 @@ def run(out_path):
         check("Dism++ 关键条目在列", not missing, f"缺失: {missing}")
         no_group = [r.key for r in rules if r.group not in cl.GROUP_ORDER]
         check("分组常量齐全", not no_group, f"未分组: {no_group}")
+        # entries 目标必须带 query（没有 query 就永远匹配不到任何东西）
+        no_q = [r.key for r in rules if any(
+            t.mode == "entries" and not t.query for t in r.targets)]
+        check("entries 目标都有 query", not no_q, f"缺失: {no_q}")
+        # 缩略图缓存必须指向真实文件名（旧规则写成 Explorer\* + IconCache.db
+        # 的链式路径，整条规则从未命中过）
+        th = next(r for r in rules if r.key == "thumbnail_cache")
+        pats = [q for t in th.targets for q in t.query]
+        check("★ 缩略图缓存指向真实缓存文件名",
+              any("iconcache_" in p for p in pats)
+              and any("thumbcache_" in p for p in pats), pats)
     except Exception as exc:
         check("规则表构建", False, f"异常: {exc}")
         rules = []
@@ -148,6 +165,29 @@ def run(out_path):
     except Exception as exc:
         check("DISM 体积解析", False, f"异常: {exc}")
 
+    # ---------- B3. 还原点：只统计「已用空间」 ----------
+    # 旧实现把 vssadmin 每个卷的三行（已用 / 分配 / 最大）括号里的字节数
+    # 全部相加，估算约为真实值的 3 倍，「已清理」数字虚高。
+    try:
+        zh_vss = (
+            "已用卷影副本存储关联: C: (\\\\?\\Volume{1}\\)\n"
+            "   卷影副本存储卷: (卷 \\\\?\\Volume{2}\\)\n"
+            "   已用空间:           1.23 GB (1,320,124,416 字节)\n"
+            "   分配的空间:         10.0 GB (10,737,418,240 字节)\n"
+            "   最大空间:           20.0 GB (21,474,836,480 字节)\n"
+        )
+        v = cl._parse_shadowstorage_used(zh_vss)
+        check("★ 还原点只统计已用空间（非三行相加）", v == 1320124416, v)
+        en_vss = ("Used: 2.00 GB (2,147,483,648 bytes)\n"
+                  "Allocated: 8.00 GB (8,589,934,592 bytes)\n"
+                  "Maximum: 20.0 GB (21,474,836,480 bytes)\n")
+        check("还原点解析-英文只取 Used",
+              cl._parse_shadowstorage_used(en_vss) == 2147483648,
+              cl._parse_shadowstorage_used(en_vss))
+        check("还原点解析-空输入返回 0", cl._parse_shadowstorage_used("") == 0)
+    except Exception as exc:
+        check("还原点解析", False, f"异常: {exc}")
+
     # ---------- C. 安全护栏 ----------
     try:
         crit = cl._critical_roots()
@@ -157,7 +197,7 @@ def run(out_path):
               and os.path.normpath(os.path.join(win, "System32")).lower() in crit)
         # 构造一个恶意/错误的 contents 目标（指向 Windows 本身）→ 清理必须被拒
         evil = cl.Target(root=win, mode="contents")
-        ok, fail, vol = cl._clean_target(evil)
+        ok, fail, vol, _sk = cl._clean_target(evil)
         check("contents 指向 Windows 被拒", ok == 0 and vol == 0,
               f"ok={ok} vol={vol}")
         check("护栏后 Windows 仍在", os.path.isdir(win))
@@ -208,11 +248,11 @@ def run(out_path):
         check("排除项求值失败整根跳过",
               cl._resolve_entries(bad_tgt) == [], "应返回空")
 
-        total, n = cl._scan_target(tgt)
+        total, n, _to = cl._scan_target(tgt)
         check("扫描体积正确", total == 4096 + 2048 and n == 2,
               f"total={total} n={n}")
 
-        ok, fail, vol = cl._clean_target(tgt)
+        ok, fail, vol, _sk = cl._clean_target(tgt)
         check("entries 清理正确", ok == 2 and fail == 0 and vol == 4096 + 2048,
               f"ok={ok} vol={vol}")
         check("当前版本保留", os.path.isdir(cur) and os.path.isfile(fake_exe))
@@ -223,7 +263,7 @@ def run(out_path):
         os.makedirs(os.path.join(holder, "junk"))
         with open(os.path.join(holder, "junk", "a.bin"), "wb") as f:
             f.write(b"Z" * 512)
-        ok2, fail2, vol2 = cl._clean_target(cl.Target(root=holder, mode="contents"))
+        ok2, fail2, vol2, _sk2 = cl._clean_target(cl.Target(root=holder, mode="contents"))
         check("contents 清空内容", ok2 == 1 and vol2 == 512
               and os.path.isdir(holder) and not os.path.exists(
                   os.path.join(holder, "junk")),
@@ -236,12 +276,221 @@ def run(out_path):
             f.write(b"C" * 128)
         wt = cl.Target(root=os.path.join(sandbox, "Users", "*", "Cache"),
                        mode="contents")
-        ok3, _, vol3 = cl._clean_target(wt)
+        ok3, _, vol3, _s3 = cl._clean_target(wt)
         check("通配 root 展开", ok3 == 1 and vol3 == 128, f"ok={ok3} vol={vol3}")
     except Exception as exc:
         check("沙箱验证", False, f"异常: {exc}")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
+
+    # ---------- D2. query 语义：并联 + 多段 / contents 遵守 excluded ----------
+    # 2026-10-19 修复的三处「静默失效」，这里必须各有一条**真调用**的断言：
+    #   ① 多段相对路径（Local\Microsoft\Windows\*.log）以前拿整串与单个文件
+    #      名比较，永不命中；
+    #   ② 多个 query 被当成逐级串联（AMD\Intel\NVIDIA），并联语义才是对的；
+    #   ③ contents 模式整段忽略 excluded —— ClickToRun 会连 MachineData /
+    #      UserData 一起清掉，后果是 Office 无法修复/卸载。
+    sandbox3 = tempfile.mkdtemp(prefix="yuhub_cln_sem_")
+    try:
+        deep = os.path.join(sandbox3, "Users", "u1", "AppData", "Local",
+                            "Microsoft", "Windows")
+        os.makedirs(deep)
+        for n in ("a.log", "b.log", "keep.txt"):
+            with open(os.path.join(deep, n), "wb") as f:
+                f.write(b"L" * 10)
+        t_deep = cl.Target(root=os.path.join(sandbox3, "Users", "u1", "AppData"),
+                           query=(r"Local\Microsoft\Windows\*.log",),
+                           file_only=True, mode="entries")
+        hits = sorted(os.path.basename(p) for p in cl._iter_matches(
+            t_deep.root, t_deep, []))
+        check("★ 多段 query 能逐级下钻（命中 2 个 *.log，不误伤 txt）",
+              hits == ["a.log", "b.log"], hits)
+        ok, fail, vol, _sk = cl._clean_target(t_deep)
+        left = sorted(os.listdir(deep))
+        check("多段 query 真能删掉（保留 keep.txt）",
+              ok == 2 and vol == 20 and left == ["keep.txt"],
+              f"ok={ok} vol={vol} left={left}")
+
+        drv = os.path.join(sandbox3, "Drv")
+        for n in ("AMD", "Intel", "NVIDIA", "Other"):
+            os.makedirs(os.path.join(drv, n))
+        t_or = cl.Target(root=drv, query=("AMD", "Intel", "NVIDIA"),
+                         mode="entries")
+        names = sorted(os.path.basename(p) for p in cl._iter_matches(
+            drv, t_or, []))
+        check("★ 多个 query 是并联（AMD/Intel/NVIDIA 全中，Other 不中）",
+              names == ["AMD", "Intel", "NVIDIA"], names)
+        ok, fail, _, _sk = cl._clean_target(t_or)
+        left = sorted(os.listdir(drv))
+        check("并联模式真能带走全部三项", ok == 3 and left == ["Other"],
+              f"ok={ok} left={left}")
+
+        c2r = os.path.join(sandbox3, "ClickToRun")
+        for n in ("MachineData", "UserData", "PackageFiles"):
+            os.makedirs(os.path.join(c2r, n))
+            with open(os.path.join(c2r, n, "x.bin"), "wb") as f:
+                f.write(b"Q" * 256)
+        t_ex = cl.Target(root=c2r, excluded=("MachineData", "UserData"),
+                         mode="contents")
+        plan = {r: [os.path.basename(x) for x in ch]
+                for r, ch in cl._contents_plan(t_ex)}
+        check("★ contents 模式尊重 excluded（计划里只剩 PackageFiles）",
+              plan.get(c2r) == ["PackageFiles"], plan)
+        ok, fail, vol, _sk = cl._clean_target(t_ex)
+        left = sorted(os.listdir(c2r))
+        check("★ contents 清理后 MachineData/UserData 仍在",
+              ok == 1 and vol == 256 and left == ["MachineData", "UserData"],
+              f"ok={ok} vol={vol} left={left}")
+
+        # ⑤ 重叠 root 不能重复统计：%Temp% 与 Users\*\AppData\Local\Temp
+        #    在"当前用户"身上就是同一个目录，不去重会把同一份文件算两遍。
+        ov = os.path.join(sandbox3, "ov", "Temp")
+        os.makedirs(ov)
+        with open(os.path.join(ov, "t.tmp"), "wb") as f:
+            f.write(b"O" * 1000)
+        rule_ov = cl.CleanRule(
+            key="ov", name="ov", desc="x", group=cl.GROUP_TEMP, level=3,
+            targets=[cl.Target(root=ov), cl.Target(root=ov)])
+        n_ov = cl.scan_rule(rule_ov)
+        check("★ 重叠 root 只统计一次", n_ov == 1000, n_ov)
+        res_ov = cl.clean_rule(rule_ov)
+        check("★ 重叠 root 清理量与扫描一致",
+              res_ov.freed == 1000 and res_ov.removed_count == 1,
+              f"freed={res_ov.freed} count={res_ov.removed_count}")
+
+        # ⑥ 被占用的文件必须归入 RM_IN_USE（"跳过"），不能报成"权限不足"。
+        #    这是用户看到的"N 项被占用或者权限不足"假警报的根源：Windows 上
+        #    Python 打开文件不带 FILE_SHARE_DELETE，删除会拿到 WinError 32。
+        lk = os.path.join(sandbox3, "locky")
+        os.makedirs(os.path.join(lk, "sub"))
+        with open(os.path.join(lk, "sub", "free.txt"), "w") as f:
+            f.write("F" * 32)
+        busy = os.path.join(lk, "sub", "busy.txt")
+        with open(busy, "w") as f:
+            f.write("B" * 32)
+        holder = open(busy, "r")
+        try:
+            kind = cl._rm_path_kind(lk)
+            sub_left = (sorted(os.listdir(os.path.join(lk, "sub")))
+                        if os.path.isdir(os.path.join(lk, "sub")) else [])
+            check("★ 被占用归入 RM_IN_USE（不是权限不足）",
+                  kind == cl.RM_IN_USE, f"kind={kind}")
+            check("★ 同目录未占用的文件照样删掉（能清多少清多少）",
+                  "free.txt" not in sub_left, sub_left)
+
+            # clean_rule 的计数口径要用**另一棵**树：上面那棵的 free.txt
+            # 已经被删掉了，再清一次释放量当然是 0（会自欺欺人地测不出东西）。
+            lk2 = os.path.join(sandbox3, "locky2")
+            os.makedirs(os.path.join(lk2, "sub"))
+            with open(os.path.join(lk2, "sub", "free.txt"), "w") as f:
+                f.write("F" * 32)
+            busy2 = os.path.join(lk2, "sub", "busy.txt")
+            with open(busy2, "w") as f:
+                f.write("B" * 32)
+            holder2 = open(busy2, "r")
+            try:
+                locked_rule = cl.CleanRule(
+                    key="lk", name="lk", desc="x", group=cl.GROUP_TEMP, level=3,
+                    targets=[cl.Target(root=lk2)])
+                r_lk = cl.clean_rule(locked_rule)
+                check("★ 清理结果把占用计入 skipped 而非 failed",
+                      r_lk.skipped >= 1 and r_lk.failed == 0,
+                      f"skipped={r_lk.skipped} failed={r_lk.failed}")
+                check("★ 部分删除时释放量取实测差值（不拿磁盘读数充数）",
+                      r_lk.freed == 32, f"freed={r_lk.freed}")
+            finally:
+                holder2.close()
+            check("★ 释放占用后可以删干净",
+                  cl._rm_path_kind(lk2) == cl.RM_OK
+                  and not os.path.exists(lk2))
+        finally:
+            holder.close()
+        check("★ 释放占用后可以删干净",
+              cl._rm_path_kind(lk) == cl.RM_OK and not os.path.exists(lk))
+
+        notes = []
+        bad = cl.Target(root=os.environ.get("SystemRoot", r"C:\Windows"),
+                        mode="contents")
+        ok_b, fail_b, vol_b, _skb = cl._clean_target(bad, notes=notes)
+        check("★ 关键目录被护栏拦下并给出说明（不再静默）",
+              ok_b == 0 and vol_b == 0 and any("护栏" in n for n in notes),
+              f"ok={ok_b} notes={notes}")
+        check("护栏后 Windows 目录仍在", os.path.isdir(
+            os.environ.get("SystemRoot", r"C:\Windows")))
+    except Exception as exc:
+        check("query 语义", False, f"异常: {exc}")
+    finally:
+        shutil.rmtree(sandbox3, ignore_errors=True)
+
+    # ---------- E2. 扫描不能"卡死"：预算截断 + 可取消 + 逐条目进度 ----------
+    # 用户实测"扫描有出现卡死"：一条规则碰到畸形/超大目录时，以前没有任何
+    # 上限，整轮扫描（以及界面的完成回调）就永远等在那里。现在有三道保险：
+    # 规则级预算（超时标 partial 并继续）、measure 每 256 项查一次取消、
+    # 逐条目进度回调（界面显示"正在扫描 XXX"，长目录不再像死机）。
+    sandbox4 = tempfile.mkdtemp(prefix="yuhub_cln_budget_")
+    try:
+        import threading as _th2
+        big = os.path.join(sandbox4, "big")
+        for i in range(40):
+            sub = os.path.join(big, "d%02d" % i)
+            os.makedirs(sub)
+            for j in range(50):
+                with open(os.path.join(sub, "f%d.bin" % j), "wb") as f:
+                    f.write(b"x" * 8)
+
+        budget_rule = cl.CleanRule(key="bg", name="bg", desc="x",
+                                   group=cl.GROUP_TEMP, level=3,
+                                   targets=[cl.Target(root=big)])
+        t0 = time.monotonic()
+        cl.scan_rule(budget_rule, budget=0.0)
+        cost = time.monotonic() - t0
+        check("★ 预算用尽立刻收尾并标记 partial（不卡死）",
+              budget_rule.partial and cost < 5.0,
+              f"partial={budget_rule.partial} cost={cost:.2f}s")
+
+        cancel_rule = cl.CleanRule(key="cx", name="cx", desc="x",
+                                   group=cl.GROUP_TEMP, level=3,
+                                   targets=[cl.Target(root=big)])
+        t0 = time.monotonic()
+        sz = cl.scan_rule(cancel_rule, cancel=lambda: True)
+        cost = time.monotonic() - t0
+        check("★ 取消后立刻返回", sz == 0 and cost < 1.0, f"cost={cost:.2f}s")
+
+        notes = []
+        cl.scan_rule(budget_rule, budget=60, note=notes.append)
+        check("★ 逐条目进度回调生效（带可读路径）",
+              len(notes) >= 1 and os.path.isdir(notes[0]), notes[:2])
+
+        full = cl.CleanRule(key="fg", name="fg", desc="x",
+                            group=cl.GROUP_TEMP, level=3,
+                            targets=[cl.Target(root=big)])
+        total = cl.scan_rule(full, budget=None)
+        check("完整扫描体积准确且未截断",
+              total == 40 * 50 * 8 and not full.partial,
+              f"total={total} partial={full.partial}")
+
+        got = []
+        done_evt = _th2.Event()
+        sc = cl.CleanerScanner()
+        sc.start([full], on_progress=lambda r: None,
+                 on_done=lambda t, rs: done_evt.set(),
+                 on_note=lambda r, txt: got.append(txt))
+        done_evt.wait(15)
+        check("★ 扫描器转发逐条目进度（界面『正在扫描 XXX』）",
+              len(got) >= 1, got[:2])
+
+        # 外部命令（DISM 分析）必须能被"停止扫描"打断：
+        # 以前 subprocess.run(timeout=) 只能干等，按钮点了没反应。
+        t0 = time.monotonic()
+        rc = cl._run_proc([sys.executable, "-c", "import time; time.sleep(5)"],
+                          30, cancel=lambda: True)
+        cost = time.monotonic() - t0
+        check("★ 外部命令可被取消（kill 后立即返回）",
+              rc is None and cost < 3.0, f"cost={cost:.2f}s")
+    except Exception as exc:
+        check("扫描预算/取消", False, f"异常: {exc}")
+    finally:
+        shutil.rmtree(sandbox4, ignore_errors=True)
 
     # ---------- E. 真机只读扫描（不删任何东西） ----------
     try:
@@ -340,7 +589,7 @@ def run(out_path):
         roots = cl._expand_root(wt.root)
         check("多用户/中文/空格用户名展开", len(roots) == 2,
               f"roots={roots}")
-        ok4, _, vol4 = cl._clean_target(wt)
+        ok4, _, vol4, _s4 = cl._clean_target(wt)
         check("多用户内容清理", ok4 == 2 and vol4 == 128,
               f"ok={ok4} vol={vol4}")
     except Exception as exc:

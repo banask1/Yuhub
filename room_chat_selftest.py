@@ -264,6 +264,10 @@ def run(out_file, timeout_sec=90):
                 dest = os.path.join(work, "down", "整合包.zip")
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 lan_b._ask_save_path = lambda name: dest   # 免掉模态框
+                # 先挂一个探针，记录联机页到底发出了哪些进度事件
+                dl_states = []
+                lan_b.chat_download.connect(
+                    lambda pl: dl_states.append(dict(pl or {})))
                 lan_b.download_chat_file(dict(frec_ui))
                 _pump(app, 3.0)
                 same = (os.path.exists(dest)
@@ -272,6 +276,26 @@ def run(out_file, timeout_sec=90):
                 chk("★ 从聊天室下载的文件与源逐字节一致", same,
                     (os.path.exists(dest),
                      os.path.getsize(dest) if os.path.exists(dest) else -1))
+                # ---- 聊天区下载进度（2026-10-19 用户报的 bug）----
+                # 以前进度只发到云盘列表的 _share_widgets，聊天区的文件气泡
+                # 不在那张表里 → 点下载完全没有任何反馈。
+                chk("★ 聊天下载会发出进度事件（prog + done）",
+                    any(s.get("state") == "prog" for s in dl_states)
+                    and any(s.get("state") == "done" for s in dl_states),
+                    [s.get("state") for s in dl_states])
+                fid = str(frec_ui.get("fid") or "")
+                refs = share_b._file_refs.get(fid)
+                pl = (refs or {}).get("prog_lbl")
+                chk("★ 聊天气泡里挂了进度控件（并按 fid 能定位到）",
+                    pl is not None, "没有 prog_lbl" if pl is None else "")
+                if pl is not None:
+                    chk("★ 下载完成后气泡显示「已下载」",
+                        (not pl.isHidden()) and "已下载" in pl.text(),
+                        (pl.isHidden(), pl.text()))
+                    b = refs.get("btn")
+                    chk("★ 下载完成后按钮恢复可点（不会卡在「下载中」）",
+                        b is not None and b.isEnabled() and b.text() == "下载",
+                        ((b.text(), b.isEnabled()) if b is not None else "无按钮"))
 
             # 撤回的端到端表现
             if added:

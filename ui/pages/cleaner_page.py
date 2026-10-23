@@ -10,6 +10,7 @@
 """
 
 import os
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QColor
@@ -289,6 +290,7 @@ class CleanerPage(BasePage):
     _scanned = Signal(object)           # 单条规则扫描完成
     _scan_fast_done = Signal(object, object)  # 除慢条目外全部扫完（可先清理）
     _scan_done = Signal(object, object)  # (total_bytes, rules) —— 字节数可能超 32 位
+    _scan_note = Signal(str, str)        # (rule_key, 正在扫描的路径)
     _clean_rule_done = Signal(object)
     _clean_done = Signal(object)
     _clean_status = Signal(str, str)
@@ -306,6 +308,12 @@ class CleanerPage(BasePage):
         self._scanner = cl.CleanerScanner()
         self._worker = cl.CleanerWorker()
         self._busy = False
+        self._scanning = False           # 扫描线程是否还活着（含慢条目）
+        self._scan_cancelled = False
+        self._scan_t0 = 0.0
+        self._last_note = ""
+        self._last_note_ts = 0.0
+        self._pending_rescan = False     # 清理后要自动重扫，但扫描还没停
         self._clean_total = 0
         self._confirm_dlg = None
         self._results = []
@@ -315,6 +323,7 @@ class CleanerPage(BasePage):
         self._scanned.connect(self._on_rule_scanned)
         self._scan_fast_done.connect(self._on_scan_fast_done)
         self._scan_done.connect(self._on_scan_done)
+        self._scan_note.connect(self._on_scan_note)
         self._clean_rule_done.connect(self._on_clean_rule_done)
         self._clean_done.connect(self._on_clean_done)
         self._clean_status.connect(self._on_clean_status)
@@ -325,6 +334,16 @@ class CleanerPage(BasePage):
         self._disk_timer.setInterval(3000)
         self._disk_timer.timeout.connect(self._refresh_disk)
         self._disk_timer.start()
+        # 清理后要重扫；如果此时慢条目（DISM 分析）还在跑，就等它结束再扫，
+        # 而不是像以前那样因为 scanner.running 直接静默放弃。
+        self._rescan_timer = QTimer(self)
+        self._rescan_timer.setInterval(1200)
+        self._rescan_timer.timeout.connect(self._try_rescan)
+        # 扫描心跳：每秒把"已用 Ns"写进状态栏。作用不是计时，而是让用户
+        # 一眼看出程序还活着 —— 大目录扫描时状态栏十几秒不动，看起来就像卡死。
+        self._heartbeat = QTimer(self)
+        self._heartbeat.setInterval(1000)
+        self._heartbeat.timeout.connect(self._scan_tick)
 
     # ------------------------------------------------------------ 构建
     def _build_content(self):
@@ -358,7 +377,7 @@ class CleanerPage(BasePage):
         bar = QHBoxLayout()
         bar.setSpacing(10)
         self.btn_scan = primary_button("开始扫描")
-        self.btn_scan.clicked.connect(self.start_scan)
+        self.btn_scan.clicked.connect(self._on_scan_btn)
         bar.addWidget(self.btn_scan)
 
         self.btn_clean = danger_button("清理选中项")
@@ -439,19 +458,50 @@ class CleanerPage(BasePage):
         )
 
     # ------------------------------------------------------------ 扫描
+    def _on_scan_btn(self):
+        """扫描按钮是**双态**的：扫描中=停止，空闲=开始/重新扫描。
+
+        以前扫描期间按钮是禁用的，一旦某条规则卡在畸形目录上，用户连
+        "停下来"的入口都没有，只能杀进程 —— 体感就是"卡死"。
+        """
+        if self._scanning:
+            self._cancel_scan()
+            return
+        if self._busy or self._worker.running:
+            return
+        self.start_scan()
+
+    def _cancel_scan(self):
+        if not self._scanning:
+            return
+        self._scan_cancelled = True
+        self._scanner.cancel()
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("正在停止…")
+        self._status.setText("正在停止扫描（已扫出的结果会保留）")
+
     def start_scan(self):
         if self._busy or self._scanner.running or self._worker.running:
+            if self._scanner.running:
+                self.toast("仍在分析组件存储，可先清理已扫出的项")
             return
         self._busy = True
-        self.btn_scan.setEnabled(False)
+        self._scanning = True
+        self._scan_cancelled = False
+        self._scan_t0 = time.monotonic()
+        self._last_note = ""
+        self._last_note_ts = 0.0
+        self.btn_scan.setEnabled(True)      # 保持可点：点一下就是"停止扫描"
+        self.btn_scan.setText("停止扫描")
         self.btn_clean.setEnabled(False)
-        self.btn_scan.setText("扫描中")
         self._bar.setRange(0, len(self.rules))
         self._bar.setValue(0)
         self._bar.show()
+        self._heartbeat.start()
         for r in self.rules:
             r.size = 0
             r.scanned = False
+            r.partial = False
             row = self.rows.get(r.key)
             if row:
                 row.set_size("…", muted=True)
@@ -466,9 +516,34 @@ class CleanerPage(BasePage):
             on_progress=lambda rule: self._scanned.emit(rule),
             on_done=lambda total, rules: self._scan_done.emit(total, rules),
             on_fast_done=lambda total, rules: self._scan_fast_done.emit(total, rules),
+            on_note=lambda rule, text: self._scan_note.emit(rule.key, text),
         )
         if not ok:
             self._busy = False
+            self._scanning = False
+            self._heartbeat.stop()
+            self.btn_scan.setText("开始扫描")
+
+    def _on_scan_note(self, key, text):
+        """逐条目进度（可能每秒几十上百次，节流到 200ms 一次）。"""
+        now = time.monotonic()
+        if now - self._last_note_ts < 0.2:
+            return
+        self._last_note_ts = now
+        row = self.rows.get(key)
+        name = row.rule.name if row else key
+        short = text if len(text) <= 72 else "…" + text[-70:]
+        self._last_note = f"{name} · {short}"
+        self._status.setText(f"扫描中　{self._last_note}")
+
+    def _scan_tick(self):
+        """每秒刷一次"已用 Ns"，证明扫描还活着（长目录不再像卡死）。"""
+        if not self._scanning:
+            self._heartbeat.stop()
+            return
+        secs = int(time.monotonic() - self._scan_t0)
+        tail = f"　·　{self._last_note}" if self._last_note else ""
+        self._status.setText(f"扫描中…已用 {secs} 秒{tail}")
 
     def _on_rule_scanned(self, rule):
         row = self.rows.get(rule.key)
@@ -479,15 +554,21 @@ class CleanerPage(BasePage):
             if rule.available:
                 row.set_dim(False)
                 row.check.setEnabled(True)
-                row.set_size(cl.human_bytes(rule.size) if rule.size > 0
-                             else "可清理")
+                if rule.size > 0:
+                    # partial = 扫描预算用尽，数字只是下限，标 "≥" 别骗人
+                    row.set_size(("≥ " if rule.partial else "")
+                                 + cl.human_bytes(rule.size),
+                                 muted=rule.partial)
+                else:
+                    row.set_size("可清理")
             else:
                 row.set_size("0 B", muted=True)
                 row.set_dim(True)
                 row.check.setEnabled(False)
                 row.set_checked(False)
         self._bar.setValue(self._bar.value() + 1)
-        self._status.setText(f"正在扫描　{rule.name}")
+        if not self._scanning:
+            self._status.setText(f"正在扫描　{rule.name}")
 
     def _on_scan_fast_done(self, total, rules):
         """除「慢条目」（DISM 组件分析）以外全部扫完 —— 先让用户能动手。
@@ -498,33 +579,48 @@ class CleanerPage(BasePage):
         put 上去、按钮解禁，慢条目那一行继续在后台分析。
         """
         self._busy = False
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("重新扫描")
         found = sum(1 for r in rules if r.size > 0)
         slow_pending = [r for r in rules
                         if getattr(r, "slow_scan", False) and not r.scanned]
         self._update_group_sums()
         self._update_selection()
         if slow_pending:
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("停止分析")
             self._status.setText(
                 "已扫完 %d / %d 项，共约 %s；正在分析组件存储（较慢，"
                 "可先清理已扫出的项）…"
                 % (found, len(rules), cl.human_bytes(total)))
         else:
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("重新扫描")
             self._status.setText(
                 f"已扫完 {found} / {len(rules)} 项，共可释放约 "
                 f"{cl.human_bytes(total)}")
 
     def _on_scan_done(self, total, rules):
         self._busy = False
+        self._scanning = False
+        self._heartbeat.stop()
         self._has_scan_result = True
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText("重新扫描")
         self._bar.hide()
         found = sum(1 for r in rules if r.size > 0)
-        self._status.setText(
-            f"扫描完成：{found} / {len(rules)} 项可清理，共可释放约 {cl.human_bytes(total)}"
-        )
+        partial = [r.name for r in rules if r.partial]
+        if self._scan_cancelled:
+            self._status.setText(
+                f"扫描已停止：已扫出 {found} / {len(rules)} 项，"
+                f"约 {cl.human_bytes(total)}")
+        else:
+            self._status.setText(
+                f"扫描完成：{found} / {len(rules)} 项可清理，共可释放约 "
+                f"{cl.human_bytes(total)}")
+            self.toast(f"扫描完成，发现约 {cl.human_bytes(total)} 可清理")
+        if partial:
+            self._status.setText(
+                self._status.text()
+                + f"（{len(partial)} 项超大目录只统计了一部分）")
         self._update_group_sums()
         self._update_selection()
         self.toast(f"扫描完成，发现约 {cl.human_bytes(total)} 可清理")
@@ -540,10 +636,14 @@ class CleanerPage(BasePage):
         self._update_selection()
 
     def _select_safe(self):
-        """全选"安全"级别（level>=2）且有体积的项。"""
+        """全选"安全"级别（level>=2）且**本机确实有东西可清**的项。
+
+        判据用 rule.available 而不是 size > 0 —— 「被取代的 WinSxS 组件」
+        这类调用系统工具的条目扫不出体积也照样能清，按体积筛会永远选不中。
+        """
         for r in self.rules:
             row = self.rows.get(r.key)
-            if row and r.size > 0 and r.level >= 2:
+            if row and r.available and r.level >= 2:
                 row.set_checked(True)
         self._update_selection()
 
@@ -560,9 +660,16 @@ class CleanerPage(BasePage):
         sel = self._selected_all_incl_risky()
         total = sum(r.size for r in sel)
         self._sel_info.setText(f"已选 {len(sel)} 项 · {cl.human_bytes(total)}")
+        # 慢条目（DISM 组件分析）还在扫时不许清它：AnalyzeComponentStore 和
+        # StartComponentCleanup 会抢同一个组件存储，并行跑两边都可能失败。
+        slow_pending = self._scanning and any(
+            getattr(r, "slow_scan", False) and not r.scanned for r in sel)
         self.btn_clean.setEnabled(
             bool(sel) and not self._busy and not self._worker.running
+            and not slow_pending
         )
+        self.btn_clean.setToolTip(
+            "正在分析组件存储，完成后才能清理该项" if slow_pending else "")
 
     # ------------------------------------------------------------ 清理
     def _confirm_clean(self):
@@ -625,8 +732,12 @@ class CleanerPage(BasePage):
             # 只判 removed_count 会把"确实清出了空间"误显示成「无可清理」。
             if res.removed_count > 0 or res.freed > 0:
                 row.set_size(f"已清理 {cl.human_bytes(res.freed)}", muted=True)
+                row.set_checked(False)      # 清掉的项不该继续勾着等下一轮空点
+            elif res.skipped:
+                # 被占用不是"失败"：文件还在，只是正被程序开着
+                row.set_size(f"{res.skipped} 项使用中", muted=True)
             elif res.failed:
-                row.set_size("部分被占用", muted=True)
+                row.set_size("部分无法删除", muted=True)
             else:
                 row.set_size("无可清理", muted=True)
 
@@ -638,22 +749,42 @@ class CleanerPage(BasePage):
         self._busy = False
         self._bar.hide()
         self.btn_scan.setEnabled(True)
-        self.btn_clean.setEnabled(True)
         self.btn_all.setEnabled(True)
         self.btn_none.setEnabled(True)
         results = self._results
         total = sum(r.freed for r in results)
         count = sum(r.removed_count for r in results)
         failed = sum(r.failed for r in results)
+        skipped = sum(getattr(r, "skipped", 0) for r in results)
         self._refresh_disk()
         # 如实汇报：数字来自"确认删除成功的对象体积"，不依赖磁盘读数（读数可能不敏感）
         msg = f"清理完成：已删除 {count} 个对象，共 {cl.human_bytes(total)}"
+        if skipped:
+            msg += f"；{skipped} 项正被程序使用，已跳过"
         if failed:
-            msg += f"（{failed} 项被占用或权限不足）"
+            msg += f"；{failed} 项权限不足或无法删除"
         self._status.setText(msg)
         self.toast(msg)
-        # 清理后自动重扫，让用户看到剩余可清理量
-        QTimer.singleShot(500, self.start_scan)
+        self._update_selection()
+        # 清理后自动重扫，让用户看到剩余可清理量。慢条目可能还在跑，交给
+        # _try_rescan 排队等它结束 —— 以前这里撞上 scanner.running 就静默放弃。
+        QTimer.singleShot(400, self._schedule_rescan)
+
+    def _schedule_rescan(self):
+        self._pending_rescan = True
+        self._try_rescan()
+
+    def _try_rescan(self):
+        """扫描/清理都空闲时，把排队中的重扫真正启动起来。"""
+        if not self._pending_rescan:
+            self._rescan_timer.stop()
+            return
+        if self._scanning or self._worker.running or self._busy:
+            self._rescan_timer.start()
+            return
+        self._rescan_timer.stop()
+        self._pending_rescan = False
+        self.start_scan()
 
     # ------------------------------------------------------------ 生命周期
     def on_shown(self):
@@ -667,6 +798,10 @@ class CleanerPage(BasePage):
             return
         self._auto_scanned = True
         self._refresh_disk()
+        # 程序本身由 exe 清单以管理员启动；万一不是（源码直跑、被降权），
+        # 系统级条目会大量删不掉 —— 提前说一句，别让用户以为是清理失败。
+        if not cl.is_admin():
+            self.toast("未以管理员身份运行，系统级条目可能无法删除")
         QTimer.singleShot(180, self._auto_start_scan)
 
     def _auto_start_scan(self):
@@ -679,6 +814,15 @@ class CleanerPage(BasePage):
             self._disk_timer.stop()
         except Exception:
             pass
+        try:
+            self._rescan_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._heartbeat.stop()
+        except Exception:
+            pass
+        self._pending_rescan = False
         self._scanner.cancel()
         self._worker.cancel()
         if self._confirm_dlg is not None:

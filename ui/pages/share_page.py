@@ -761,6 +761,10 @@ class SharePage(BasePage):
         self._chat_enabled = False   # 是否在「异地联机」的房间里
         self._chat_connected = False # 聊天信号是否已接到联机页（只接一次）
         self._chat_rows = {}          # 消息 id -> {"row","name_lbl","btn"}
+        # fid -> 该文件消息的气泡控件引用（下载进度要就地改这一行的文字）。
+        # 与 _chat_rows 分开：_chat_rows 按**消息 id**索引（撤回用），这里按
+        # **文件 id** 索引（下载进度用），同一条消息在两个表里各有一份引用。
+        self._file_refs = {}
         self._send_meter = screenshare.RateMeter()
         self._recv_meter = screenshare.RateMeter()
         # 送达口径（per-viewer 在 sendall 成功后才计数）：与"发出"对照，
@@ -1178,6 +1182,9 @@ class SharePage(BasePage):
             return
         try:
             lan.chat_message.connect(self._on_chat_message)
+            # 聊天区文件下载的进度（联机页单独发的一条通道，见 lan_page
+            # 的 chat_download）。少了这一行，聊天区点下载就**完全没有反馈**。
+            lan.chat_download.connect(self._on_chat_download)
         except (TypeError, RuntimeError):
             return
         self._chat_connected = True
@@ -1209,6 +1216,61 @@ class SharePage(BasePage):
             self.toast("下载不可用（找不到联机页）")
             return
         lan.download_chat_file(rec)
+
+    def _on_chat_download(self, payload):
+        """聊天区文件下载的进度 / 完成（联机页 `chat_download` → 主线程）。
+
+        就地把气泡里的那一行进度文字改掉，**不重建整行** —— 重建会让用户
+        正在看的那条消息闪一下，还可能把滚动位置带跑。
+
+        以前这条通道根本不存在：联机页把进度发到云盘列表的
+        `_share_widgets[key]`，而聊天区的文件气泡不在那张表里，于是
+        "聊天区点下载完全没有反馈"（用户实测 2026-10-19）。
+        """
+        payload = dict(payload or {})
+        refs = self._file_refs.get(str(payload.get("fid") or ""))
+        if refs is None:
+            return
+        lbl = refs.get("prog_lbl")
+        btn = refs.get("btn")
+        if lbl is None:
+            return
+        p = theme.current()
+
+        def _safe_set_button(text, enabled):
+            if btn is None:
+                return
+            try:
+                btn.setText(text)
+                btn.setEnabled(enabled)
+            except RuntimeError:                 # 控件已被销毁（退房竞态）
+                pass
+
+        if str(payload.get("state") or "") == "done":
+            if payload.get("ok"):
+                lbl.setText("✓ 已下载")
+                lbl.setStyleSheet("font-size: 11px; color: %s;"
+                                  % p.get("green", p["accent"]))
+            else:
+                lbl.setText("✗ 下载失败：%s"
+                            % (payload.get("result") or "未知原因"))
+                lbl.setStyleSheet("font-size: 11px; color: %s;" % p["red"])
+            lbl.setVisible(True)
+            _safe_set_button("下载", True)
+            return
+
+        # ---- 进度中 ----
+        done = int(payload.get("done") or 0)
+        total = int(payload.get("total") or 0)
+        pct = int(done * 100 / total) if total else 0
+        lbl.setText("下载中 %d%% · %s / %s"
+                    % (pct, lan_share.human_size(done),
+                       lan_share.human_size(total)))
+        lbl.setStyleSheet("font-size: 11px; color: %s;" % p["accent"])
+        lbl.setVisible(True)
+        # 同一条消息一次只允许一个下载（联机页本来就有全局互斥），
+        # 按钮就地变成"下载中"并禁用，避免用户重复点。
+        _safe_set_button("下载中", False)
 
     def _on_chat_message(self, rec):
         """聊天消息到达（主线程）：新消息加一行，撤回改那一行。"""
@@ -1326,6 +1388,13 @@ class SharePage(BasePage):
             size_lbl.setStyleSheet("font-size: 11px; color: %s;"
                                    % p["text_faint"])
             info.addWidget(size_lbl)
+            # 下载进度：默认不占位，点「下载」后才出现。单独一行而不是
+            # 覆盖体积——"文件多大"和"下到哪了"要能同时看到。
+            prog_lbl = QLabel("")
+            prog_lbl.setVisible(False)
+            prog_lbl.setWordWrap(True)
+            prog_lbl.setStyleSheet("font-size: 11px; color: %s;" % p["accent"])
+            info.addWidget(prog_lbl)
             line.addLayout(info, 1)
 
             # 「下载」用 MiniButton（内边距 2px 12px）而不是 ghost_button
@@ -1349,6 +1418,11 @@ class SharePage(BasePage):
             refs["tile"] = tile
             refs["tile_kind"] = fkind
             refs["btn"] = btn
+            refs["prog_lbl"] = prog_lbl
+            fid = str(rec.get("fid") or "")
+            if fid:
+                # 下载进度按 fid 找这一行（同一个文件只会有一条文件消息）
+                self._file_refs[fid] = refs
         else:
             body = QLabel(str(rec.get("text") or ""))
             body.setWordWrap(True)
@@ -1398,6 +1472,9 @@ class SharePage(BasePage):
                 w.hide()
                 w.deleteLater()
         self._chat_rows = {}
+        # 进度表的引用指向同一批控件，必须一起清 —— 否则退房后残留的
+        # refs 指向已 deleteLater 的 QLabel，下次进度回调会碰已销毁对象。
+        self._file_refs = {}
 
     def _scroll_chat_bottom(self):
         bar = self._chat_scroll.verticalScrollBar()
@@ -1995,6 +2072,10 @@ class SharePage(BasePage):
             try:
                 lan.chat_message.disconnect(self._on_chat_message)
             except (TypeError, RuntimeError):
+                pass
+            try:
+                lan.chat_download.disconnect(self._on_chat_download)
+            except (TypeError, RuntimeError, AttributeError):
                 pass
         self._chat_connected = False
         self._clear_chat_rows()

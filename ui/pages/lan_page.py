@@ -295,6 +295,15 @@ class LanPage(BasePage):
     #: payload 是一条消息记录，字段见 room_chat.RoomChat 的 docstring。
     chat_message = Signal(dict)
 
+    #: **聊天区文件下载的进度/完成**（屏幕共享页的聊天气泡就地显示用）。
+    #: payload: {"state": "prog"|"done", "fid", "done", "total", "ok", "result"}
+    #:
+    #: 为什么必须单独一条通道：云盘列表那一路的进度走 `share_prog` →
+    #: `_on_share_prog` → `_share_widgets[key]`，而**聊天区的文件消息没有
+    #: 那套控件字典**（它渲染在屏幕共享页里），于是进度被静默丢掉 ——
+    #: 用户实测"聊天区点下载完全看不到进度"就是这个原因。
+    chat_download = Signal(dict)
+
     def __init__(self, notify=None, parent=None):
         super().__init__(
             "异地联机",
@@ -1446,13 +1455,21 @@ class LanPage(BasePage):
             if done != total and now - last[0] < 0.25:
                 return          # 节流：每个 64KB 分块都发信号会把事件队列灌满
             last[0] = now
+            # 两路都发：① 云盘列表（同一次下载恰好也在列表里时，那一行也同步）
+            # ② 聊天区气泡（屏幕共享页渲染，靠 chat_download 单独一条通道）
             self._event.emit("share_prog", {"key": key, "done": done,
                                             "total": total})
+            self.chat_download.emit({"state": "prog", "fid": fid,
+                                     "done": done, "total": total})
 
         def work():
             ok, res = hub.download(ip, port, fid, progress=prog,
                                    is_cancelled=lambda: self._cancel_dl,
                                    timeout=20.0, dest_path=dest)
+            # 先告诉聊天区（用户正盯着那个气泡），再走云盘那套收尾
+            self.chat_download.emit({"state": "done", "fid": fid,
+                                     "ok": bool(ok), "result": res,
+                                     "name": name})
             self._event.emit("share_done",
                              {"key": key, "ok": ok, "result": res,
                               "name": name})

@@ -454,6 +454,16 @@
 #      ④ 美化：自己的行用主色淡底 + 主色描边（一眼分清哪个地址是我的）、
 #      别人的行悬停时描边变主色、圆角 6px、行内边距与按钮高度统一。
 #      右下的「临时云盘」文件行是同一个毛病，一并改成 36px 细长条。
+#      ── v1.1.8 为整合发布（2026-10-21，用户要求，同 1.1.6 整合版先例）──
+#      GitHub 线上最新发布版是 v1.1.5，本 exe 把其后工作区累积的全部改动按
+#      同一个版本号打包：除上面 1.1.8 的成员区修复外，还含 1.1.6 正式版
+#      （异地联机三处修复 + 整合版的性能/UI 各项）、1.1.7 三轮（联机日志
+#      去重降噪 / 聊天下载进度 / C 盘清理引擎大修）、1.1.9（聊天区 UI 重做：
+#      头像 + 文件消息卡）、1.2.0（设置中心 SAC 开关，sac.py + 只读自检）、
+#      1.2.1（SAC 提示栏两处 bug：读取失败谎称"没有 SAC" / 回读失败置灰开关
+#      —— read_state_ex 机器可读分类；提示栏颜色接主题重刷）与 1.2.2（SAC
+#      关闭确认弹窗跟随主题，_messagebox_qss 按当前色板现算不透明样式）。
+#      版本号仍高于线上 v1.1.5，老客户端自动更新可正常触发，不构成降级。
 # 1.1.9：聊天区 UI 重做（用户截图反馈"看不出是谁发的" + 分享文件卡片太素）。
 #      ① **身份三重编码**：每条消息加**头像**（昵称首字 + 按昵称哈希稳定取色，
 #         同一个人永远同色），头像在气泡外侧、自己靠右别人靠左；气泡内头部
@@ -515,6 +525,107 @@
 #      ④ **源码态拦截**：非冻结运行直接提示不支持自动替换，不再拉起一个
 #         python.exe --apply-update 然后莫名其妙退出。
 #      自检新增 19 项回归断言（暗号 12 + 兜底/回滚 7），总计 90 项全绿。
-VERSION = "1.1.6"
+# 1.1.7（聊天下载进度）：修「**聊天区下载文件看不到进度**」。
+#      云盘列表那一路本来就有进度（`_start_download` → `share_prog` →
+#      `_on_share_prog` 改 `_share_widgets[key]` 那一行），但**聊天区的文件
+#      气泡渲染在屏幕共享页**、根本不在 `_share_widgets` 里 → `_on_share_prog`
+#      查不到 key 就 `return`，进度被**静默丢弃**：点了下载界面一动不动。
+#      修法（不动云盘那一路，避免回归）：
+#      ① 联机页新增独立信号 `chat_download`，`download_chat_file` 在进度回调
+#         与完成时各发一次（`state=prog|done` + fid/done/total/ok/result）；
+#      ② 屏幕共享页的文件气泡里加一行 `prog_lbl`（默认隐藏、单独一行，
+#         不覆盖体积），`_file_refs[fid]` 按文件 id 定位；`_connect_chat`
+#         多接一条 `chat_download`，退房时一并断开；
+#      ③ 就地更新「下载中 42% · 1.2 MB / 3.4 MB」→「✓ 已下载」/「✗ 下载
+#         失败：原因」，按钮在「下载中（禁用）」↔「下载（可点）」之间切换。
+#      `_clear_chat_rows` 同时清 `_file_refs`（否则退房后残留引用指向已
+#      deleteLater 的 QLabel）。自检 +4 项，聊天自检 30/30 全绿。
+# 1.1.7（C盘清理引擎大修）：修「勾了也删不掉 / 显示的数字是假的」。
+#      根因有三类，都是**静默失效**（界面一切正常，只是什么都没干）：
+#      ① **query 被当成逐级串联**：`("AMD","Intel","NVIDIA")` 被解释成
+#         root\AMD\Intel\NVIDIA 一条链，于是 drivers、$Windows.~BT、
+#         Tencent\TXSSO 这些规则一个条目都匹配不到；带 `\` 的整段模式
+#         （`Local\Microsoft\Windows\*.log`）又拿整串去和单个文件名比，
+#         同样永不命中。现在多个 query 是**并联**、单条按 `\` 拆段逐级下钻，
+#         结果按路径去重。
+#      ② **contents 模式完全忽略 excluded**：ClickToRun 规则明写保留
+#         MachineData / UserData，实际会一起清掉（后果是无法修复/卸载
+#         Office）。现在扫描与清理共用同一个 `_contents_plan`，
+#         护栏 + excluded 只在一处生效，保证"扫得出来 = 清得掉"。
+#      ③ **缩略图缓存规则整条是死的**：写成 `Explorer\*` + `IconCache.db`
+#         的链式路径，而真实文件是 `iconcache_*.db` / `thumbcache_*.db`。
+#      另外修：还原点扫描把「已用/分配/最大」三行相加（≈3 倍虚高）；重叠
+#      root（%Temp% 与 Users\*\AppData\Local\Temp 是同一目录）重复统计，
+#      实测 temp_files 从 5.26 GB 变 2.63 GB（原来整整算了两遍）；清理撞上
+#      DISM 分析时并发抢组件存储；清理后重扫撞上 scanner.running 就静默放弃。
+#      删除链路增强：超长路径自动加 \\?\ 前缀（Windows.old/WinSxS 里常见），
+#      首次失败时 takeown + icacls 夺回所有权再删一次，符号链接/目录联接
+#      只删链接不跟进去；事件日志被服务占用归入 skipped 而非 failed。
+#      **「47 项被占用或者权限不足」假警报**：删除改成自己递归（不再用
+#      shutil.rmtree），逐项按 WinError 分类 —— 32/33=被占用（重试一次后
+#      记 skipped）、5=没权限（SetFileAttributesW 摘属性 + takeown 再试）、
+#      其余才算失败；父目录只会因为"里面有被占用的子项"而记 skipped，
+#      不再是整棵树笼统算成"权限不足"。同时「Windows 下载缓存」改成先停
+#      wuauserv/bits 再清 Download（原来整片被服务锁着，是那 47 项的主力）。
+#      界面分开报「N 项正被程序使用，已跳过」/「N 项权限不足或无法删除」。
+#      **扫描卡死**（用户报）：以前没有任何"上限/出口"，一条规则碰上畸形或
+#      超大目录，整轮扫描和界面的完成回调就永远等下去。现在四道保险 ——
+#      ① 每条规则 90 秒预算，超时收尾并把该行标成「≥ N」；② measure 每
+#      256 个条目查一次取消；③ DISM 分析改 Popen 轮询（"停止扫描"能真正
+#      kill，上限 120 秒，原来要干等 7 分钟）；④ 所有子进程 stdin=DEVNULL
+#      （GUI 进程没有控制台，子进程读 stdin 会永久挂住，是最隐蔽的一种
+#      "卡死"）。扫描按钮改为双态「停止扫描 / 重新扫描」，状态栏每秒刷新
+#      "扫描中…已用 N 秒 · 当前路径"，长目录不再看起来像死机。
+#      不再有任何二次提权代码路径（exe 清单已 requireAdministrator），
+#      `is_admin()` 只用于非管理员时提示一句。
+#      自检新增并联/多段/contents 排除/去重/还原点解析/护栏说明/占用分类/
+#      扫描预算与取消等断言，源码态 80/80 全绿。
+# 1.2.0：设置中心新增「智能应用控制 (SAC)」开关（用户要求）——
+#    不少用户装完 Windows 11 后，运行**未签名**的 Yuhub.exe 会被 SAC 直接
+#    拦下（"智能应用控制已阻止可能不安全的应用"），而且 SAC **没有「仍要
+#    运行」、也没有按应用例外**：要么关 SAC，要么给程序做代码签名。
+#    现在设置页可直接开/关。实现见 sac.py：改
+#    HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy\
+#    VerifiedAndReputablePolicyState（0关/1开/2评估）后跑 CiTool.exe -r
+#    刷新策略；关闭前**二次确认**，并明确告知"老版 Win11 关掉后不可逆、
+#    需重装/重置"。SAC 仅 Win11 新装系统才有，本机没有该键时开关置灰。
+#    配套 sac_selftest.py（**只读**，绝不改注册表）验证常量/路径/读取。
+# 1.2.1：修设置中心 SAC 开关提示栏两处 bug（**已并入 v1.1.8 整合版发布**，
+#     见下方 1.1.8 整合说明；SAC 开关本身来自 1.2.0）——
+#    ① **提示栏把「读取失败」谎称成「本机没有 SAC」**：根因是
+#       `_render_sac_state` 只按 err 文本分两类（`"管理员" in err` / 其它），
+#       而 `sac.read_state()` 其实有**三种**失败：键不存在（真没有）、
+#       PermissionError（要管理员）、其它 OSError（读取失败）。任何读取失败
+#       都落到 else 分支显示"本机没有智能应用控制（SAC）……Windows 10 没有
+#       这个功能"，最坑的是**写入成功后回读失败**这条路：用户刚成功关了
+#       SAC，提示栏却告诉他本机没有 SAC，同时 `setEnabled(False)` 把开关
+#       **永久置灰**，toast 还说"当前仍为未知"。修法：`sac.read_state_ex()`
+#       返回机器可读的失败分类（KIND_ABSENT / KIND_DENIED / KIND_ERROR），
+#       UI 按 kind 分流（文案会过时、分类不会）；写入后回读失败改为按
+#       「目标态」显示 + 如实说明"已写入但读取状态失败"，开关不再被锁死。
+#    ② **主题切换后提示栏颜色留在旧主题**：`small_note` 的颜色是内联写死
+#       的，`_on_theme_changed_restyle` 却只重刷 autostart_hint / tray_hint
+#       两条（SAC 卡是后加的，没接进去）——切到浅色后 SAC 提示栏还留着深色的
+#       text_faint，淡得几乎看不见。修法：small_note 创建时登记
+#       smallNote/noteWarn 动态属性，主题切换时按属性全刷（覆盖全部卡片）。
+#    sac_selftest.py 同步补失败分类与两接口一致性的只读断言。
+# 1.2.2：修「SAC 关闭确认弹窗不跟随主题」（用户截图 2026-10-21：浅色应用
+#      里弹出深色原生弹窗）。**只修 UI，不动 SAC 逻辑。已并入 v1.1.8 整合版
+#      发布（见下方 1.1.8 整合说明）。**
+#      根因：全局 QSS 在 `MainWindow._apply_theme()` 里只
+#      `setStyleSheet` 在**主窗口自己**身上 —— 它**不会**流进任何独立顶层
+#      窗口。项目里每个自建对话框（update_ui._BaseDialog / cleaner 的
+#      ConfirmDialog / uninstall 的 _BaseDialog / monitor 的 DetailDialog）
+#      都各自 `setStyleSheet(theme.build_qss())`，唯独 SAC 这个确认框漏了，
+#      于是 QMessageBox 走系统原生渲染，主题与主界面完全脱节。
+#      修法：不能直接甩 build_qss() —— 那份里的
+#      `QDialog { background: transparent; }` 是配 `QFrame#DialogFrame`
+#      的（底由内层 QFrame 画），QMessageBox 没有这层内框，透明背景会把
+#      桌面透出来。改为 `settings_page._messagebox_qss()` 按当前色板现算
+#      一份**全不透明**样式（弹窗底 / 文字 / 按钮），按钮语言对齐主界面：
+#      取消=中性描边（GhostButton）、确定=红色描边（DangerButton，
+#      经 setObjectName 挂到 box.button(QMessageBox.Yes) 上）。
+#      弹窗构建拆成 `_build_sac_confirm_box()`，供无头自检直接取证。
+VERSION = "1.1.8"
 VERSION_LABEL = f"v{VERSION} 正式版"
 APP_NAME = "Yuhub"

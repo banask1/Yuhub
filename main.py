@@ -373,6 +373,21 @@ def main():
         except Exception:
             sys.exit(5)
 
+    # ---- sac-selftest 模式：无窗口自检「智能应用控制开关」（**只读**）----
+    # 用法： Yuhub.exe --sac-selftest <结果json路径>
+    # 只校验常量/路径/读取与"非法状态被拒"，**绝不改注册表** ——
+    # 改 SAC 会真的动系统安全策略，自检不能干这事。
+    if "--sac-selftest" in sys.argv:
+        idx = sys.argv.index("--sac-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import sac_selftest
+            sys.exit(sac_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # ---- dism-probe 模式：抓取本机 DISM 组件存储分析的真实输出（只读诊断）----
     # 用法： Yuhub.exe --dism-probe <输出txt路径>
     # 用于排查「被取代的 WinSxS 组件」扫不出体积 / 清不掉的问题：把 DISM 的
