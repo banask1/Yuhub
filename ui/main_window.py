@@ -6,7 +6,7 @@ import threading
 
 from PySide6.QtCore import (
     Qt, QEvent, QObject, QPoint, QPropertyAnimation, QRect,
-    QRectF, QSettings, QTimer, QVariantAnimation, QAbstractAnimation, Signal,
+    QRectF, QSettings, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QColor, QCursor, QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap,
@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
 from . import glass
 from . import ink
 from . import motion
+from . import motion_engine as anim
+from . import nativedrop
 from . import theme
 from . import VERSION, VERSION_LABEL
 from .tray import TrayIcon, tray_available
@@ -182,15 +184,13 @@ class NavButton(QPushButton):
         self._hover_t = 0.0
         # 上一次写进 QLabel 的提亮程度（-1 = 还没写过，保证首次一定生效）
         self._label_tint_k = -1.0
-        self._hover_anim = QVariantAnimation(self)
-        self._hover_anim.setDuration(motion.HOVER)
-        # 弹簧而不是直线：膜"冲过头一点再坐稳"才有果冻感（用户 2026-10-04
-        # 确认要 Q 弹手感，且不要强度档位）。用与侧栏选中片**同一条**曲线
-        # (CURVE_SPRING，16% 过冲)，两处动作才像同一个系统里的东西。
+        # v1.3.0：物理弹簧（见 motion_engine）。旧实现是"QVariantAnimation +
+        # 贝塞尔拟弹簧"，重启时速度丢失 —— 鼠标快速划过多行时会一段一段
+        # 重新起步，看着像"抖"。弹簧改目标不重置速度，天然接力。
+        self._hover_spring = anim.Spring(0.0, motion.SPRING_JELLY,
+                                         on_change=self._on_hover_value)
         # 过冲只会让膜更宽：起点两侧各留 HOVER_SPREAD(7px)，16% 最坏也只吃掉
         # 1.1px，绝不会冒出按钮边界（`_hover_rect` 还有一道最小尺寸兜底）。
-        self._hover_anim.setEasingCurve(motion.curve(motion.CURVE_SPRING))
-        self._hover_anim.valueChanged.connect(self._on_hover_value)
         theme.bus.changed.connect(lambda _: self._refresh())
         # 选中态变化时也要刷新（玻璃贴片选中时描边换成主题色）
         self.toggled.connect(lambda *_: self._refresh())
@@ -218,24 +218,16 @@ class NavButton(QPushButton):
             self._animate_hover(0.0)
 
     def _animate_hover(self, target):
-        running = (self._hover_anim.state()
-                   == QAbstractAnimation.State.Running)
-        if running:
-            # 已经在往同一个目标跑就别重启 —— 重启会让弹簧从当前位置
-            # 重新起步，连续进出时看着像"抖一下"。
-            try:
-                if abs(float(self._hover_anim.endValue()) - target) < 0.001:
-                    return
-            except (TypeError, ValueError):
-                pass
-        elif abs(self._hover_t - target) < 0.002:
-            return                        # 已经在位，别白跑一次动画
-        self._hover_anim.stop()
-        self._hover_anim.setStartValue(float(self._hover_t))
-        self._hover_anim.setEndValue(float(target))
-        self._hover_anim.start()
+        """把 hover 膜推向目标。
 
-    def _on_hover_value(self, value):
+        v1.3.0 起这里**没有**"已经在往同一目标跑就别重启"的守卫了 ——
+        那条守卫是为旧实现服务的：`stop()` + 从当前值重新起步会丢掉速度，
+        连续进出时看着像抖一下，所以只能靠"别重启"绕开。物理弹簧改目标
+        本来就不重置速度，重启等于接力，守卫反而会挡住真实的手势。
+        """
+        self._hover_spring.to(float(target))
+
+    def _on_hover_value(self, value, _velocity):
         self._hover_t = float(value)
         self._tint_labels()
         self.update()
@@ -666,14 +658,13 @@ class GlassPill(QFrame):
         self._backdrop = backdrop
         self._src = glass.BackdropSource()
         self._relayout = None
-        self._anim = QPropertyAnimation(self, b"geometry", self)
-        # 面板在两个位置之间挪位 —— 用**弹簧曲线**：冲过目标 16%、弹回一点、
-        # 停稳。直线滑过去像"被搬过去"，弹簧才像"有质量的东西撞上去"（用户
-        # 要的"Q弹果冻感"）。过冲体现在 x 上：起点终点宽度相同，插值里
-        # width 恒定，只有 x 会短暂越过目标再回来。
-        # 时长见动效令牌（motion.PILL = 300ms，过冲峰值落在 147ms）。
-        self._anim.setDuration(motion.PILL)
-        self._anim.setEasingCurve(motion.curve(motion.CURVE_SPRING))
+        # v1.3.0：几何动画换成物理弹簧（只动 x）。原来 QPropertyAnimation
+        # 连点会 `stop()` 再从头走 —— 指示条在半路"顿一下重新加速"。
+        # 弹簧带速度接力，连续点击是顺着惯性滑过去，这才是"有质量"的手感。
+        # 宽高不参与动画：侧栏折叠/展开时由 eventFilter 直接瞬时落位。
+        self._target = QRect()
+        self._spring = anim.Spring(0.0, motion.SPRING_JELLY,
+                                   on_change=self._on_slide)
         if parent is not None:
             parent.installEventFilter(self)
         self.hide()
@@ -703,20 +694,35 @@ class GlassPill(QFrame):
         self.update()
 
     def slide_to(self, rect, animate=True):
-        """滑到目标矩形。首次出现（还没有几何）时不动画，直接落位。"""
-        self._anim.stop()
-        if not animate or self.geometry().width() <= 0:
+        """滑到目标矩形。首次出现（还没有几何）时不动画，直接落位。
+
+        v1.3.0：弹簧只解 **x** 一个自由度。宽高在滑动过程中必须恒定 ——
+        它们一变，玻璃片的形状、模糊快取的键、以及按钮行的对齐全都会跟着
+        抖（旧实现里 `geometry` 插值恰好起点终点同宽，才没暴露这个问题；
+        换成弹簧后如果还插值宽高，过冲会把片拉宽）。
+        """
+        self._target = QRect(rect)
+        self.show()
+        fresh = self.geometry().width() <= 0
+        if not animate or fresh:
+            self._spring.snap(rect.x())
             self.setGeometry(rect)
-            self.show()
             self.update()
             return
-        if self.geometry() == rect:
-            self.show()
+        if abs(self.x() - rect.x()) < 0.5:
+            self._spring.snap(rect.x())
+            self.setGeometry(rect)
+        else:
+            self._spring.to(rect.x())
+        self.update()
+
+    def _on_slide(self, value, _velocity):
+        """弹簧每帧回调：只改 x，宽高取目标值（见 slide_to 的说明）。"""
+        t = self._target
+        if t.isNull():
             return
-        self.show()
-        self._anim.setStartValue(self.geometry())
-        self._anim.setEndValue(rect)
-        self._anim.start()
+        self.setGeometry(int(round(value)), t.y(), t.width(), t.height())
+        self.update()
 
     def paintEvent(self, event):
         r = self.rect()
@@ -868,6 +874,16 @@ class MainWindow(QWidget):
         self._fit_to_screen()
         self._apply_theme()
         self._install_resize_filter()
+        self._install_native_drop()
+
+        # 加速页证书状态的**后台预热**（v1.3.1 性能修复）：
+        # `framework_status()` 要起一个 11MB 的 Native AOT 进程问状态，
+        # 实测 ~115ms。原来这段跑在"第一次点网络加速"的 GUI 线程上 ——
+        # 用户看到的就是侧栏点一下、界面僵 0.1 秒（前面若还有别的页面
+        # 扫描线程在抢 CPU，实测甚至能到 1 秒）。趁启动空闲在 daemon
+        # 线程里跑一次把缓存填好，用户点进去时直接命中缓存（0ms）。
+        # 权威来源仍然是框架自己，没有引入第二份判定逻辑。
+        QTimer.singleShot(1500, self._warm_accel_status)
 
         # 开机自启走这条：不弹窗口，直接安静地待在托盘里。
         # 托盘不可用时退回正常显示，否则用户会发现"程序启动了但什么也看不到"。
@@ -892,6 +908,21 @@ class MainWindow(QWidget):
         self._update_timer.setInterval(30 * 60 * 1000)   # 30 分钟
         self._update_timer.timeout.connect(self._on_periodic_update_tick)
         self._update_timer.start()
+
+    def _warm_accel_status(self):
+        """后台填一次加速页的证书状态缓存（见 __init__ 里的说明）。
+
+        模块在文件顶部已经静态导入过（AccelPage 就在本文件的 import 列表里），
+        所以这里只是从 sys.modules 取，不会在后台线程里抢 Python 的 import 锁。
+        预热失败完全不影响功能：缓存空着，用户点进去时照旧同步读一次。
+        """
+        try:
+            from .pages import accel_page
+            threading.Thread(
+                target=lambda: accel_page.framework_status(force=True),
+                name="YuhubAccelWarm", daemon=True).start()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 自动更新
     def _on_periodic_update_tick(self):
@@ -1395,6 +1426,9 @@ class MainWindow(QWidget):
     def showEvent(self, event):
         """窗口首次显示后再异步采集硬件信息，避免拖慢启动。"""
         super().showEvent(event)
+        # 原生拖放通道要在窗口有真句柄之后再挂一次（__init__ 里那次可能
+        # 拿到的还是 0）。arm() 幂等，重复调用只是多了三次 Win32 查询。
+        QTimer.singleShot(0, self._arm_native_drop)
         if not getattr(self, "_hw_kicked", False):
             self._hw_kicked = True
             home = self._pages.get("home")
@@ -1404,6 +1438,39 @@ class MainWindow(QWidget):
         QTimer.singleShot(0, self._sync_nav_pill)
         # 开机自启静默进托盘期间发现的更新，等窗口真打开时再提示
         self.show_update_if_pending()
+        self._sync_ambient_gate()
+
+    def hideEvent(self, event):
+        """窗口藏起来（进托盘 / 最小化到托盘）时停掉装饰动画。
+
+        v1.3.0：本应用的默认行为是"点 ✕ 留在托盘"，也就是窗口大部分时间
+        是**隐藏**的。装饰层（竹子 24fps + 鱼池 30fps）此前只查
+        `isVisible()`，而隐藏后子控件依旧 isVisible() == False —— 这一条
+        能挡住大部分；但托盘常驻时窗口一旦被系统最小化，Qt 仍认为可见，
+        于是继续为看不见的画面算每一帧。这里统一用窗口状态做闸门。
+        """
+        super().hideEvent(event)
+        self._sync_ambient_gate()
+
+    def _sync_ambient_gate(self):
+        """把"用户到底看不看得见"翻译成装饰层的开关。
+
+        判据只用**可靠**的两项：窗口可见 + 未最小化，再加应用未被挂起。
+        ⚠️ 刻意不用 `windowHandle().isExposed()` 判遮挡：它在部分平台上
+        直到第一次 expose 之前都报 False（会把本来就可见的窗口判成"看不见"，
+        表现是"竹子不动了"这种比省电更糟的 bug）。宁可少省一点，也不能让
+        装饰装死。
+        """
+        try:
+            vis = self.isVisible() and not self.isMinimized()
+            if vis:
+                app = QApplication.instance()
+                if (app is not None and app.applicationState()
+                        == Qt.ApplicationSuspended):
+                    vis = False
+        except RuntimeError:              # 窗口已析构
+            vis = False
+        anim.set_ambient_enabled(vis)
 
     def changeEvent(self, event):
         """最大化 / 还原时同步外壳圆角。
@@ -1416,6 +1483,12 @@ class MainWindow(QWidget):
         if event.type() == QEvent.WindowStateChange:
             QTimer.singleShot(0, lambda: self._set_rounded(
                 not self.isMaximized()))
+            # 最小化 / 还原都要重新判一次装饰层的闸门（v1.3.0）
+            QTimer.singleShot(0, self._sync_ambient_gate)
+        elif event.type() == QEvent.ActivationChange:
+            # 失焦不暂停装饰（水墨竹子在后台轻轻动是设计的一部分），
+            # 但要让帧时钟知道"现在没有交互"，它才好降帧。
+            self._sync_ambient_gate()
 
     # ---------------------------------------------------- 启动画面联动
     def launch_with_data_wait(self, on_ready, timeout_ms=12000):
@@ -1531,6 +1604,9 @@ class MainWindow(QWidget):
         pill = getattr(self, "_nav_pill", None)
         if pill is not None:
             pill.refresh_geometry(animate=True)
+        # v1.3.0：转场这 300ms 里让装饰层（竹子/鱼池）让路 —— 页面淡入
+        # 本身就要重画整块内容区，再叠一层 24fps 竹子就是抢帧。
+        anim.mark_busy(motion.PAGE_IN + 40)
         self._animate_page_in(host, page)
         # 通知页面已切到前台（用于惰性初始化 / 自动刷新）
         if hasattr(page, "on_shown"):
@@ -1704,6 +1780,47 @@ class MainWindow(QWidget):
             self._set_rounded(False)
             self.showMaximized()
 
+    # ---------------------------------------------- 原生拖放（提权可拖）
+    # 背景见 ui/nativedrop.py 的模块说明：本 exe 带 requireAdministrator 清单，
+    # 提权运行时 Qt 的 OLE 拖放会被 UIPI 挡掉（鼠标还是"可放"的样子，松手却
+    # 没反应），必须改走原生 WM_DROPFILES。原生通道不提权时也照样可用，
+    # 所以这里是**唯一**的拖放路径，不做二选一。
+    def _install_native_drop(self):
+        self._native_drop = None
+        if not nativedrop.available():
+            return
+        try:
+            self._native_drop = nativedrop.NativeDropFilter(self._on_native_drop)
+            QApplication.instance().installNativeEventFilter(self._native_drop)
+        except Exception:
+            self._native_drop = None
+            return
+        QTimer.singleShot(0, self._arm_native_drop)
+
+    def _arm_native_drop(self):
+        """把过滤器挂到当前窗口句柄上（窗口重建后会换句柄，需重新挂）。"""
+        nd = getattr(self, "_native_drop", None)
+        if nd is None:
+            return
+        try:
+            nd.arm(int(self.winId()))
+        except Exception:
+            pass
+
+    def _on_native_drop(self, paths, client_pt):
+        """WM_DROPFILES 到货：按落点找投放区，找不到就明确提示。"""
+        if not paths:
+            return
+        sink = nativedrop.resolve_sink(self, client_pt)
+        if nativedrop.deliver(sink, paths):
+            return
+        # 原生通道给**整个窗口**都画了"可放"光标（它不知道哪个控件才是投放区），
+        # 所以落在别处时什么都不说，用户会以为"又坏了"。给一句明话。
+        try:
+            show_toast(self, "把文件拖到「临时云盘」的投放区里")
+        except Exception:
+            pass
+
     # -------------------------------------------------------- 边缘缩放
     def _install_resize_filter(self):
         QApplication.instance().installEventFilter(self)
@@ -1753,6 +1870,10 @@ class MainWindow(QWidget):
         return Qt.ArrowCursor
 
     def eventFilter(self, obj, event):
+        # 窗口句柄换了（改窗口标志 / 重建原生窗口）就要重新挂一次拖放通道，
+        # 否则 RevokeDragDrop 的效果随旧句柄一起消失，拖拽又变回"没反应"。
+        if obj is self and event.type() == QEvent.Type.WinIdChange:
+            QTimer.singleShot(0, self._arm_native_drop)
         if self.isVisible():
             t = event.type()
             if t == QEvent.Type.MouseMove:

@@ -472,6 +472,17 @@ def _resource_dir():
 
 def release_binaries(force=False):
     """把内置的 EasyTier 释放到固定目录。返回 (成功, 说明)。"""
+    dst = install_dir()
+    # 🔴 C盘清理会清空 `%Temp%`，连带删掉当前 onefile 进程的 `_MEIPASS`
+    # 内置资源（那份目录只在进程启动时生成，同进程内无法重建）。但落地
+    # 目录里的三件套其实完好无损 —— 组件没坏，不该再去依赖源快照。
+    # 不短路的后果：清理完点联机必报「缺少 easytier-core.exe」，退出
+    # 重开又自动好了，用户完全看不出因果关系。
+    # `force=True` 是「强制覆盖/校验版本」语义，必须照常走源文件比对。
+    if not force:
+        ok, _ = core_health()
+        if ok:
+            return True, dst
     src = _resource_dir()
     if not src:
         return False, "内置 EasyTier 资源缺失"
@@ -890,6 +901,24 @@ def virtual_adapter_ip():
     """
     ips = virtual_adapter_ips()
     return ips[0] if ips else ""
+
+
+def _own_virtual_ips(current=""):
+    """本机**全部**虚拟地址，用来把自己从成员发现里彻底排除。
+
+    只排除 `virtual_adapter_ip()`（第一个）是不够的：强杀重启后残留的旧
+    wintun 网卡还在地址表里，旧 IP 会以"远端成员"的身份混进 tracker，
+    而且 `_round` 每轮无条件刷新 confirmed / 清零 ping_fail，让它变成
+    永远不会老化的僵尸成员（界面上就是「两个我」）。
+    GetIpAddrTable 是纯 ctypes 调用，微秒级，每轮取一次不构成负担。
+    """
+    try:
+        ips = set(virtual_adapter_ips())
+    except Exception:
+        ips = set()
+    if current:
+        ips.add(current)
+    return ips
 
 
 def _resolve_name(ip, timeout=0.6):
@@ -1339,10 +1368,11 @@ class MemberTracker:
                 pass                    # 单轮失败不影响下一轮
             self._wake.wait(self.PING_INTERVAL)
 
-    def _hint_ips(self):
+    def _hint_ips(self, own_ips=None):
         """把所有「第三方到场线索」合成一个 IP 集合（见 _round 的注释）。
 
         单个线索抛异常只丢它自己——不能让一条辅助通道把整轮扫描带崩。
+        `own_ips` 由 `_round` 一次算好后传入，避免每轮重复枚举地址表。
         """
         ips = set()
         for hint in self._alive_hints:
@@ -1350,7 +1380,8 @@ class MemberTracker:
                 ips.update(hint() or ())
             except Exception:
                 pass
-        ips.discard(self._my_ip)
+        own = own_ips if own_ips is not None else _own_virtual_ips(self._my_ip)
+        ips -= own
         return ips
 
     def _apply_quality(self):
@@ -1394,11 +1425,15 @@ class MemberTracker:
         #    根因都是只认 a：云盘轮询的 peer 列表同样来自本跟踪器，跟踪器
         #    看不见人，文件就永远拉不回来。b 是应用层补丁，c 是根治。
         #    三条并集：任何一条算数，任何一条坏掉都还有另外两条。
+        # 本机可能有多个虚拟地址（残留旧网卡）。ARP 那条通道不经过
+        # _hint_ips，必须在这里单独排掉，否则旧 IP 会以"另一个我"的身份
+        # 每轮被刷新成永生僵尸成员。
+        own_ips = _own_virtual_ips(self._my_ip)
         try:
-            arp = set(list_members(self._my_ip))
+            arp = set(list_members(self._my_ip)) - own_ips
         except Exception:
             arp = set()
-        hinted = self._hint_ips()
+        hinted = self._hint_ips(own_ips)
         with self._lock:
             for ip in (arp | hinted):
                 p = self._peers.setdefault(

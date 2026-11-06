@@ -649,6 +649,52 @@ def run(out_path):
     except Exception as exc:
         check("main.py 静态守卫", False, f"异常: {exc}")
 
+    # ---------- H. 清理器不能删掉自己（v1.3.1 回归绊线） ----------
+    # 用户报：「用软件里清 C 盘功能之后再联机会显示联机组件缺失，把软件
+    # 退掉再开又没问题了」。根因：temp_files 以 contents 模式清空 %Temp%，
+    # 把当前 onefile 进程的 `%Temp%\_MEIxxxxxx`（sys._MEIPASS）一起删了；
+    # 内置 easytier / accel / ffmpeg 资源是**进程启动时的一次性解压快照**，
+    # 同进程内无法重建，所以退出重开才恢复。删错的是系统临时目录，属于
+    # 不可逆动作，必须钉死。
+    try:
+        import tempfile as _tf
+        box = _tf.mkdtemp(prefix="yuhub_meipass_selftest_")
+        mei = os.path.join(box, "_MEI123456")
+        os.makedirs(mei)
+        os.makedirs(os.path.join(box, "ordinary_dir"))
+        with open(os.path.join(box, "junk.tmp"), "w", encoding="utf-8") as fp:
+            fp.write("x")
+        saved = getattr(sys, "_MEIPASS", None)
+        sys._MEIPASS = mei
+        try:
+            tgt = cl.T(box)                    # contents 模式
+            plan = cl._contents_plan(tgt)
+            names = [os.path.basename(c) for _r, ch in plan for c in ch]
+            check("★ contents 模式跳过当前进程 _MEIPASS",
+                  "_MEI123456" not in names, names)
+            check("★ 其它临时项照常清理（没把整条规则废掉）",
+                  "junk.tmp" in names and "ordinary_dir" in names, names)
+            check("★ _root_blocked 只拦 _MEIPASS 本身，不拦 %Temp% 父目录",
+                  cl._root_blocked(mei) and not cl._root_blocked(box))
+            check("★ _MEIPASS 内部条目也受保护",
+                  cl._is_self_meipass(
+                      os.path.join(mei, "easytier", "easytier-core.exe")))
+            check("★ 别的 _MEI 残留目录仍可清理（只护当前进程）",
+                  not cl._is_self_meipass(os.path.join(box, "_MEI999999")))
+            ent_hits = cl._resolve_entries(cl.T(box, "*", mode="entries"))
+            check("★ entries 模式同样跳过 _MEIPASS 子项",
+                  not any(cl._is_self_meipass(p) for p in ent_hits),
+                  "entries 命中 %d 项" % len(ent_hits))
+        finally:
+            if saved is None:
+                del sys._MEIPASS
+            else:
+                sys._MEIPASS = saved
+        import shutil as _sh
+        _sh.rmtree(box, ignore_errors=True)
+    except Exception as exc:
+        check("★ 清理器自我保护", False, f"异常: {exc!r}")
+
     result = {
         "ok": all(c["ok"] for c in checks),
         "total": len(checks),

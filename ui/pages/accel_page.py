@@ -32,6 +32,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
+
+import winproc
 
 from PySide6.QtCore import QByteArray, QPointF, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import (
@@ -171,6 +175,12 @@ def run_framework(args, timeout=10):
     p = framework_path()
     if not os.path.isfile(p):
         return (-1, "", "框架未安装")
+    # 任何**改状态**的命令（gen-ca / trust / untrust / hosts-* / serve）
+    # 都可能换掉根证书，缓存必须当场作废 —— 否则紧接着读状态会拿到旧指纹，
+    # 界面就会在"刚信任完"之后显示成"未信任"。放在这个唯一入口里，
+    # 将来新增命令也不会漏。
+    if args and str(args[0]) not in ("status",):
+        _invalidate_status_cache()
     try:
         r = subprocess.run(
             [p] + list(args), capture_output=True, timeout=timeout,
@@ -182,21 +192,64 @@ def run_framework(args, timeout=10):
         return (-1, "", str(exc))
 
 
-def framework_status():
+#: 证书状态的缓存时长（秒）。
+#:
+#: `framework_status()` 是**起一个 11MB 的原生进程**去问状态，实测约 100ms；
+#: 而它挂在"进加速页 / 打开设置页"的路径上 —— 不缓存就是每次切页卡 0.1 秒。
+#: 敢缓存的理由：证书信任状态只会被**我们自己**的按钮改变（安装 / 信任 /
+#: 取消信任 / 卸载），而所有改状态的动作都走 `run_framework`，那里会立刻作废
+#: 缓存（见上）。用户绕过 Yuhub 去证书管理器手动删证书这种外部操作，最坏
+#: 多显示 _STATUS_TTL 秒旧状态，且「刷新」按钮一律强制重读。
+_STATUS_TTL = 30.0
+_status_cache = {"t": 0.0, "v": None}
+#: 每次作废缓存 +1。后台预热线程探测要 ~115ms，期间用户可能点了「信任证书」；
+#: 拿 gen 比对一下，就能避免预热线程把**旧状态**写回去覆盖新状态。
+_status_gen = 0
+#: 后台预热与 GUI 线程可能同时想读状态。串行化 + 拿到锁后复查缓存，
+#: 避免"用户刚点进加速页、预热线程又起一个 11MB 进程"这种撞车。
+_status_lock = threading.Lock()
+
+
+def _invalidate_status_cache():
+    global _status_gen
+    _status_cache["t"] = 0.0
+    _status_cache["v"] = None
+    _status_gen += 1
+
+
+def framework_status(force=False):
     """`status --json` 解析成 dict（ca / thumbprint / trusted / expires_in_days）。
 
     拿不到（框架缺失、输出不合法）返回 None —— 调用方必须能区分
-    "没读出来"和"读出来是未信任"。
+    "没读出来"和"读出来是未信任"。命中的是缓存时返回副本，调用方随便改。
     """
-    _rc, out, _err = run_framework(["status", "--json"], timeout=8)
-    for line in (out or "").splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except ValueError:
-                return None
-    return None
+    now = time.monotonic()
+    if (not force and _status_cache["v"] is not None
+            and now - _status_cache["t"] < _STATUS_TTL):
+        return dict(_status_cache["v"])
+    with _status_lock:
+        # 等锁期间另一个线程（启动预热 / 另一次切页）可能已经填好了缓存
+        if (not force and _status_cache["v"] is not None
+                and now - _status_cache["t"] < _STATUS_TTL):
+            return dict(_status_cache["v"])
+        gen = _status_gen
+        _rc, out, _err = run_framework(["status", "--json"], timeout=8)
+        found = None
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    found = json.loads(line)
+                except ValueError:
+                    found = None
+                break
+        # 读失败**不写缓存**：一次瞬时失败不该被记住 30 秒（那会把"没读到"
+        # 固化成一整段时间的错状态）。探测期间状态被改过（gen 变了）也不写，
+        # 免得后台预热的旧结果盖掉用户刚做的新状态。
+        if found is not None and gen == _status_gen:
+            _status_cache["t"] = time.monotonic()
+            _status_cache["v"] = dict(found)
+        return found
 
 
 def _sha256(path):
@@ -288,15 +341,14 @@ def framework_running_by_name():
     为什么不能只看 pid 文件：pid 文件可能被安全软件/清垃圾工具删掉，而内核还
     活得好好的。判活的判据一旦漏掉这种情况，"脏退自愈"会在**内核正常运行**时
     去清 hosts，直接把正在用的加速打断 —— 那比不修还糟。
+
+    🔴 实现从 `tasklist` 换成了 Toolhelp 快照（v1.3 性能修复）：
+    这条判活挂在 `_refresh_toolbar` 上，而后者**每次进页面都要跑一遍**；
+    `tasklist` 单次 83 ms（起进程 + 控制台子系统 + 遍历），Toolhelp 读同一张
+    表只要 3.5 ms（实测，见 winproc.py）。语义完全一致：都按**映像名**比对，
+    大小写不敏感。读不到时仍然返回 False（与"没在跑"同义，调用方本就要能容忍）。
     """
-    try:
-        r = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq " + _FRAMEWORK_EXE, "/NH"],
-            capture_output=True, timeout=8, creationflags=_CREATE_NO_WINDOW)
-        out = (r.stdout or b"").decode("utf-8", "replace").lower()
-        return _FRAMEWORK_EXE.lower() in out
-    except Exception:
-        return False
+    return winproc.running_by_name(_FRAMEWORK_EXE)
 
 
 def install_framework(progress=None):
@@ -306,11 +358,15 @@ def install_framework(progress=None):
     避免两处各写一份复制 + gen-ca 的顺序与报错文案。
     """
     src = _embedded_framework_path()
-    if src is None:
+    if src is None and not framework_installed():
         return False, "本体里没有内嵌加速框架，请重新安装 Yuhub"
+    # 内置源被清掉（`_MEIPASS` 只在启动时解压一次）但落点已就位时，
+    # 跳过复制、照常往下跑 gen-ca —— 别误报"请重新安装 Yuhub"，
+    # 也别把证书生成这一步一起跳过。
     try:
         os.makedirs(framework_dir(), exist_ok=True)
-        shutil.copy2(src, framework_path())
+        if src is not None:
+            shutil.copy2(src, framework_path())
     except OSError as exc:
         return False, "写入失败：%s" % exc
     if progress:
@@ -835,9 +891,12 @@ class AccelPage(BasePage):
         """跑框架的一次性命令（委托模块级实现，见文件上方 run_framework）。"""
         return run_framework(args, timeout=timeout)
 
-    def _ca_status(self):
-        """读框架报的证书状态（`status --json`）。拿不到返回 None。"""
-        return framework_status()
+    def _ca_status(self, force=False):
+        """读框架报的证书状态（`status --json`）。拿不到返回 None。
+
+        `force=True` 绕过缓存 —— 「刷新」按钮和用户操作后的重读都要走它。
+        """
+        return framework_status(force=force)
 
     # ------------------------------------------------------------ 构建
     def _build_content(self):
@@ -902,7 +961,13 @@ class AccelPage(BasePage):
         self._refresh_toolbar()
 
     # ------------------------------------------------------------ 刷新
-    def _refresh_toolbar(self):
+    def _refresh_toolbar(self, force=False):
+        """重读框架/证书状态并重画工具条。
+
+        `force` 只作用于**证书状态**的缓存（见 framework_status 的说明）：
+        切页进来用缓存即可，用户点「刷新」或刚做完安装/信任动作时必须强制。
+        """
+        self._last_refresh = time.monotonic()
         # 「启动中」态由 _start_accel 自己绘制、由 _on_accel_started 收尾，
         # 刷新不打断它（否则会把"启动中…"覆盖回旧状态）
         if getattr(self, "_state", "") == "starting":
@@ -923,7 +988,7 @@ class AccelPage(BasePage):
                 self.toast("加速框架已自动就位（内嵌版 %s，随本体自带）"
                            % _FRAMEWORK_SIZE)
         self._framework = self._framework_installed()
-        self._ca = self._ca_status() if self._framework else None
+        self._ca = self._ca_status(force) if self._framework else None
         trusted = bool(self._ca and self._ca.get("trusted"))
         running = self._accel_pid()
 
@@ -938,7 +1003,7 @@ class AccelPage(BasePage):
             if did:
                 self.toast(dmsg)
                 # hosts 刚被我们改过，框架状态重读一次更准
-                self._ca = self._ca_status() if self._framework else self._ca
+                self._ca = self._ca_status(force) if self._framework else self._ca
                 trusted = bool(self._ca and self._ca.get("trusted"))
 
         n = len(self._selected)
@@ -1223,12 +1288,24 @@ class AccelPage(BasePage):
         self._refresh_toolbar()
 
     def _on_refresh(self):
-        self._refresh_toolbar()
+        # 用户主动点「刷新」= 我要现在这一刻的真状态，绕过缓存
+        self._refresh_toolbar(force=True)
         self.toast("已刷新框架与证书状态")
 
     def on_shown(self):
         self.refresh_state()
 
-    def refresh_state(self):
-        """重读框架/证书状态并刷新工具条（切页进来时、以及设置页修复完之后）。"""
-        self._refresh_toolbar()
+    def refresh_state(self, force=False):
+        """重读框架/证书状态并刷新工具条（切页进来时、以及设置页修复完之后）。
+
+        构造页面时 `_build_content` 末尾已经刷过一次，`switch_page` 紧接着
+        又会调 `on_shown` → 一进页面连刷两遍（第二遍虽命中证书缓存，但仍要
+        枚举一遍进程表 + 重设十几个控件的文字）。1 秒内的重复刷新直接跳过：
+        这两次之间状态不可能变，用户切回来（>1s）仍照常刷新。
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_refresh", 0.0)
+        if not force and now - last < 1.0:
+            return
+        self._last_refresh = now
+        self._refresh_toolbar(force=force)

@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 
-from PySide6.QtCore import Qt, QSettings, QStandardPaths, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QSettings, QStandardPaths, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -43,6 +43,55 @@ import screenshare
 from .. import theme
 from ..widgets import ghost_button, primary_button
 from .base_page import BasePage
+
+
+class _ElidedLabel(QLabel):
+    """按可用宽度显示省略号的标签（长文件名用）。
+
+    为什么不能用 `setWordWrap(True)`：分享行是 `setFixedHeight(36)` 的细长条，
+    换行会把第二行顶出固定高度直接裁掉。也不能只写死一个字符数上限 ——
+    中文/英文宽度差一倍，右栏宽度还会随窗口变。所以按**当前控件宽度**
+    用 QFontMetrics 现场算，窗口拉伸时实时多显示一点。
+
+    全名永远留在 tooltip 里（见 `_make_share_row`），截断只影响观感、不丢信息。
+    """
+
+    def __init__(self, full, parent=None):
+        super().__init__(full, parent)
+        self._full = str(full or "")
+        self.setMinimumWidth(0)
+        # Ignored = 允许布局把它压到任意窄。QLabel 默认的 minimumSizeHint
+        # 等于**整行文本宽度**，长文件名会把 tag/size/按钮挤出可视区。
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._relabel()
+
+    def set_full(self, full):
+        self._full = str(full or "")
+        self.setToolTip(self._full)
+        self._relabel()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relabel()
+
+    def minimumSizeHint(self):
+        """名称再长也不许把行的最小宽撑起来。
+
+        `QSizePolicy.Ignored` 只影响 QBoxLayout 的**分配**，但页面外层的
+        `QScrollArea` 用了 `SetMinimumSize` 约束，会拿子控件的
+        minimumSizeHint 反推整页最小宽。不在这里压到 0，长文件名仍会
+        逼出一条横向滚动条（用户说「可以试着滚动」的正是它）。
+        """
+        return QSize(0, super().minimumSizeHint().height())
+
+    def _relabel(self):
+        if not self._full:
+            return
+        w = max(0, self.width() - 2)
+        txt = self.fontMetrics().elidedText(
+            self._full, Qt.ElideMiddle, w) if w > 0 else ""
+        if txt != self.text():
+            self.setText(txt)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +236,10 @@ class _DropZone(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
+        # 原生 WM_DROPFILES 通道的寻址标记（见 ui/nativedrop.py）：
+        # 提权运行时 Qt 的 OLE 拖放被 UIPI 挡掉，改走原生消息后，消息里只有
+        # 一个屏幕坐标，靠这个属性反查"落点是哪个控件"。
+        self.setProperty("yuhubNativeDropSink", True)
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumHeight(64)
         self.setToolTip("把文件 / 文件夹拖到这里分享；也可以直接点一下选文件")
@@ -266,6 +319,18 @@ class _DropZone(QFrame):
         if paths:
             self.dropped.emit(paths)
         event.acceptProposedAction()
+
+    def accept_native_paths(self, paths):
+        """原生 WM_DROPFILES 通道的入口（提权运行时只有它能收到）。
+
+        故意与 `dropEvent` 共用同一条出口（`dropped` 信号）：下游
+        `_on_share_paths` 完全不需要知道消息是从 OLE 还是从 WM_DROPFILES
+        进来的，两条通道的行为也就不会悄悄分叉。
+        """
+        self._set_active(False)
+        paths = [p for p in (paths or []) if p]
+        if paths:
+            self.dropped.emit(paths)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1022,7 +1087,11 @@ class LanPage(BasePage):
             "background: %s; border: none; border-radius: 2px;" % dot_color)
         h.addWidget(dot)
 
-        name = QLabel(entry["name"])
+        # 长文件名不能撑破这一行：QLabel 的 minimumSizeHint 是"整行文字宽度"，
+        # 250 字符的文件名会把右侧 tag/size/按钮推出卡片、逼出横向滚动条
+        # （用户报的「部分 UI 被挡住，可以试着滚动」）。用 _ElidedLabel
+        # 按可用宽度省略，全名仍在 tooltip 里。
+        name = _ElidedLabel(entry["name"])
         name.setToolTip(entry["name"])
         if entry.get("problem"):
             name.setStyleSheet(
@@ -1040,6 +1109,9 @@ class LanPage(BasePage):
             "font-size: 11px; color: %s; background: transparent; border: none;"
             % p["accent"])
         prog.setVisible(False)
+        # 下载进度文本（「100% · 1.2 MB / 3.4 MB」）同样别把行撑宽
+        prog.setMinimumWidth(0)
+        prog.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         h.addWidget(prog)
 
         tag = QLabel(entry["owner"])
@@ -2484,7 +2556,18 @@ class LanPage(BasePage):
                         "name": self._host_nick or self._current_nickname(),
                         "self": True, "game": my_game, "port": my_port,
                         "ss": 0}]          # 自己那行的「看屏幕」没有意义
+            # 🔴 用户报「怎么有两个我」：进程被强杀/重进房间后常残留一块旧
+            # wintun 网卡，本机同时持有 .2（旧）与 .3（在用）。界面只把
+            # virtual_adapter_ips()[0] 当"我"并硬编码成第一行，旧地址却仍
+            # 经由 ARP / core 权威表 / 昵称信标三条通道进 MemberTracker；
+            # core 的 hostname 又把旧地址兜底成同一个昵称，于是渲染出第二行
+            # 「BRDXSM .2 | 中继」。自己只由上面 self=True 那一行代表即可。
+            # ⚠️ 必须按 **IP** 过滤，不能按名字：两台机器恰好同名（默认
+            # 计算机名）时按名字去重会把真正的队友误删。
+            own_ips = set(all_ips)
             for m in members:
+                if m["ip"] in own_ips:
+                    continue
                 entries.append({
                     "ip": m["ip"],
                     "name": m.get("name") or "",

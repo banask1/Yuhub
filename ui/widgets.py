@@ -3,7 +3,6 @@
 from PySide6.QtCore import (
     Qt,
     Signal,
-    QAbstractAnimation,
     QEvent,
     QPoint,
     QPointF,
@@ -11,7 +10,6 @@ from PySide6.QtCore import (
     QRect,
     QRectF,
     QTimer,
-    QVariantAnimation,
 )
 from PySide6.QtGui import QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
@@ -28,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from . import glass
 from . import motion
+from . import motion_engine as anim
 from . import theme
 
 
@@ -45,7 +44,15 @@ class ToggleSwitch(QAbstractButton):
 
     KNOB_MARGIN = 3.0       # 静止时滑块与轨道内缘的间距（上下左右一致 → 正好居中）
     STRETCH_MAX = 0.55      # 拉伸时额外增加的宽度 = 直径 × 这个系数（会被边界钳制）
-    STRETCH_REF = 0.08      # 一帧位移达到这个量 = 拉伸拉满（60fps 下的峰值速度）
+    # 一帧位移达到这个量 = 拉伸拉满（60fps 下的峰值速度）。保留它是因为
+    # 自检与调参都按"每帧位移"的历史口径来读；下面再由它换算出速度口径。
+    STRETCH_REF = 0.08
+    #: 拉伸拉满所需的**速度**（单位/秒）。v1.3.0 换成物理弹簧后，拉伸依据
+    #: 从"帧位移"改成"速度"—— 帧位移是给离散帧凑的近似，帧率一变幅度就变。
+    #: 取值 = SPRING_JELLY 走完 0→1 行程的**峰值速度**（数值积分实测 22.3/s，
+    #: 见 motion.SPRING_JELLY 上方的表格）：这样"最满的拉伸"仍然正好落在
+    #: 滑块冲得最快的那一帧，与旧观感一致。
+    STRETCH_VEL = 22.0
     PRESS_SCALE = 0.20      # 按下时直径放大的比例
 
     def __init__(self, checked=False, parent=None):
@@ -59,22 +66,17 @@ class ToggleSwitch(QAbstractButton):
         self._stretch_dir = 1.0    # +1 向右、-1 向左（只记方向，供自检/调试）
         self._press = 0.0          # 0~1，按下进度
 
-        self._anim = QVariantAnimation(self)
-        # 血泪：这里原来只有 setDuration(150)、**没有 setEasingCurve** ——
-        # QVariantAnimation 不设曲线时是 Linear（匀速），滑块走得"机械"。
-        # 现在是弹簧：冲过目标再弹回，滑块是"撞"到另一头的。
-        self._anim.setDuration(motion.SWITCH)
-        self._anim.setEasingCurve(motion.curve(motion.CURVE_SPRING))
-        self._anim.valueChanged.connect(self._on_anim)
-
-        self._press_anim = QVariantAnimation(self)
-        self._press_anim.setDuration(motion.HOVER)
-        self._press_anim.setEasingCurve(motion.curve(motion.CURVE_SPRING_SOFT))
-        self._press_anim.valueChanged.connect(self._on_press)
+        # v1.3.0：从 QVariantAnimation（固定时长 + 贝塞尔"拟"弹簧）换成
+        # 物理弹簧。形状几乎不变（预设刻意对齐 16% 过冲 / ~280ms），换来的
+        # 是**可打断**：连点时滑块带着速度接力，不会停住再从头走一遍。
+        self._spring = anim.Spring(self._offset, motion.SPRING_JELLY,
+                                   on_change=self._on_spring_value)
+        self._press_spring = anim.Spring(0.0, motion.SPRING_SOFT,
+                                         on_change=self._on_press_value)
 
         self.toggled.connect(self._on_toggled)
-        self.pressed.connect(lambda: self._animate_press(1.0))
-        self.released.connect(lambda: self._animate_press(0.0))
+        self.pressed.connect(lambda: self._press_spring.to(1.0))
+        self.released.connect(lambda: self._press_spring.to(0.0))
         theme.bus.changed.connect(lambda _: self.update())
 
     # -- 形状 -----------------------------------------------------------------
@@ -141,35 +143,28 @@ class ToggleSwitch(QAbstractButton):
 
     # -- 动画 -----------------------------------------------------------------
     def _on_toggled(self, checked):
-        self._anim.stop()
-        self._anim.setStartValue(self._offset)
-        self._anim.setEndValue(1.0 if checked else 0.0)
-        self._anim.start()
+        self._spring.to(1.0 if checked else 0.0)
 
-    def _on_anim(self, value):
-        """逐帧驱动。顺带把"这一帧走了多远"换算成拉伸量。
+    def _on_spring_value(self, value, velocity):
+        """逐帧驱动。拉伸量由**速度**换算，不再用"这一帧走了多远"。
 
-        为什么用帧位移而不是时间导数：QVariantAnimation 给的本来就是离散帧，
-        `value - _offset` 就是这一帧的实际位移，直接除一个参考值即可 ——
-        不需要再引一阶差分、也不会因为帧率抖动而算飞。
+        旧写法（`delta / STRETCH_REF`）是给 QVariantAnimation 的离散帧凑的
+        近似：帧率一变（16ms → 33ms），同一段动画的峰值拉伸就跟着变，120Hz
+        屏上几乎看不出果冻。物理弹簧直接给速度，与帧率无关；而且弹簧本来
+        就是靠速度产生过冲的，两者天然同步 —— 拉伸最满的时刻正好是滑块
+        冲得最快的那一帧。
         """
-        value = float(value)
-        delta = value - self._offset
-        self._offset = value
-        if abs(delta) > 1e-4:
-            self._stretch_dir = 1.0 if delta > 0 else -1.0
-            self._stretch = min(1.0, abs(delta) / self.STRETCH_REF)
+        self._offset = float(value)
+        v = float(velocity)
+        av = abs(v)
+        if av > 1e-3:
+            self._stretch_dir = 1.0 if v > 0 else -1.0
+            self._stretch = min(1.0, av / self.STRETCH_VEL)
         else:
             self._stretch = 0.0            # 收尾时自然归零，不会停在"半拉长"
         self.update()
 
-    def _animate_press(self, to):
-        self._press_anim.stop()
-        self._press_anim.setStartValue(self._press)
-        self._press_anim.setEndValue(float(to))
-        self._press_anim.start()
-
-    def _on_press(self, value):
+    def _on_press_value(self, value, _velocity):
         self._press = float(value)
         self.update()
 
@@ -286,13 +281,12 @@ class SegmentSlider(QWidget):
         self._t = 1.0              # 当前插值进度（弹簧会 >1 一点，= 果冻过冲）
         self._pending = True       # True = 还没落位
 
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(motion.PAGE_IN)
-        self._anim.setEasingCurve(motion.curve(motion.CURVE_SPRING_SOFT))
-        self._anim.valueChanged.connect(self._on_value)
+        # v1.3.0：从 QVariantAnimation 换成引擎的 Tween（同一个时钟、同一套
+        # 预算闸门）。这里**不**用物理弹簧：滑块是"在 from/to 之间插值进度"，
+        # 中途改选时 from 会被重新锚定到当前位置，弹簧的速度在新的位移尺度上
+        # 没有意义 —— 强行套用只会得到一段忽快忽慢的滑动。
+        self._tween = None
         # 跑完再落一次位：动画期间如果容器 resize 过，按钮几何已经变了
-        self._anim.finished.connect(lambda: self._place_now())
-
         host.installEventFilter(self)
         theme.bus.changed.connect(lambda _: self.update())
         # 压到所有按钮**下面**才不会被文字盖住（这是背景层，不是覆盖层）。
@@ -398,7 +392,7 @@ class SegmentSlider(QWidget):
         self.update()
 
     def _animating(self):
-        return self._anim.state() == QAbstractAnimation.State.Running
+        return self._tween is not None
 
     def _sync(self):
         if self.size() != self._host.size():
@@ -434,12 +428,17 @@ class SegmentSlider(QWidget):
             return
         self._from = self._current()
         self._to = r
-        self._anim.stop()
-        self._anim.setStartValue(0.0)
-        self._anim.setEndValue(1.0)
-        self._anim.start()
+        self._tween = anim.Tween(0.0, 1.0, motion.PAGE_IN,
+                                 easing=motion.CURVE_SPRING_SOFT,
+                                 on_change=self._on_value,
+                                 on_done=self._on_tween_done)
+        self._tween.start()
 
-    def _on_value(self, value):
+    def _on_tween_done(self):
+        self._tween = None
+        self._place_now()        # 跑完再落一次位（见构造处的说明）
+
+    def _on_value(self, value, _velocity=0.0):
         self._t = float(value)
         self.update()
 
@@ -1243,6 +1242,8 @@ class SpecCell(QFrame):
     def _apply_tint(self):
         p = theme.current()
         color = p.get(self._tint_key, p["accent"])
+        # 主题可能换掉字体族/字号（QSS 里带 font-family）→ 字号自适应要重算
+        self._fit_key = None
         self._tile.setStyleSheet(
             f"QFrame {{ background: {color}; border: none; border-radius: 4px; }}"
         )
@@ -1259,23 +1260,44 @@ class SpecCell(QFrame):
         self._fit_value_font()
 
     def _fit_value_font(self):
-        """主值一行放下：文字比当前格子宽就逐级缩小像素字号（最低 9px）。
+        """主值一行放下：文字比当前格子宽就逐级缩小像素字号（最低 8px）。
 
         用户要求"文字过长就缩小字体，保证在一行能显示所有字"。
         在 set_value 和 resizeEvent 里都会触发——首次填充时布局还没定，
         真正的宽度要等 resizeEvent 才准。
+
+        ⚠️ "结论没变就直接返回"这个判断是性能必需（v1.3 修复）：
+        拖一次窗口边框会连发几十次 resizeEvent，而每次都会
+          · 逐级 new 一个 QFontMetrics 量宽度（最多 7 次）；
+          · **无条件** setFont() —— 它会触发样式重解 + 布局失效 + 重绘。
+        后者是"拖窗口边缘发涩"的主要来源：5 个格子 × 每帧一次 setFont，
+        等于每帧把整块面板重排一遍。文字与可用宽度都没变时，上次算出的
+        字号仍然成立，跳过即可（结论完全一致，不是近似）。
         """
         text = self._value.text()
         if not text:
             return
-        from PySide6.QtGui import QFontMetrics
         avail = max(30.0, self._value.width() - 2)
+        key = (text, int(avail))
+        if key == getattr(self, "_fit_key", None):
+            return
+        from PySide6.QtGui import QFontMetrics
         font = self._value.font()
-        for px in range(self._value_base_px, self._value_min_px - 1, -1):
-            font.setPixelSize(px)
+        current = font.pixelSize()      # ⚠️ 必须在下面改 font 之前取
+        px = self._value_min_px
+        for candidate in range(self._value_base_px,
+                               self._value_min_px - 1, -1):
+            font.setPixelSize(candidate)
             if QFontMetrics(font).horizontalAdvance(text) <= avail:
+                px = candidate
                 break
-        self._value.setFont(font)
+        self._fit_key = key
+        # 只有"标签上真正生效的字号"需要变时才 setFont。注意比的是
+        # current（标签当前值）而不是 font.pixelSize()：循环跑完后 font
+        # 一定被改成最后一个候选值，拿它比会恒等、永远不设字体。
+        if current != px:
+            font.setPixelSize(px)
+            self._value.setFont(font)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

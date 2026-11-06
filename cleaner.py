@@ -65,6 +65,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -584,6 +585,36 @@ def _iter_matches(root_dir: str, tgt: Target, dyn_excl: list[str]):
 _CRITICAL_CACHE = None
 
 
+def _self_meipass():
+    """当前 PyInstaller onefile 进程的解压目录（源码态返回 None）。
+
+    为什么清理器必须认识它：`Yuhub.spec` 是单 EXE onefile，运行期把
+    `datas`（easytier / accel / ffmpeg / 图标…）解压到 `%Temp%\\_MEIxxxxxx`，
+    而 `temp_files` 规则恰好以 contents 模式清空 `%Temp%`。`sys._MEIPASS`
+    是**进程启动时的一次性快照**，同进程内无法重建 —— 一旦被删，联机页
+    就报「内置 EasyTier 资源缺失」，退出重开才好（用户报的正是这个）。
+    """
+    raw = getattr(sys, "_MEIPASS", "")
+    if not raw:
+        return None
+    try:
+        return os.path.normcase(os.path.abspath(raw))
+    except Exception:
+        return None
+
+
+def _is_self_meipass(path) -> bool:
+    """path 是不是当前进程的内置资源目录（或其内部条目）——是就不能删。"""
+    d = _self_meipass()
+    if not d:
+        return False
+    try:
+        p = os.path.normcase(os.path.abspath(str(path)))
+    except Exception:
+        return False
+    return p == d or p.startswith(d + os.sep)
+
+
 def _critical_roots() -> set:
     """关键目录集合（进程生命周期内不变，缓存一次）。"""
     global _CRITICAL_CACHE
@@ -610,7 +641,14 @@ def _critical_roots() -> set:
 
 
 def _root_blocked(root_dir: str) -> bool:
-    """contents 模式下该根是否被安全护栏拒绝。"""
+    """contents 模式下该根是否被安全护栏拒绝。
+
+    ⚠️ 只判断"root 恰好就是 _MEIPASS"，**不能**把 _MEIPASS 塞进
+    `_critical_roots()` 后拿去匹配 `%Temp%` 的父链 —— 那会让整条
+    `temp_files` 规则失效。子项级排除在 `_contents_plan` 里做。
+    """
+    if _is_self_meipass(root_dir):
+        return True
     return os.path.normpath(root_dir).lower() in _critical_roots()
 
 
@@ -1487,7 +1525,8 @@ def _resolve_entries(tgt: Target) -> list[str]:
             dyn.append(v)
         if skip_root:
             continue
-        out.extend(_iter_matches(root_dir, tgt, dyn))
+        out.extend(p for p in _iter_matches(root_dir, tgt, dyn)
+                   if not _is_self_meipass(p))
     return out
 
 
@@ -1526,8 +1565,11 @@ def _contents_plan(tgt: Target, cancel=None, notes=None) -> list:
             if notes is not None:
                 notes.append("无法列出 %s（%s）" % (root_dir, exc))
             continue
+        # 当前进程的 _MEIPASS 是 `%Temp%` 下的一级子目录，contents 模式会
+        # 把它连同一堆内置资源一起删掉。子项级排除，不动 root 护栏。
         children = [os.path.join(root_dir, n) for n in names
-                    if not _excluded_match(n, tgt.excluded, dyn)]
+                    if not _excluded_match(n, tgt.excluded, dyn)
+                    and not _is_self_meipass(os.path.join(root_dir, n))]
         plan.append((root_dir, children))
     return plan
 

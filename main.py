@@ -490,6 +490,22 @@ def main():
                 pass
             sys.exit(5)
 
+    # ---- motion-selftest 模式：无窗口自检「帧驱动动画引擎」 ----
+    # 用法： Yuhub.exe --motion-selftest <结果json路径>
+    # 引擎坏掉不会报错，只会"手感变了"：弹簧不过冲、收敛不了、改目标丢速度、
+    # 后台还在烧 CPU。这些只能靠断言钉死，而且必须在**冻结态**跑一遍 ——
+    # 表现是"源码态全绿、打包后卡顿"的那种问题，只有 exe 里才测得出。
+    if "--motion-selftest" in sys.argv:
+        idx = sys.argv.index("--motion-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import motion_selftest
+            sys.exit(motion_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
     # ---- theme-selftest 模式：无窗口自检主题包系统 ----
     # 用法： Yuhub.exe --theme-selftest <结果json路径>
     # 主题包涉及"文档目录创建 / 扫描 / 色板合并 / QSS 生成 / 切换持久化"，
@@ -537,6 +553,52 @@ def main():
                     _fh.write(_tb.format_exc())
             except Exception:
                 pass
+            sys.exit(5)
+
+    # ---- lan-ui-selftest 模式：无窗口自检联机页三个回归 ----
+    # 用法： Yuhub.exe --lan-ui-selftest <结果json路径>
+    # 「两个我」/ 清理后组件缺失 / 分享长文件名遮挡 —— 都不进真实房间，
+    # 只造离线页面与打桩，避免 UAC 与网络。
+    if "--lan-ui-selftest" in sys.argv:
+        idx = sys.argv.index("--lan-ui-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import lan_ui_selftest
+            sys.exit(lan_ui_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- winproc-selftest 模式：无窗口自检「按进程名判活」----
+    # 用法： Yuhub.exe --winproc-selftest <结果json路径>
+    # Toolhelp 结构体布局错位会静默导致"判活恒 False"，而它是加速页脏退
+    # 自愈的判据。自检会真枚举进程表并与 tasklist 交叉比对（不搞自洽比较）。
+    if "--winproc-selftest" in sys.argv:
+        idx = sys.argv.index("--winproc-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import winproc_selftest
+            sys.exit(winproc_selftest.run(rest[0]))
+        except Exception:
+            sys.exit(5)
+
+    # ---- nativedrop-selftest 模式：无窗口自检「临时云盘拖拽投放通道」 ----
+    # 用法： Yuhub.exe --nativedrop-selftest <结果json路径>
+    # 提权运行时 Qt 的 OLE 拖放会被 UIPI 挡掉，只能走原生 WM_DROPFILES。
+    # 这条链路**失效时什么都不发生**（没有报错、没有日志），外部脚本既造不出
+    # 完整性级别差异、也发不出真 HDROP，所以让 exe 自己在真窗口上投一次真消息。
+    if "--nativedrop-selftest" in sys.argv:
+        idx = sys.argv.index("--nativedrop-selftest")
+        rest = sys.argv[idx + 1:]
+        if not rest:
+            sys.exit(2)
+        try:
+            import nativedrop_selftest
+            sys.exit(nativedrop_selftest.run(rest[0]))
+        except Exception:
             sys.exit(5)
 
     # ---- apply-update 模式：替换自己的 exe 并重启（同样早返回） ----

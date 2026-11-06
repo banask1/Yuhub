@@ -1355,6 +1355,148 @@ def run_uninstall(app, silent=True, on_status=None, timeout=None):
         return False, f"启动失败：{e}", -1
 
 
+# ---------------------------------------------------------------------------
+# 阶段 2 辅助：等卸载器的整棵进程树
+# ---------------------------------------------------------------------------
+# ⚠️ 回归记录（2026-10-23 修复，v1.1 起存在）：`_wait_proc_tree` 的**定义**
+#    在 v1.1（提交 f53ac87）里被误删，只剩 run_uninstall 里的调用点 ——
+#    于是每次卸载都在 Popen 成功之后抛 NameError，被 run_uninstall 的
+#    `except Exception` 吞成「启动失败：name '_wait_proc_tree' is not
+#    defined」。现象：官方卸载程序其实被拉起来了，但 Yuhub 报失败、不等
+#    进程树、也不扫残留。uninstaller_selftest 对 run_uninstall 零覆盖，
+#    所以十三套自检一路全绿 —— 又是同一个失效模式。
+#    旧实现只等根进程 + 2 秒宽限（自己的 docstring 也承认是务实降级），
+#    本次按"等真正的进程树"重写。
+_SYNCHRONIZE = 0x00100000
+_TH32CS_SNAPPROCESS = 0x00000002
+#: 根进程等完之后，给后代进程的尾窗上限。不给无限等待：根进程退出后它的
+#: PID 可能被系统复用，若有无关新进程恰好复用了该 PID 当父 PID，无界轮询
+#: 会把一次正常卸载一直拖到 timeout（默认 10 分钟）上限。
+_WAIT_TAIL_SECONDS = 120.0
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    """Win32 PROCESSENTRY32W（Toolhelp 快照用）。
+
+    布局与 memopt.py 同款，其自检钉过：szExeFile 偏移 44、sizeof 568
+    （32 位进程跑会错位成 36）—— 手改字段顺序前先想清楚。
+    """
+
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),   # ULONG_PTR：64 位下 8 字节
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def _descendant_pids(root_pid):
+    """当前系统里 root_pid 的全部后代 PID（子、孙、曾孙都算）。
+
+    快照语义；枚举失败返回空列表，绝不抛异常。
+    """
+    root_pid = int(root_pid or 0)
+    if not IS_WIN or root_pid <= 0:
+        return []
+    k32 = ctypes.windll.kernel32
+    kids = {}
+    try:
+        snap = k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return []
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if not k32.Process32FirstW(snap, ctypes.byref(entry)):
+                return []
+            while True:
+                kids.setdefault(int(entry.th32ParentProcessID), []).append(
+                    int(entry.th32ProcessID))
+                if not k32.Process32NextW(snap, ctypes.byref(entry)):
+                    break
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:                                     # noqa: BLE001
+        return []
+    # 从 root 逐代下钻（BFS），seen 防环
+    out, seen = [], {root_pid}
+    frontier = [root_pid]
+    while frontier:
+        nxt = []
+        for parent in frontier:
+            for pid in kids.get(parent, ()):
+                if pid not in seen:
+                    seen.add(pid)
+                    out.append(pid)
+                    nxt.append(pid)
+        frontier = nxt
+    return out
+
+
+def _wait_pid_exit(pid, timeout_ms):
+    """等单个 PID 退出。打不开句柄（已退出 / 权限不足）就当它没了。"""
+    if not IS_WIN:
+        return
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(_SYNCHRONIZE, 0, int(pid))
+    if not h:
+        return
+    try:
+        k32.WaitForSingleObject(h, max(0, int(timeout_ms)))
+    finally:
+        k32.CloseHandle(h)
+
+
+def _wait_proc_tree(root_pid, timeout=None):
+    """等 root_pid 及其全部后代进程结束，再返回。
+
+    为什么必须等**进程树**而不是根进程：很多卸载器会 fork 一个子进程干活、
+    自己先退出，这时若立刻开始扫描残留，会把正在被卸载的文件误判成残留
+    （run_uninstall 的 docstring 记了同一件事）。
+
+    时序：
+      1. 等根进程退出，占满 timeout（默认 10 分钟 —— 用户可能要走卸载向导）；
+      2. 循环枚举后代并逐个等，**每轮重新枚举**（兜住卸载过程中新拉起的孙
+         进程），尾窗受 _WAIT_TAIL_SECONDS 与总 deadline 双重约束。
+
+    ⚠️ 两条本模块 ctypes 的老规矩（都踩过，别再犯）：
+      ① restype/argtypes 必须显式声明 —— 64 位下不声明 OpenProcess 的
+         restype，句柄高位被截成 32 位，要么打不开、要么等到错对象；
+      ② 任何一步失败都只降级不抛异常 —— 这里抛出去会被 run_uninstall 的
+         except 吞成"启动失败"，把一次正常卸载报成故障。
+    """
+    root_pid = int(root_pid or 0)
+    if not IS_WIN or root_pid <= 0:
+        return
+
+    deadline = time.monotonic() + float(timeout or 600)
+    # ① 根进程
+    _wait_pid_exit(root_pid, int((deadline - time.monotonic()) * 1000))
+
+    # ② 后代：每轮重新枚举，直到没有存活后代或尾窗用尽
+    tail = min(deadline, time.monotonic() + _WAIT_TAIL_SECONDS)
+    while True:
+        left = int((tail - time.monotonic()) * 1000)
+        if left <= 0:
+            break
+        kids = _descendant_pids(root_pid)
+        if not kids:
+            break
+        for pid in kids:
+            left = int((tail - time.monotonic()) * 1000)
+            if left <= 0:
+                break
+            _wait_pid_exit(pid, left)
+        # 全部打不开（权限）时这一轮是纯枚举，不加 Sleep 会空转烧一个核
+        time.sleep(0.5)
+
+
 def _is_safe_to_delete(path):
     """白名单校验：只允许删除用户数据区与程序安装区里的内容。
 

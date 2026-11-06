@@ -5,14 +5,19 @@
 ------------------
 这两条"自动扫描"是纯 UI 时序逻辑（QTimer + 线程 + 信号），
 在打包后**无法用外部脚本可靠驱动**：
-  * 本机 150% 缩放，外部脚本拿捏不准点击落点；
-  * 窗口是 `Qt.FramelessWindowHint + WA_TranslucentBackground`，
-    `PrintWindow` 渲染空白、`PostMessage` 用的是客户区坐标而截图是屏幕坐标；
-  * onefile 包还会 fork 子进程，PID 对不上。
+ * 本机 150% 缩放，外部脚本拿捏不准点击落点；
+ * 窗口是 `Qt.FramelessWindowHint + WA_TranslucentBackground`，
+   `PrintWindow` 渲染空白、`PostMessage` 用的是客户区坐标而截图是屏幕坐标；
+ * onefile 包还会 fork 子进程，PID 对不上。
 
 既然外部进不去，就让 exe **自己**在内部跑一遍真实对象，把观测到的
 时序事件写成 JSON 回传。跑的是真正的 `UninstallPage`，不是简化复刻，
 所以任何时序回归都会被抓到。
+
+另覆盖（2026-10-23 补）：**卸载链路的进程树等待**（检查 7）。
+`run_uninstall` 依赖的 `_wait_proc_tree` 定义曾在 v1.1 被误删、只剩调用点，
+每次卸载都在 Popen 成功后抛 NameError 被吞成"启动失败"，而本自检此前对
+`run_uninstall` **零覆盖**、十三套全绿。现在用真·假卸载器进程钉住它。
 
 用法：`Yuhub.exe --uninstall-selftest <结果json路径>`
 """
@@ -229,6 +234,21 @@ def run(out_file, timeout_sec=90):
     except Exception as exc:
         result["checks"].append({
             "name": "删除权限与只读属性",
+            "pass": False,
+            "detail": "检查失败：%r" % (exc,),
+        })
+
+    # ---------------- 检查 7：卸载链路必须等进程树（v1.1 回归绊线） ----------------
+    # 2026-10-23：`_wait_proc_tree` 的定义在 v1.1 被误删、只剩 run_uninstall
+    # 里的调用点 —— 每次卸载都在 Popen 成功后抛 NameError，被 except 吞成
+    # 「启动失败：name '_wait_proc_tree' is not defined」。官方卸载程序其实
+    # 被拉起了，但 Yuhub 报失败、不等进程树、也不扫残留。本自检此前对
+    # run_uninstall 零覆盖，所以一路全绿。断言细节见 _check_wait_proc_tree。
+    try:
+        _check_wait_proc_tree(result["checks"])
+    except Exception as exc:
+        result["checks"].append({
+            "name": "卸载链路等进程树（v1.1 回归绊线）",
             "pass": False,
             "detail": "检查失败：%r" % (exc,),
         })
@@ -628,6 +648,259 @@ def _check_delete_permissions(checks):
             "detail": "why=%r" % why[:160],
         })
         shutil.rmtree(acl_dir, ignore_errors=True)
+
+
+def _check_wait_proc_tree(checks):
+    """回归：卸载链路必须等到**整棵进程树**结束（v1.1 NameError 事故）。
+
+    事故回放：`_wait_proc_tree` 的定义在 v1.1（提交 f53ac87）里被误删，
+    只剩 `run_uninstall` 里的调用点 —— 每次卸载都在 Popen 成功之后抛
+    NameError，被 `except Exception` 吞成「启动失败：name '_wait_proc_tree'
+    is not defined」。官方卸载程序其实被拉起了，但 Yuhub 报失败、不等进程树、
+    也不扫残留。而本自检此前对 `run_uninstall` **零覆盖**，十三套全绿。
+
+    这里补的真断言（全部真调用、不打桩——打桩或自洽比较正是当年让它
+    一路绿灯的原因）：
+      ① 辅助函数还在（静态，抓"定义又被删了"）；
+      ② `run_uninstall` 端到端跑一个真·假卸载器，确认不再抛 NameError、
+         并且真的等到了它结束；
+      ③ fork 型（壳进程秒退、活儿在子进程里）—— 旧实现"等根 + 2 秒宽限"
+         恰恰在这个场景漏等，是这个函数存在的理由；
+      ④ deadline 不打穿（"无限等待"回归会把整套自检挂死，表现成超时，
+         比断言失败更难排查）。
+    """
+    import ctypes
+    import os
+    import subprocess
+    import time
+    import uninstaller as un
+
+    PING = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                        "System32", "ping.exe")
+
+    # ① 静态：三个辅助函数必须都在（抓"定义又被误删/改名"）
+    for fn in ("_wait_proc_tree", "_descendant_pids", "_wait_pid_exit"):
+        checks.append({
+            "name": "★ 卸载链路辅助函数存在：%s" % fn,
+            "pass": callable(getattr(un, fn, None)),
+            "detail": "callable=%s" % callable(getattr(un, fn, None)),
+        })
+
+    # 结构体布局：Toolhelp 枚举的地基。与 memopt_selftest 钉同一份布局
+    # （szExeFile 偏移 44 / sizeof 568）——32 位跑会错位成 36，
+    # 表现是"枚举得到一堆乱码 PPID"，极难定位。
+    st = getattr(un, "_PROCESSENTRY32W", None)
+    try:
+        layout_ok = (st is not None
+                     and ctypes.sizeof(st) == 568
+                     and st.szExeFile.offset == 44)
+        layout_detail = "sizeof=%s szExeFile.offset=%s" % (
+            ctypes.sizeof(st) if st is not None else None,
+            st.szExeFile.offset if st is not None else None)
+    except Exception as exc:                                # noqa: BLE001
+        layout_ok, layout_detail = False, repr(exc)
+    checks.append({
+        "name": "★ _PROCESSENTRY32W 布局正确（Toolhelp 依赖它）",
+        "pass": layout_ok,
+        "detail": layout_detail,
+    })
+
+    if not os.path.isfile(PING):
+        checks.append({
+            "name": "★ 卸载链路真调用（需要 ping.exe 当假卸载器）",
+            "pass": False,
+            "detail": "找不到 %s" % PING,
+        })
+        return
+
+    # ② run_uninstall 端到端：假卸载器 = ping（无子进程，活约 4 秒）。
+    #    走的是真实代码路径：build_uninstall_command → _split_cmdline →
+    #    Popen → _wait_proc_tree → poll。NameError 一旦回来，这里立刻红。
+    app = un.AppInfo(name="YuhubSelfTestFakeUninstaller",
+                     uninstall_string='"%s" -n 5 127.0.0.1' % PING)
+    t0 = time.monotonic()
+    ok, msg, code = un.run_uninstall(app, silent=False, timeout=60)
+    dt = time.monotonic() - t0
+    checks.append({
+        "name": "★ run_uninstall 端到端（v1.1 NameError 回归）",
+        "pass": ok is True and "not defined" not in str(msg),
+        "detail": "ok=%s code=%r msg=%r 耗时 %.1fs" % (ok, code, msg, dt),
+    })
+    checks.append({
+        "name": "★ run_uninstall 真的等到了卸载器结束",
+        "pass": ok is True and dt >= 3.0,
+        "detail": "假卸载器设计活约 4s，实测等待 %.1fs（明显偏小说明没等）" % dt,
+    })
+
+    # ③ fork 型：壳进程秒退、活儿全在子进程里。这是"等进程树"这个词的
+    #    真正含义，也是旧实现漏等的场景。
+    #
+    #    ⚠️ 断言刻意**只用品进程存活状态 + 耗时，不假设父子关系**：
+    #    实测个别环境（安全软件 / 控制台代理）会让孙进程的 PPID 落在壳的
+    #    进程树之外，依赖枚举的断言会误红。而"等之前活着、等完之后死了、
+    #    耗时覆盖子进程寿命"三条已经能把回归说全 —— 枚举一旦坏掉（等不到
+    #    东西），耗时断言当场就红，覆盖并不因此变弱。
+    root, child_pid = _spawn_fork_uninstaller(PING, seconds=4)
+    if root is None:
+        # 只在壳进程确实拉不起来时跳过（与⑥同一惯例）：主回归已被①②覆盖
+        checks.append({
+            "name": "★ fork 型卸载器（壳秒退/子干完）能等到底",
+            "pass": True,
+            "detail": "本机拉不起壳进程，跳过；①②两项已覆盖主回归",
+        })
+    else:
+        try:
+            root.wait(timeout=30)
+            # 前置断言：开始等之前子进程必须真的活着。没有这一条，
+            # "耗时 >= 3s"可能是等了个别的什么东西，绿灯不可信。
+            pre_alive = _pid_alive(child_pid) if child_pid else None
+            checks.append({
+                "name": "★ fork 型：开始等待前子进程确实活着",
+                "pass": pre_alive is not False,
+                "detail": "等待前子进程存活=%s（False 说明假卸载器没真正干活，"
+                          "后面的耗时断言失去意义）" % pre_alive,
+            })
+            t1 = time.monotonic()
+            un._wait_proc_tree(root.pid, timeout=60)
+            dt1 = time.monotonic() - t1
+            if child_pid:
+                alive_after = _pid_alive(child_pid)
+                waited_ok = (dt1 >= 3.0) and alive_after is False
+                tail = "等完子进程仍存活=%s" % alive_after
+            else:
+                waited_ok = False
+                tail = "没取到子进程 pid，无法判定（视为失败，不装没测到）"
+            checks.append({
+                "name": "★ fork 型：等待覆盖子进程的整个生命周期",
+                "pass": waited_ok,
+                "detail": "子进程设计活约 3s，实测等待 %.1fs；%s" % (dt1, tail),
+            })
+        finally:
+            if child_pid:
+                _kill_pid(child_pid)      # 断言真失败时收尸，别漏 ping
+
+    # ④ deadline 不打穿：timeout=1 必须几秒内返回。
+    proc = subprocess.Popen([PING, "-n", "40", "127.0.0.1"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=0x08000000)
+    try:
+        t2 = time.monotonic()
+        un._wait_proc_tree(proc.pid, timeout=1)
+        dt2 = time.monotonic() - t2
+        checks.append({
+            "name": "★ _wait_proc_tree 受 timeout 约束（不会无限等）",
+            "pass": dt2 <= 4.0,
+            "detail": "timeout=1s，实测 %.1fs 返回" % dt2,
+        })
+    finally:
+        _kill_pid(proc.pid)
+        try:
+            proc.wait(timeout=10)
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+def _spawn_fork_uninstaller(ping_exe, seconds=4):
+    """拉起一个"fork 型卸载器"：壳进程拉起子进程后自己立刻退出。
+
+    返回 (壳进程 Popen, 子进程 PID 或 None)；壳拉不起来返回 (None, None)。
+    子进程 PID 经**临时文件**回传而不是管道 —— 壳一退出，管道另一头只剩
+    子进程还持有，readline 的阻塞行为两条路径不一致，文件则没有这个问题。
+    """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import uninstaller as un
+
+    n = int(seconds) + 1        # ping 的 -n：约 (n-1) 秒
+    pidfile = os.path.join(tempfile.gettempdir(),
+                           "yuhub_st_child_%d.txt" % os.getpid())
+    if os.path.basename(sys.executable or "").lower().startswith("python"):
+        # 源码态：用 python 当壳，行为完全确定、零外部依赖。
+        # ⚠️ 必须先 close 再 os._exit —— _exit 不走缓冲区刷新，
+        #    不 close 的话 pidfile 会是空文件。
+        code = (
+            "import os, subprocess\n"
+            "p = subprocess.Popen([%r, '-n', '%d', '127.0.0.1'],\n"
+            "                     stdout=subprocess.DEVNULL,\n"
+            "                     stderr=subprocess.DEVNULL)\n"
+            "fh = open(%r, 'w')\n"
+            "fh.write(str(p.pid))\n"
+            "fh.close()\n"
+            "os._exit(0)\n" % (ping_exe, n, pidfile))
+        argv = [sys.executable, "-c", code]
+    else:
+        # 冻结态：没有 python 可用，用 PowerShell 壳。它是 Yuhub 已有的
+        # 依赖（hardware / uninstaller 全程在用），不算新增外部依赖。
+        ps = ("$p = Start-Process -FilePath '%s' -ArgumentList '-n %d 127.0.0.1' "
+              "-WindowStyle Hidden -PassThru; "
+              "Set-Content -LiteralPath '%s' -Value $p.Id"
+              % (ping_exe, n, pidfile))
+        argv = [un._ps_exe(), "-NoProfile", "-Command", ps]
+
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=0x08000000)
+    except Exception:                                        # noqa: BLE001
+        return None, None
+    try:
+        proc.wait(timeout=30)
+    except Exception:                                        # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:                                    # noqa: BLE001
+            pass
+        return None, None
+
+    child_pid = None
+    try:
+        with open(pidfile, "r", encoding="ascii") as fh:
+            text = fh.read().strip()
+        child_pid = int(text) if text.isdigit() else None
+    except Exception:                                        # noqa: BLE001
+        child_pid = None
+    finally:
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
+    return proc, child_pid
+
+
+def _pid_alive(pid):
+    """PID 是否还活着（SYNCHRONIZE + 非阻塞等待；拿不到句柄算死）。"""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    k32.WaitForSingleObject.restype = ctypes.c_ulong
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    h = k32.OpenProcess(0x00100000, 0, int(pid))
+    if not h:
+        return False
+    try:
+        return k32.WaitForSingleObject(h, 0) == 0x102      # WAIT_TIMEOUT = 活着
+    finally:
+        k32.CloseHandle(h)
+
+
+def _kill_pid(pid):
+    """强杀一个 PID（自检收尸用；失败静默返回 False）。"""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    k32.TerminateProcess.restype = ctypes.c_bool
+    k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    h = k32.OpenProcess(0x0001, 0, int(pid))               # PROCESS_TERMINATE
+    if not h:
+        return False
+    try:
+        return bool(k32.TerminateProcess(h, 1))
+    finally:
+        k32.CloseHandle(h)
 
 
 def _runtime_flags():

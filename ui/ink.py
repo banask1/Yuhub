@@ -18,7 +18,7 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QImage,
@@ -33,6 +33,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
+from . import motion_engine as anim
+from .fish import CarpFrames
 from . import theme
 
 
@@ -67,107 +69,14 @@ def is_dark(palette=None):
 
 
 # ---------------------------------------------------------------------------
-# 鱼 sprite：从鱼画抠出的写实墨鱼（透明底 PNG）
+# 鱼：矢量俯视水墨鲤（实现见 ui/fish.py）
 # ---------------------------------------------------------------------------
-_FISH_FILES = ("ink_fish_1.png", "ink_fish_2.png")
-_fish_cache = {}          # kind -> [QPixmap, ...]  kind: 'normal' / 'inverted'
-_BAND_CACHE = {}          # pixmap.cacheKey() -> (y0, y1) 鱼身实际像素带
-
-
-def _align_body_axis(img):
-    """把斜着画的鱼摆平：身体主轴转到水平、**头朝右**。
-
-    sprite 是从齐白石风格的鱼画里抠出来的，鱼在画里本来就是斜游的
-    （头朝右上、尾在左下）。之前整块贴图直接用问题不大——顶多鱼看着
-    比航向翘一点；但身体行波必须**沿体轴**切片，斜着切会把鱼切碎。
-
-    角度与头尾全部自动判别：
-      * 主轴 = alpha 加权的 PCA 第一主成分；
-      * 头尾 = 沿主轴分两半比"横向厚度"——鲤科鱼头比尾深，厚的那头是头。
-    """
-    w, h = img.width(), img.height()
-    sw = swx = swy = swxx = swyy = swxy = 0.0
-    pts = []
-    for y in range(h):
-        for x in range(w):
-            a = img.pixelColor(x, y).alphaF()
-            if a <= 0.02:
-                continue
-            sw += a
-            swx += a * x
-            swy += a * y
-            swxx += a * x * x
-            swyy += a * y * y
-            swxy += a * x * y
-            pts.append((x, y, a))
-    if sw <= 0 or len(pts) < 10:
-        return img
-    cx, cy = swx / sw, swy / sw
-    cxx = swxx / sw - cx * cx
-    cyy = swyy / sw - cy * cy
-    cxy = swxy / sw - cx * cy
-    theta = 0.5 * math.atan2(2 * cxy, cxx - cyy)
-    ax, ay = math.cos(theta), math.sin(theta)   # 主轴方向（方差最大）
-
-    # 头尾判别：沿主轴取中点分两半，各自累计"垂直厚度"（|偏距|×alpha）
-    s_mid_lo = s_mid_hi = None
-    thick = {1: 0.0, -1: 0.0}
-    for x, y, a in pts:
-        dx, dy = x - cx, y - cy
-        s = dx * ax + dy * ay
-        if s_mid_lo is None or s < s_mid_lo:
-            s_mid_lo = s
-        if s_mid_hi is None or s > s_mid_hi:
-            s_mid_hi = s
-    s_mid = (s_mid_lo + s_mid_hi) / 2
-    for x, y, a in pts:
-        dx, dy = x - cx, y - cy
-        s = dx * ax + dy * ay
-        d = abs(dx * -ay + dy * ax)
-        thick[1 if s >= s_mid else -1] += d * a
-    head_sign = 1.0 if thick[1] >= thick[-1] else -1.0   # 头在主轴哪一侧
-
-    # 把"头方向"旋到 +x（右）：内容点 p → R(a)·p，要 R(a)·(hd) = (1,0)
-    hd = (ax * head_sign, ay * head_sign)
-    ang = -math.degrees(math.atan2(hd[1], hd[0]))
-    return img.transformed(QTransform().rotate(ang), Qt.SmoothTransformation)
-
-
-def fish_sprites(inverted=False):
-    """加载鱼 sprite（带缓存）。`inverted` 用于深色模式（墨鱼翻成白鱼）。
-
-    QImage.invertPixels(InvertRgb) 只反转 RGB、保留 alpha —— 正好把
-    "黑墨鱼"翻成"白墨鱼"，轮廓与浓淡关系不变。
-    加载后自动把鱼摆平（体轴水平、头朝右，见 _align_body_axis）：
-    身体行波按体轴切片，斜着的原素材会把鱼切碎。
-    """
-    kind = "inverted" if inverted else "normal"
-    if kind in _fish_cache:
-        return _fish_cache[kind]
-    out = []
-    for name in _FISH_FILES:
-        img = QImage(resource_path(os.path.join("resources", name)))
-        if img.isNull():
-            continue
-        img = img.convertToFormat(QImage.Format.Format_ARGB32)
-        if inverted:
-            img.invertPixels(QImage.InvertMode.InvertRgb)
-            # 纯反色后鱼身（原本的浅色肚）还是中灰，压不亮整条鱼。
-            # 按"墨密度"重新映射：反色后越亮的地方（原浓墨笔画）越白，
-            # 原来淡的地方给稍暗的白，整体读成"白墨画的鱼"。
-            for yy in range(img.height()):
-                for xx in range(img.width()):
-                    c = img.pixelColor(xx, yy)
-                    a = c.alpha()
-                    if a == 0:
-                        continue
-                    lum = (c.red() * 299 + c.green() * 587 + c.blue() * 114) // 1000
-                    v = 135 + (lum * 115) // 255
-                    img.setPixelColor(xx, yy, QColor(v, v, v, a))
-        out.append(QPixmap.fromImage(_align_body_axis(img)))
-    _fish_cache[kind] = out
-    return out
-
+# 原来这里是"从齐白石鱼画抠出的写实墨鱼 PNG + 切片剪切"（_align_body_axis /
+# fish_sprites / _sprite_band / _draw_fish_body）。2026-10-30 起换成矢量绘制的
+# 俯视鱼：身体是**一条连续路径**，姿态按相位量化成帧号播放（ui.fish.CarpFrames），
+# 不再有"把一张图拆成很多节在滑"的折线观感。
+# resources/ink_fish_*.png 两张素材仍在包里（没删），但已不再被引用；
+# 想恢复"照片墨鱼"可以从这里接回去。
 
 # ---------------------------------------------------------------------------
 # 墨池背景：纸色 + 数团极淡的墨晕（开机画面用，合成一次缓存成 pixmap）
@@ -241,7 +150,7 @@ class _Fish:
                  "sprite", "flip", "phase", "ripple_at", "target", "margin",
                  "tail_phase", "beat_hz", "bend")
 
-    def __init__(self, rng, w, h, margin, size_factor=1.0):
+    def __init__(self, rng, w, h, margin, size_factor=1.0, now=None):
         self.margin = margin
         self.heading = rng.uniform(0, math.tau)
         self.speed = rng.uniform(18, 36)           # px/s，鱼有快有慢
@@ -264,7 +173,10 @@ class _Fish:
         m = margin
         self.x = rng.uniform(m, w - m)
         self.y = rng.uniform(m, h - m)
-        self.ripple_at = time.monotonic() + rng.uniform(1.5, 6.0)
+        #: 涟漪排期用的"现在"。默认墙钟（独立使用 InkPond 的场合），
+        #: 由帧时钟驱动时传**累计动画时间** —— 见 InkPond.step 的说明。
+        self.ripple_at = (time.monotonic() if now is None else float(now)) \
+            + rng.uniform(1.5, 6.0)
         # 第一个巡游目标：偏向自己面朝的方向，开局不会原地掉头
         self.target = self._pick_target(rng, w, h, ahead=True)
 
@@ -283,39 +195,6 @@ class _Fish:
                     / ln > -0.17:
                 return (tx, ty)
         return (w / 2.0, h / 2.0)
-
-
-def _sprite_band(pix):
-    """贴图里"真正有像素"的纵向带 (y0, y1)，按 cacheKey 缓存。
-
-    鱼被转平后，画布上下各留了一大块全透明边角（259×242 的画布里鱼身
-    只有 ~100px 高）。切片若按整幅高度画，等于一半以上的 blit 面积在复制
-    空气——按内容收紧绘制带，鱼的绘制开销直接砍掉一半多。
-    """
-    key = pix.cacheKey()
-    hit = _BAND_CACHE.get(key)
-    if hit is not None:
-        return hit
-    img = pix.toImage()
-    w, h = img.width(), img.height()
-    top = bot = None
-    step = 2
-    for y in range(0, h, step):
-        hit_row = False
-        for x in range(0, w, step):
-            if img.pixelColor(x, y).alpha() > 8:
-                hit_row = True
-                break
-        if hit_row:
-            if top is None:
-                top = y
-            bot = y
-    if top is None:                      # 全透明（异常贴图）：退回整幅
-        band = (0, h)
-    else:
-        band = (max(0, top - step), min(h, bot + step + 1))
-    _BAND_CACHE[key] = band
-    return band
 
 
 class InkPond(QWidget):
@@ -344,14 +223,19 @@ class InkPond(QWidget):
         import random
         self._rng = random.Random()
         self._last_tick = time.monotonic()
+        #: 累计动画时间（秒）：只在 step() 被真的调用时前进。
+        #: 用它而不是墙钟，是为了让"暂停"（窗口隐藏 / 转场让路 / 掉帧跳过）
+        #: 表现为**停住**而不是**瞬移** —— 恢复时鱼和涟漪都从原地继续。
+        self._t = 0.0
 
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.PreciseTimer)
-        self._timer.timeout.connect(self._tick)
-        # 30fps（≈33ms）：鱼是慢速巡游，60fps 与 30fps 肉眼几乎无差，但
-        # 实测 CPU 直接差一半（见 2026-10-13 的性能归因：三处动画从 85%
-        # 单核降到 ~15%）。
-        self._timer.start(33)
+        self._timer = None           # v1.3.0 起不再自带定时器（见下方注册）
+        self._last_tick = time.monotonic()
+
+        # v1.3.0：交给共享帧时钟（装饰车道）。原来这里是一个常驻的 33ms
+        # 定时器 —— 首页一直开着就一直在跑，连窗口最小化都不停。现在：
+        # 只有装饰动画时降到 24fps，窗口不可见/最小化时整层停摆，
+        # 交互/转场进行时被预算闸门跳过。
+        anim.add_ambient(self)
 
         theme.bus.changed.connect(self._on_theme_changed)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -398,18 +282,24 @@ class InkPond(QWidget):
                    for px, py in pts):
                 continue
             pts.append((x, y))
-            f = _Fish(self._rng, w, h, m, size_factor=size_factor)
+            f = _Fish(self._rng, w, h, m, size_factor=size_factor,
+                      now=self._t)
             f.x, f.y = x, y
             self._fish.append(f)
         self._built_size = (w, h)
 
     # ---------------------------------------------------------------- 动画
-    def _tick(self):
+    def step(self, dt):
+        """帧时钟回调（装饰层）。返回 True = 继续占用车道。
+
+        dt 由时钟统一给出（真实经过时间），掉帧时按时间求值 —— 鱼是"游过去"
+        而不是"跳过去"。上限 50ms：长时间卡顿后别让鱼瞬移半屏。
+        """
         if not self.isVisible() or not self._fish:
-            return
-        now = time.monotonic()
-        dt = min(0.05, now - self._last_tick)   # 实测帧间隔（掉帧时不瞬移）
-        self._last_tick = now
+            return True
+        dt = min(0.05, float(dt))
+        self._t += dt
+        now = self._t
         w, h = self.width(), self.height()
         for f in self._fish:
             # ---- 巡游目标点：直线为主，接近了才缓转 ----
@@ -453,6 +343,11 @@ class InkPond(QWidget):
         # 涟漪 2.4 秒一生
         self._ripples = [r for r in self._ripples if now - r[2] < 2.4]
         self.update()
+        # ⚠️ **必须显式返回 True**。帧时钟把 falsy 当成"我已经结束"，
+        # 于是第一次 tick 就把鱼池从车道上摘掉 —— 表现是鱼一条不动，
+        # 但画面上完全没有任何报错（2026-10-29 真踩过：接引擎后首页鱼池
+        # 静止，竹子照摆，因为竹子的 step 写了 return True）。
+        return True
 
     # ------------------------------------------------------------ 池底缓存
     def _backdrop(self):
@@ -500,7 +395,11 @@ class InkPond(QWidget):
         p.end()
 
     def _paint_ripples(self, p):
-        now = time.monotonic()
+        # ⚠️ 必须用**同一个**时钟：涟漪的 t0 记的是 `self._t`（累计动画时间），
+        # 这里若用墙钟算年龄，k 会是几万倍，`46 * (1 - k)` 直接成负数 ——
+        # 症状是满屏 `QColor::setAlpha: invalid value -220745` 的告警，
+        # 涟漪画不出来（2026-10-29 接引擎时踩到）。
+        now = self._t
         c = theme.current()
         base = ink_color(c, 0)
         for x, y, t0 in self._ripples:
@@ -515,102 +414,55 @@ class InkPond(QWidget):
             p.drawEllipse(QRectF(x - r, y - r * 0.42, r * 2, r * 0.84))
 
     def _paint_fish(self, p):
-        dark = is_dark()
-        sprites = fish_sprites(inverted=dark)
-        if not sprites:
-            return
-        for f in self._fish:
-            pix = sprites[f.sprite % len(sprites)]
+        """画鱼：姿态来自**帧表**（ui.fish.CarpFrames），位置/朝向实时算。
 
-            # 只有"大鱼"才开滤波贴图（清晰度肉眼可辨）；小鱼关掉省一半
-            # 的变换 blit 开销。逐鱼设置，全帧不重复设同一个值。
-            p.setRenderHint(QPainter.SmoothPixmapTransform, f.scale > 0.8)
+        v1.3.1（2026-10-30）：原来是"把一张抠出来的墨鱼照片切成 10 片、每片
+        单独剪切"——无论怎么调都摆脱不了"分片在滑"的骨架（轮廓是 10 段折线、
+        接缝处有整像素台阶）。现在换成**矢量俯视鱼 + 24 帧表**：
+          * 身体是一条连续闭合路径（不是切片）；
+          * 姿态按相位量化成**帧号**，帧间不插值 → 真正的"24 张画在播"；
+          * 位置/朝向/大小/浓淡仍然实时算，所以鱼照样朝任意方向游。
+
+        帧表按 (墨色, 纸色, DPI) 缓存；主题切换或换显示器自动重烘。
+        """
+        frames, fw, fh = _carp_frames.frames(self._carp_palette(),
+                                             self.devicePixelRatioF())
+        if not frames:
+            return
+        n = len(frames)
+        # 播放头：池子的动画时钟（累计推进量，暂停时不前进 → 不会瞬移）
+        # 相位 = 播放头 + 个体相位偏移 → 同池的鱼不同步，但节奏一致
+        head = (self._t % 1.0) if self._t else 0.0
+        for f in self._fish:
+            phase = (head + f.tail_phase / math.tau) % 1.0
+            pm = frames[int(phase * n) % n]
 
             p.save()
             # 鱼锚在自身位置，身体朝向 = 航向。刚体只负责"朝哪游"，
-            # "怎么游"交给下面的切片行波——两者叠加才是活鱼。
+            # "怎么游"交给帧表里的姿态——两者叠加才是活鱼。
             p.translate(f.x, f.y)
             p.rotate(math.degrees(f.heading))
-            # 缩放只在这里做一次——切片坐标全部用 sprite 的**未缩放**尺寸。
-            # 之前把缩放后的 pw 喂进切片循环，源矩形却按未缩放取，
-            # scale<1 的鱼只画出了左边一小条（首页的鱼就是这么"消失"的）。
             p.scale(f.scale, f.scale)
             p.setOpacity(f.alpha / 255.0)
-            self._draw_fish_body(p, pix, f)
+            p.drawPixmap(QPointF(-fw / 2.0, -fh / 2.0), pm)
             p.restore()
         p.setOpacity(1.0)
 
-    # 身体切片数：够顺滑即可。屏幕上鱼只有几十像素高，10 片已经看不出
-    # 折线（22 片是历史遗留）；每帧 blit 次数直接减半，是动画 CPU 的大头
-    BODY_SLICES = 10
-
-    def _fish_dy(self, f, d, pw):
-        """身体行波在"离头距离 d"（0=头、1=尾）处的横向偏移。
-
-        参考《鲤鱼游动》一类的二维游动循环的身体波动规律：
-          * **行波从头传向尾**：头部几乎不动，波幅向尾部递增
-            （carangiform 游泳——头部摆幅只有尾部的 ~15%）；
-          * 尾鳍"跟随"身体的弯曲，从不自作主张；
-          * 转弯时身体整体顺势弯向转向侧、尾巴甩向外侧（静态弯曲
-            叠加在行波上），直游时弯曲量平滑归零。
-        振幅以**体长**为基准（pw 的 5.5% / 5%）：转平后的画布高度
-        包含大片透明边角，拿它当基准会高估波幅、把鱼折出"断节"。
-        """
-        env = 0.15 + 0.85 * d ** 1.7               # 头小尾大的振幅包络
-        wave = math.sin(f.tail_phase - math.tau * 0.62 * d)
-        bend = -f.bend * d ** 1.8
-        # 摆幅按体长：行波 7.5%、静态弯 6%（2026-10-13 用户要求加大摆幅，
-        # 由 5.5% 提到 7.5%）。波长同时从 0.7 收到 0.62：幅度变大后波长
-        # 太短会让 10 片的折线读出"折角"，放长一个摆更连贯。
-        return pw * (0.075 * env * wave + 0.06 * bend)
-
-    def _draw_fish_body(self, p, pix, f):
-        """把鱼贴图沿体轴切成薄片，按行波逐片**剪切**后画出来。
-
-        全程使用 sprite 的**未缩放**坐标（缩放由调用方在画笔上做一次）。
-        关键是用**垂直剪切**（parallelogram）而不是旋转：每片左右两条
-        边保持竖直、整体斜切 slope = (dy1 − dy0) / 片宽，于是相邻片的
-        分界线完全重合——薄片连成一条连续的、会波动"身体"，没有任何
-        缝隙或扇形伪影（旋转方案会让鱼背/鱼腹出现扇贝状缺口）。
-        鱼的外观（sprite 像素）一个都不改——改的只是身体怎么动。
-        腹背翻转变体由调用方用 scale(1,-1) 做（头始终朝 +x）。
-        """
-        pw, ph = pix.width(), pix.height()
-        # 只画鱼身所在的横带（上下透明边角不画）。余量**按每一片自己的
-        # 摆幅**给：头/中段几乎不动（头摆幅只有尾部的 15%），用整条鱼的
-        # 最大值去撑就是把空气也画上去了 —— 摆幅加大后这一项差了 10% 开销。
-        band0, band1 = _sprite_band(pix)
-        n = self.BODY_SLICES
-        for i in range(n):
-            # 切片边界全部取整：浮点源矩形会让每一片都重采样，鱼身上
-            # 浮出一条条淡淡的竖向接缝（深色模式的白鱼上格外明显）。
-            # 整数对齐 + 斜率近零的片直接 1:1 贴图 → 中段完全无接缝。
-            x0 = round(i * pw / n)
-            x1 = round((i + 1) * pw / n)
-            u0, u1 = i / n, (i + 1) / n
-            # d = 离头距离（0=头、1=尾）：摆平后的贴图头在图像右端
-            d0 = 1.0 - u0
-            d1 = 1.0 - u1
-            dy0 = round(self._fish_dy(f, d0, pw))
-            dy1 = round(self._fish_dy(f, d1, pw))
-            lx0, lx1 = x0 - pw / 2, x1 - pw / 2
-            slope = (dy1 - dy0) / max(1.0, (lx1 - lx0))
-            # 余量 = 本片两端的最大横移 + 剪切带来的额外倾斜量
-            pad = max(abs(dy0), abs(dy1)) + abs(dy1 - dy0) + 2
-            y0 = max(0, band0 - pad)
-            y1 = min(ph, band1 + pad)
-            p.save()
-            p.translate(lx0, dy0)
-            if abs(slope) > 0.004:
-                p.shear(0.0, slope)
-            p.drawPixmap(QRectF(0, -ph / 2 + y0, lx1 - lx0, y1 - y0),
-                         pix, QRectF(x0, y0, lx1 - lx0, y1 - y0))
-            p.restore()
-
+    def _carp_palette(self):
+        """帧表用的四色：鱼身墨、鳍墨、纸色（背脊亮边）、（眼已按要求去掉）。"""
+        cur = theme.current()
+        body = QColor(cur.get("text", "#1d1d1b"))
+        fin = QColor(cur.get("text", "#1d1d1b"))
+        rim = QColor(cur.get("window_top", "#f7f6f2"))
+        return {"body": body, "fin": fin, "rim": rim, "eye": rim}
 
 # ---------------------------------------------------------------------------
 # 墨竹：会随风摆动的竹子
 # ---------------------------------------------------------------------------
+#: 全进程共用一份帧表（按墨色/纸色/DPR 缓存，主题切换自动重烘）
+_carp_frames = CarpFrames()
+
+
 def _wind(t):
     """风力场：几个不同频率的正弦叠加，偶有"阵风"。
 
@@ -626,7 +478,10 @@ def _wind(t):
 class _Leaf:
     """一片竹叶：由 3 个控制点构成的细长弯叶。"""
 
-    __slots__ = ("length", "width", "angle", "flutter", "alpha")
+    #: color —— 画叶子用的填充色。**每帧都一样**（只跟主题墨色与叶自身
+    #: alpha 有关），所以在建竹时算一次、之后整帧复用（v1.3 性能修复：
+    #: 之前每帧为 54 片叶子各 new 一个 QColor + setAlpha，是纯浪费）。
+    __slots__ = ("length", "width", "angle", "flutter", "alpha", "color")
 
     def __init__(self, rng):
         self.length = rng.uniform(26, 46)
@@ -634,6 +489,7 @@ class _Leaf:
         self.angle = rng.uniform(-1.05, 1.05)     # 相对枝条方向的张角
         self.flutter = rng.uniform(0, math.tau)   # 各叶相位错开
         self.alpha = rng.randint(150, 225)
+        self.color = None                         # 由 _ensure_pens 填
 
 
 class _Branch:
@@ -666,6 +522,15 @@ class _Stalk:
         for i in range(self.segments):
             if i >= 1 and rng.random() < 0.85:
                 self.branches.append(_Branch(rng, i, self.segments))
+        # ---- 画笔缓存（v1.3 性能修复）----
+        # 每节的粗细、节环/枝条的笔宽、每片叶的填充色**逐帧完全一致**
+        # （只由 width/alpha 与主题墨色决定），所以按"当前墨色"算一次就够。
+        # 实测这一坨 Python 侧对象分配占单帧渲染的 ~35%（每帧 ~74 个对象）。
+        # _pen_key 存的是墨色签名；主题切换后墨色变了，下一帧自动重建。
+        self._pen_key = None
+        self.seg_pens = []          # 每节的 QPen（索引同 segments）
+        self.ring_pen = None        # 竹节环
+        self.branch_pen = None      # 小枝
 
 
 class BambooStrip(QWidget):
@@ -685,6 +550,8 @@ class BambooStrip(QWidget):
     # 24fps：竹子**每个页面都在跑**，实测两根竹子占 ~30% 单核（60fps 全量
     # 抗锯齿矢量重绘）。风本身是低通滤波出来的慢变量，24fps 的摇曳完全
     # 看不出台阶，开销直接砍 60%。
+    # v1.3.0 起节奏由 motion_engine 统一（只有装饰动画时用 AMBIENT_MS），
+    # 这里保留常量供自检/文档引用，不再自己开定时器。
     TICK_MS = 42
 
     def __init__(self, orientation="right", parent=None):
@@ -694,12 +561,19 @@ class BambooStrip(QWidget):
         self._built_size = None
         import random
         self._rng = random.Random(20261011)
-        self._now = time.monotonic()   # 本帧时间（整帧统一，防枝叶抖动不一致）
+        # 本帧时间（整帧统一，防枝叶抖动不一致）。用引擎的**累计动画时间**
+        # 而不是墙钟：装饰层被暂停（隐藏 / 转场让路 / 掉帧跳过）时相位不前进，
+        # 恢复时从原地继续，不会"瞬移"到当前应有的位置。
+        self._now = anim.anim_time()
         self._wind = 0.0
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.PreciseTimer)   # 别让 Qt 把节拍对齐到网格
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(self.TICK_MS)
+        # v1.3.0：不再自带 QTimer，注册到全进程共享的帧时钟（装饰车道）。
+        # 三个收益：
+        #   ① 只有装饰动画在跑时自动降到 24fps；
+        #   ② 窗口最小化/收起托盘/进程挂起时**整个装饰层停摆** —— 旧实现
+        #      只查 isVisible()，最小化后 Qt 仍认为控件可见，于是它继续以
+        #      24fps 为一块谁也看不见的画面算每一片叶子的摆动；
+        #   ③ 用户按开关、切页面时，装饰层会被预算闸门跳过，帧让给交互。
+        anim.add_ambient(self)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
     # ------------------------------------------------------------ 布局生成
@@ -724,15 +598,24 @@ class BambooStrip(QWidget):
         self._built_size = (w, h)
 
     # ------------------------------------------------------------ 动画
-    def _tick(self):
+    def step(self, dt):
+        """帧时钟回调（装饰层）。返回 True = 继续占用车道。
+
+        dt 由时钟统一给出，同一帧里所有装饰共用一份 —— 各自取
+        `time.monotonic()` 会差几微秒，多根竹子之间看不出，但和鱼池叠在
+        一起时相位会缓慢漂移。
+
+        风力低通原来写的是"每 tick 吸收 22%"（24fps 下时间常数 ≈170ms）。
+        换成按 dt 算才是帧率无关的：掉帧时不会突然"风变大一下"。
+        """
         if not self.isVisible():
-            return
-        self._now = time.monotonic()
-        # 低通滤波：目标风力突变时竹子是"被风带过去"的，不是瞬移
+            return True
+        self._now = anim.anim_time()
         target = _wind(self._now)
-        self._wind += (target - self._wind) * 0.22
+        self._wind += (target - self._wind) * min(1.0, dt / 0.17)
         self.wind_changed.emit(self._wind)
         self.update()
+        return True
 
     # ------------------------------------------------------------ 绘制
     def paintEvent(self, event):
@@ -761,6 +644,37 @@ class BambooStrip(QWidget):
             self._paint_stalk(p, stalk, w, h, wind)
         p.end()
 
+    def _ensure_pens(self, stalk, ink):
+        """按当前墨色备好这根竹的全部画笔/填充色（"每帧零分配"的关键）。
+
+        每节的粗细、节环/枝条的笔宽、每片叶的填充色**逐帧完全一致**，
+        只由 width/alpha 与主题墨色决定。实测这坨 Python 对象分配占单帧
+        渲染的 ~35%（每帧 ~74 个 QPen/QColor）。用墨色签名当失效键：
+        主题换了墨色就自动重建，其余时间一帧都不再 new。
+        """
+        key = (ink.name(), ink.alpha())
+        if stalk._pen_key == key:
+            return
+        seg_pens = []
+        for i in range(stalk.segments):
+            k = (i + 1) / stalk.segments
+            width = stalk.width * (1.0 - 0.35 * k)
+            seg_pens.append(QPen(ink, max(1.5, width),
+                                 Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        stalk.seg_pens = seg_pens
+        ring = QColor(ink)
+        ring.setAlpha(int(stalk.alpha * 0.85))
+        stalk.ring_pen = QPen(ring, max(1.0, stalk.width * 0.16),
+                              Qt.SolidLine, Qt.RoundCap)
+        stalk.branch_pen = QPen(QColor(ink), max(1.0, stalk.width * 0.16),
+                                Qt.SolidLine, Qt.RoundCap)
+        for br in stalk.branches:
+            for leaf in br.leaves:
+                c = QColor(ink)
+                c.setAlpha(int(leaf.alpha * stalk_alpha_scale(leaf.alpha)))
+                leaf.color = c
+        stalk._pen_key = key
+
     def _paint_stalk(self, p, stalk, w, h, wind):
         """画一根竹：从底向上逐节推进，风力随高度与柔韧度放大。"""
         total_h = h * stalk.height_ratio
@@ -768,7 +682,8 @@ class BambooStrip(QWidget):
         x = w * stalk.x_ratio
         y = float(h)
         angle = stalk.lean
-        ink = ink_color(alpha=stalk.alpha)
+        self._ensure_pens(stalk, ink_color(alpha=stalk.alpha))
+        pens = stalk.seg_pens
 
         joints = []                      # (x, y, angle, seg_index) 记录竹节
         for i in range(stalk.segments):
@@ -780,9 +695,7 @@ class BambooStrip(QWidget):
             nx = x - math.sin(seg_angle) * seg_len
             ny = y - math.cos(seg_angle) * seg_len
             width = stalk.width * (1.0 - 0.35 * k)
-            pen = QPen(ink, max(1.5, width),
-                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            p.setPen(pen)
+            p.setPen(pens[i])
             # 节间留 2px 缺口 → 竹节的"节环"意象
             gap = max(1.5, width * 0.28)
             ux, uy = nx - x, ny - y
@@ -794,11 +707,8 @@ class BambooStrip(QWidget):
             x, y = nx, ny
 
         # 竹节环：每节末端一条更淡的短横线
-        ring = QColor(ink)
-        ring.setAlpha(int(stalk.alpha * 0.85))
         for jx, jy, ja, i in joints[:-1]:
-            p.setPen(QPen(ring, max(1.0, stalk.width * 0.16),
-                          Qt.SolidLine, Qt.RoundCap))
+            p.setPen(stalk.ring_pen)
             half = stalk.width * (1.0 - 0.35 * ((i + 1) / stalk.segments)) * 0.62
             p.drawLine(QPointF(jx - half * math.cos(ja),
                                jy + half * math.sin(ja)),
@@ -819,8 +729,7 @@ class BambooStrip(QWidget):
             bang = -ja + out * br.angle
             bx = jx + math.sin(bang) * blen
             by = jy - math.cos(bang) * blen * 0.9
-            p.setPen(QPen(QColor(ink), max(1.0, stalk.width * 0.16),
-                          Qt.SolidLine, Qt.RoundCap))
+            p.setPen(stalk.branch_pen)
             p.drawLine(QPointF(jx, jy), QPointF(bx, by))
             for leaf in br.leaves:
                 # 叶：以枝条方向为基线，整体向外侧半圆张开（+0.45 下垂偏置，
@@ -830,13 +739,15 @@ class BambooStrip(QWidget):
                 la = (bang + out * (0.45 + leaf.angle)
                       + wind * 0.16 * stalk.flex
                       + 0.05 * math.sin(self._now * 3.1 + leaf.flutter))
-                self._paint_leaf(p, bx, by, la, leaf, ink)
+                self._paint_leaf(p, bx, by, la, leaf)
 
-    def _paint_leaf(self, p, x0, y0, angle, leaf, ink):
-        """一片竹叶：细长的两端尖中间鼓的弯月形。"""
+    def _paint_leaf(self, p, x0, y0, angle, leaf):
+        """一片竹叶：细长的两端尖中间鼓的弯月形。
+
+        填充色由 `_ensure_pens` 预算好挂在 `leaf.color` 上（逐帧一致），
+        这里不再每帧 new QColor。
+        """
         ln, wd = leaf.length, leaf.width
-        c = QColor(ink)
-        c.setAlpha(int(leaf.alpha * stalk_alpha_scale(leaf.alpha)))
         # 叶尖方向
         x1 = x0 + math.sin(angle) * ln
         y1 = y0 - math.cos(angle) * ln
@@ -849,7 +760,7 @@ class BambooStrip(QWidget):
         path.quadTo(mx, my, x1, y1)
         path.quadTo(mx - px * wd * 0.7, my - py * wd * 0.7, x0, y0)
         p.setPen(Qt.NoPen)
-        p.setBrush(c)
+        p.setBrush(leaf.color)
         p.drawPath(path)
 
 

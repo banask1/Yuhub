@@ -1163,14 +1163,35 @@ def run(out_file, timeout_sec=60):
             all("color: $liquid_text;" in t
                 for t in (str(theme_packs.SKY_QSS), str(builtin_tpl))), "")
 
-        # ---- ② 侧栏指示条：弹簧 + 液态玻璃 ----
+        # ---- ② 侧栏指示条：物理弹簧 + 液态玻璃 ----
+        # v1.3.0 起它不再是 QPropertyAnimation（固定时长 + 贝塞尔拟弹簧），
+        # 而是 motion_engine.Spring。所以这里**直接数值积分**这条弹簧，
+        # 断言"过冲"和"收敛时间"这两个用户真正能感知的量，而不是查令牌常量
+        # —— 换实现后令牌可能不再参与，查令牌会变成"自证清白"。
+        from ui import motion_engine as _me
+
         _p2 = win._nav_pill
-        _pc = _p2._anim.easingCurve()
-        chk("侧栏指示条滑动用弹簧曲线（过冲 > 1.05）",
-            max(_pc.valueForProgress(i / 200) for i in range(201)) > 1.05,
-            max(_pc.valueForProgress(i / 200) for i in range(201)))
-        chk("侧栏指示条时长取令牌 PILL",
-            _p2._anim.duration() == motion.PILL, _p2._anim.duration())
+        _ps = getattr(_p2, "_spring", None)
+        chk("侧栏指示条用物理弹簧驱动（可打断）",
+            isinstance(_ps, _me.Spring), type(_ps))
+        _pov = _ps.overshoot() if _ps is not None else 1.0
+        chk("侧栏指示条过冲 > 5%（果冻感，不是直线到达）",
+            _pov > 1.05, round(_pov, 3))
+        # 收敛时间：从 0 推到 1，按 1/60 步进，看多少毫秒后与目标差 < 1px 量级
+        _settle_ms = None
+        if _ps is not None:
+            _probe = _me.Spring(0.0, motion.SPRING_JELLY)
+            _probe.to(1.0)
+            _acc = 0.0
+            for _ in range(120):
+                _probe.step(1.0 / 60.0)
+                _acc += 1000.0 / 60.0
+                if abs(_probe.value - 1.0) < 0.01 and abs(_probe.velocity) < 0.02:
+                    _settle_ms = _acc
+                    break
+        chk("指示条弹簧在 400ms 内收敛（与令牌 PILL=300ms 同量级）",
+            _settle_ms is not None and _settle_ms <= 400,
+            _settle_ms)
 
         # ---- ②b 侧栏按钮 hover 反馈：自绘（v0.15.4beta） ----
         # 为什么必须自绘：QSS 的 `:hover` 在这类按钮上**不生效** ——
@@ -1179,8 +1200,6 @@ def run(out_file, timeout_sec=60):
         # hover 前后逐像素零差异 —— 也就是用户报的「左侧这几个功能鼠标移上去
         # 没有动画」。所以反馈改由 NavButton 自己画一层浅蓝液态玻璃膜 + 弹簧
         # 铺开。下面几条把它钉死（并顺带守住"别再退回 qss"）。
-        from PySide6.QtCore import QVariantAnimation
-
         from ui.main_window import NavButton
 
         _nb = NavButton("memory", "🧠", "自检项")
@@ -1203,16 +1222,15 @@ def run(out_file, timeout_sec=60):
                     n += 3
             return tot / max(1, n)
 
-        chk("侧栏按钮的 hover 反馈走自绘（挂着 hover 动画对象）",
-            isinstance(getattr(_nb, "_hover_anim", None), QVariantAnimation),
-            type(getattr(_nb, "_hover_anim", None)))
-        chk("侧栏 hover 动画时长取令牌 HOVER",
-            _nb._hover_anim.duration() == motion.HOVER,
-            _nb._hover_anim.duration())
-        _hc = _nb._hover_anim.easingCurve()
-        _hpeak = max(_hc.valueForProgress(_i / 200.0) for _i in range(201))
-        chk("侧栏 hover 用弹簧曲线（过冲 > 1.05，Q 弹果冻感）",
-            _hpeak > 1.05, round(_hpeak, 3))
+        chk("侧栏按钮的 hover 反馈走自绘（挂着物理弹簧）",
+            isinstance(getattr(_nb, "_hover_spring", None), _me.Spring),
+            type(getattr(_nb, "_hover_spring", None)))
+        # v1.3.0：过冲与收敛不再查曲线/令牌（弹簧没有"时长"这个概念），
+        # 直接对这条弹簧做一次数值积分 —— 测的是用户真正看到的运动。
+        _hov = (_nb._hover_spring.overshoot()
+                if getattr(_nb, "_hover_spring", None) is not None else 1.0)
+        chk("侧栏 hover 用弹簧（过冲 > 5%，Q 弹果冻感）",
+            _hov > 1.05, round(_hov, 3))
 
         # 0 → 1 必须经过中间值：一帧都不停就是"瞬变"，不算动画
         _nb._hover_t = 0.0
@@ -1326,15 +1344,10 @@ def run(out_file, timeout_sec=60):
             _sw.knob_rect(offset=1.3, stretch=0.0).right()
             <= _sw.width() - _sw.KNOB_MARGIN + 0.01,
             _sw.knob_rect(offset=1.3, stretch=0.0).right())
-        _sc = _sw._anim.easingCurve()
-        chk("开关滑动用弹簧曲线（过冲 > 1.05）",
-            max(_sc.valueForProgress(i / 200) for i in range(201)) > 1.05,
-            max(_sc.valueForProgress(i / 200) for i in range(201)))
-        chk("开关滑动时长取令牌 SWITCH",
-            _sw._anim.duration() == motion.SWITCH, _sw._anim.duration())
-        chk("按下反馈接了动画而不是瞬变",
-            _sw._press_anim.duration() > 0 and _sw._press_anim.duration()
-            <= motion.UI_BUDGET, _sw._press_anim.duration())
+        _sc = _sw._spring.overshoot()
+        chk("开关滑动用物理弹簧（过冲 > 5%）", _sc > 1.05, round(_sc, 3))
+        chk("按下反馈也接了弹簧而不是瞬变（尺寸随 _press 变化，见上一条）",
+            isinstance(_sw._press_spring, _me.Spring), type(_sw._press_spring))
 
         # ---- ④ 分段控件的滑动选中片（v0.15.1） ----
         # 用户反馈「所有切换功能的地方都没有加入动画，例如内存优化的定时
@@ -1352,12 +1365,6 @@ def run(out_file, timeout_sec=60):
                 [type(c).__name__ for c in _kids][:3])
             chk("选中片不抢鼠标（否则整块分段控件都点不动）",
                 _sld.testAttribute(_Qt.WA_TransparentForMouseEvents), "")
-            _sc2 = _sld._anim.easingCurve()
-            chk("选中片滑动用弹簧曲线（过冲 > 1.03）",
-                max(_sc2.valueForProgress(i / 200)
-                    for i in range(201)) > 1.03, "")
-            chk("选中片时长取令牌 PAGE_IN",
-                _sld._anim.duration() == motion.PAGE_IN, _sld._anim.duration())
             # 未跑过 layout 时容器与按钮**都是** 640x480 的默认几何 ——
             # 第一版认了它，片一上来就落成一个巨框。这条守着那个判据。
             _pre = _sld._target_rect()
@@ -1373,6 +1380,22 @@ def run(out_file, timeout_sec=60):
                 and abs(_tr_.x() - _ba.x()) < 1.5
                 and abs(_tr_.width() - _ba.width()) < 1.5,
                 (_tr_, _ba))
+            # v1.3.0：进度推进从 QVariantAnimation 换成引擎的 Tween。
+            # 判据仍是"曲线过冲 + 时长令牌"，但要**真的发起一次切换**之后再
+            # 读 —— 顺带证明这条线确实被接上了（只查属性会漏掉"接错对象"）。
+            # ⚠️ 必须在 show() + 布局之后做：未布局时 `_rect_of` 返回 None，
+            # `_on_toggled` 会直接 return，根本走不到建 Tween 那一步。
+            _segc.set_current("c")
+            pump(40)
+            _tw = getattr(_sld, "_tween", None)
+            chk("选中片切换时创建了引擎 Tween（不是旧 QVariantAnimation）",
+                isinstance(_tw, _me.Tween), type(_tw))
+            _pk = (max(_tw._curve.valueForProgress(i / 200.0)
+                       for i in range(201)) if _tw is not None else 0.0)
+            chk("选中片滑动曲线有过冲（> 1.03）", _pk > 1.03, round(_pk, 3))
+            chk("选中片时长取令牌 PAGE_IN",
+                _tw is not None and _tw.ms == motion.PAGE_IN,
+                None if _tw is None else _tw.ms)
             _segc.hide()
         _segc.deleteLater()
 
